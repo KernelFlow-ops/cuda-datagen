@@ -1,3 +1,5 @@
+"""LangGraph: generate → extract → compile → repair / next candidate / save."""
+
 from __future__ import annotations
 
 import logging
@@ -5,7 +7,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
-from cuda_sft.compile import compile_cuda_source
+from cuda_sft.compile import attempt_workdir, compile_cuda_source, finalize_question_work
 from cuda_sft.config import get_settings
 from cuda_sft.llm import get_llm_client, is_retryable_llm_error
 from cuda_sft.parse import extract_cuda_source
@@ -13,6 +15,7 @@ from cuda_sft.prompt import (
     SYSTEM_PROMPT,
     build_repair_prompt,
     candidate_temperature,
+    format_nvcc_for_prompt,
     select_prompts,
     truncate_compile_error,
 )
@@ -25,11 +28,17 @@ PRINT_STREAM = True
 
 
 def set_print_stream(enabled: bool) -> None:
+    """Enable or disable printing streamed model tokens to stdout.
+
+    Args:
+        enabled: False under ``--quiet`` or when ``workers > 1``.
+    """
     global PRINT_STREAM
     PRINT_STREAM = enabled
 
 
 def _retry_policy():
+    """RetryPolicy for transient LLM failures on the generate node."""
     from langgraph.types import RetryPolicy
 
     return RetryPolicy(
@@ -42,6 +51,14 @@ def _retry_policy():
 
 
 def prepare(state: GraphState) -> dict[str, Any]:
+    """Initialize prompts, counters, and GPU metadata for one question.
+
+    Args:
+        state: Must contain ``question_id`` and ``question``.
+
+    Returns:
+        Partial state update for the generate node.
+    """
     settings = get_settings()
     gpu_name = settings.resolved_gpu_name
     cuda_arch = settings.resolved_cuda_arch
@@ -75,6 +92,14 @@ def prepare(state: GraphState) -> dict[str, Any]:
 
 
 def generate(state: GraphState) -> dict[str, Any]:
+    """Call the LLM and append the assistant turn to ``messages``.
+
+    Args:
+        state: Current graph state with ``messages`` and ``system_prompt``.
+
+    Returns:
+        ``raw_response`` and updated ``messages``.
+    """
     qid = state["question_id"]
     cand = state.get("candidate_idx", 1)
     repair = state.get("repair_idx", 0)
@@ -97,6 +122,11 @@ def generate(state: GraphState) -> dict[str, Any]:
 
 
 def extract(state: GraphState) -> dict[str, Any]:
+    """Pull CUDA source out of the last model reply.
+
+    Args:
+        state: Must contain ``raw_response``.
+    """
     code = extract_cuda_source(state.get("raw_response") or "")
     if not code.strip():
         logger.warning("Q%s: no CUDA source extracted", state["question_id"])
@@ -104,12 +134,17 @@ def extract(state: GraphState) -> dict[str, Any]:
 
 
 def compile_node(state: GraphState) -> dict[str, Any]:
+    """``nvcc -c`` the extracted source and record the attempt.
+
+    Args:
+        state: Must contain ``code`` and ``question_id``.
+    """
     settings = get_settings()
-    workdir = (
-        settings.work_path
-        / f"q{state['question_id']}"
-        / f"c{state.get('candidate_idx', 1)}"
-        / f"r{state.get('repair_idx', 0)}"
+    workdir = attempt_workdir(
+        settings,
+        int(state["question_id"]),
+        int(state.get("candidate_idx") or 1),
+        int(state.get("repair_idx") or 0),
     )
     code = state.get("code") or ""
     attempts = list(state.get("attempts") or [])
@@ -126,6 +161,8 @@ def compile_node(state: GraphState) -> dict[str, Any]:
             }
         )
         print(f"[Q{state['question_id']}] compile FAIL: {error}", flush=True)
+        workdir.mkdir(parents=True, exist_ok=True)
+        (workdir / "nvcc.log").write_text(error + "\n", encoding="utf-8")
         return {
             "compile_ok": False,
             "compile_error": error,
@@ -135,13 +172,17 @@ def compile_node(state: GraphState) -> dict[str, Any]:
 
     result = compile_cuda_source(code, workdir, settings=settings)
     error = "" if result.ok else (result.output or "nvcc failed with empty output")
+    (workdir / "nvcc.log").write_text((result.output or error or "") + "\n", encoding="utf-8")
+    prompt_error = (
+        format_nvcc_for_prompt(error, settings.repair_error_max_chars) if not result.ok else ""
+    )
     attempts.append(
         {
             "candidate": state.get("candidate_idx", 1),
             "repair": state.get("repair_idx", 0),
             "ok": result.ok,
             "used_rdc": result.used_rdc,
-            "error": truncate_compile_error(error) if not result.ok else "",
+            "error": prompt_error,
         }
     )
     status = "PASS" if result.ok else "FAIL"
@@ -158,11 +199,19 @@ def compile_node(state: GraphState) -> dict[str, Any]:
 
 
 def repair(state: GraphState) -> dict[str, Any]:
+    """Append a compile-fix user message and bump ``repair_idx``.
+
+    Args:
+        state: Failed compile state with ``compile_error`` and ``code``.
+    """
     settings = get_settings()
     next_repair = int(state.get("repair_idx") or 0) + 1
     repair_user = build_repair_prompt(
         cuda_arch=state.get("cuda_arch") or settings.resolved_cuda_arch,
-        compile_error=truncate_compile_error(state.get("compile_error") or ""),
+        compile_error=format_nvcc_for_prompt(
+            state.get("compile_error") or "",
+            settings.repair_error_max_chars,
+        ),
         previous_code=state.get("code") or "",
         question_id=int(state["question_id"]),
         candidate_idx=int(state.get("candidate_idx") or 1),
@@ -186,6 +235,11 @@ def repair(state: GraphState) -> dict[str, Any]:
 
 
 def next_candidate(state: GraphState) -> dict[str, Any]:
+    """Start a fresh candidate with a different prompt variant and temperature.
+
+    Args:
+        state: State after the previous candidate exhausted repairs.
+    """
     settings = get_settings()
     next_idx = int(state.get("candidate_idx") or 1) + 1
     temperature = candidate_temperature(next_idx)
@@ -224,8 +278,15 @@ def next_candidate(state: GraphState) -> dict[str, Any]:
 
 
 def save_success(state: GraphState) -> dict[str, Any]:
+    """Write SFT jsonl rows and mark the question successful."""
     settings = get_settings()
-    get_store().write_success(state, model_name=settings.model)
+    get_store().write_success(state, model_name=settings.resolved_model)
+    finalize_question_work(
+        settings,
+        int(state["question_id"]),
+        code=state.get("code") or "",
+        success=True,
+    )
     logger.info(
         "Q%s saved SFT sample (candidate=%s repairs=%s)",
         state["question_id"],
@@ -236,7 +297,15 @@ def save_success(state: GraphState) -> dict[str, Any]:
 
 
 def save_abandoned(state: GraphState) -> dict[str, Any]:
+    """Write the abandoned record after all candidates failed."""
+    settings = get_settings()
     get_store().write_abandoned(state)
+    finalize_question_work(
+        settings,
+        int(state["question_id"]),
+        code=state.get("code") or "",
+        success=False,
+    )
     logger.info("Q%s abandoned after all candidates failed", state["question_id"])
     print(f"[Q{state['question_id']}] abandoned", flush=True)
     return {"status": "abandoned"}
@@ -245,6 +314,7 @@ def save_abandoned(state: GraphState) -> dict[str, Any]:
 def route_after_compile(
     state: GraphState,
 ) -> Literal["save_success", "repair", "next_candidate", "save_abandoned"]:
+    """Route after compile: save, repair, next candidate, or abandon."""
     settings = get_settings()
     if state.get("compile_ok"):
         return "save_success"
@@ -256,6 +326,7 @@ def route_after_compile(
 
 
 def build_graph():
+    """Compile the per-question StateGraph."""
     builder = StateGraph(GraphState)
     builder.add_node("prepare", prepare)
     builder.add_node("generate", generate, retry_policy=_retry_policy())
@@ -288,6 +359,7 @@ def build_graph():
 
 
 def recursion_limit() -> int:
+    """LangGraph superstep cap covering 3 candidates × (1 gen + 3 repairs)."""
     settings = get_settings()
     # prepare + per attempt (generate/extract/compile) + repair/next + save
     per_candidate = (settings.max_repairs + 1) * 3 + settings.max_repairs + 2

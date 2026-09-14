@@ -1,9 +1,13 @@
+"""LangGraph state schemas for one-question CUDA SFT generation."""
+
 from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
 
 class AttemptRecord(TypedDict, total=False):
+    """One generate/compile attempt (candidate + repair round)."""
+
     candidate: int
     repair: int
     ok: bool
@@ -12,6 +16,8 @@ class AttemptRecord(TypedDict, total=False):
 
 
 class GraphState(TypedDict, total=False):
+    """Mutable state passed between LangGraph nodes for a single question."""
+
     question_id: int
     question: str
     system_prompt: str

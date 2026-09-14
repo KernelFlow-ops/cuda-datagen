@@ -1,3 +1,5 @@
+"""Load ``.env`` settings and detect local CUDA / GPU architecture."""
+
 from __future__ import annotations
 
 import os
@@ -15,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_env_file() -> None:
+    """Load project-root ``.env`` if present (does not override existing env)."""
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
         load_dotenv(env_path, override=False)
@@ -32,6 +35,11 @@ def normalize_anthropic_base_url(url: str) -> str:
 
 
 def _run_text(cmd: list[str]) -> str | None:
+    """Run a short command and return stripped stdout, or None on failure.
+
+    Args:
+        cmd: argv to execute.
+    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -42,6 +50,7 @@ def _run_text(cmd: list[str]) -> str | None:
 
 
 def detect_gpu_name() -> str:
+    """Return the first GPU name from ``nvidia-smi``, or a generic fallback."""
     raw = _run_text(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
     )
@@ -51,6 +60,7 @@ def detect_gpu_name() -> str:
 
 
 def detect_cuda_arch() -> str:
+    """Return nvcc arch like ``sm_86`` from compute capability, default ``sm_86``."""
     raw = _run_text(
         ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"]
     )
@@ -63,6 +73,7 @@ def detect_cuda_arch() -> str:
 
 
 def detect_cuda_home() -> str:
+    """Locate the CUDA toolkit root from env, ``nvcc`` path, or common prefixes."""
     env_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if env_home and Path(env_home).exists():
         return env_home
@@ -81,6 +92,11 @@ def detect_cuda_home() -> str:
 
 
 def detect_cuda_version(cuda_home: str) -> str:
+    """Parse ``nvcc --version`` release number (e.g. ``12.6``).
+
+    Args:
+        cuda_home: Toolkit root used to find ``bin/nvcc``.
+    """
     nvcc = Path(cuda_home) / "bin" / "nvcc"
     binary = str(nvcc) if nvcc.exists() else (shutil.which("nvcc") or "nvcc")
     raw = _run_text([binary, "--version"])
@@ -91,6 +107,7 @@ def detect_cuda_version(cuda_home: str) -> str:
 
 
 def detect_nvcc() -> str:
+    """Return a path to ``nvcc``, or the string ``nvcc`` if not found."""
     nvcc = shutil.which("nvcc")
     if nvcc:
         return nvcc
@@ -102,6 +119,13 @@ def detect_nvcc() -> str:
 
 
 class Settings(BaseSettings):
+    """Pipeline config loaded from environment / ``.env``.
+
+    Provider-specific keys (OpenRouter vs NVIDIA NIM) are selected through
+    :attr:`llm_provider`. Empty ``MODEL`` falls back to ``OPENROUTER_MODEL`` or
+    ``NVIDIA_MODEL``.
+    """
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
@@ -109,15 +133,24 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    llm_provider: str = Field(default="openrouter")
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api")
-    model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
+    openrouter_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
+    nvidia_api_key: str = Field(default="")
+    nvidia_base_url: str = Field(default="https://integrate.api.nvidia.com/v1")
+    nvidia_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b")
+    model: str = Field(default="")
     thinking_level: str = Field(default="medium")
     max_tokens: int = Field(default=16384)
+    top_p: float = Field(default=0.95)
     llm_timeout_sec: float = Field(default=600.0)
 
     max_candidates: int = Field(default=3, ge=1)
     max_repairs: int = Field(default=3, ge=0)
+    workers: int = Field(default=1, ge=1)
+    repair_error_max_chars: int = Field(default=6000, ge=500)
+    work_keep: str = Field(default="simple")
 
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
@@ -134,47 +167,118 @@ class Settings(BaseSettings):
     @field_validator("openrouter_base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
+        """Strip a trailing ``/v1`` so the Anthropic SDK does not double it."""
         return normalize_anthropic_base_url(value)
 
     @field_validator("thinking_level")
     @classmethod
     def _normalize_thinking(cls, value: str) -> str:
+        """Lowercase thinking level (``medium``, ``high``, ``none``, ...)."""
         return value.strip().lower()
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _normalize_provider(cls, value: str) -> str:
+        """Map aliases to ``openrouter`` or ``nvidia``.
+
+        Raises:
+            ValueError: If the name is not a known provider.
+        """
+        name = value.strip().lower()
+        aliases = {
+            "nim": "nvidia",
+            "nv": "nvidia",
+            "integrate": "nvidia",
+            "or": "openrouter",
+            "open-router": "openrouter",
+        }
+        name = aliases.get(name, name)
+        if name not in {"openrouter", "nvidia"}:
+            raise ValueError("LLM_PROVIDER must be 'openrouter' or 'nvidia'")
+        return name
+
+    @field_validator("work_keep")
+    @classmethod
+    def _normalize_work_keep(cls, value: str) -> str:
+        """Map aliases to ``simple`` (last answer only) or ``detailed`` (all attempts)."""
+        name = value.strip().lower()
+        aliases = {
+            "last": "simple",
+            "final": "simple",
+            "all": "detailed",
+            "full": "detailed",
+            "debug": "detailed",
+        }
+        name = aliases.get(name, name)
+        if name not in {"simple", "detailed"}:
+            raise ValueError("WORK_KEEP must be 'simple' or 'detailed'")
+        return name
 
     @property
     def resolved_cuda_home(self) -> str:
+        """CUDA toolkit root: env override or auto-detect."""
         return self.cuda_home or detect_cuda_home()
 
     @property
     def resolved_cuda_arch(self) -> str:
+        """nvcc ``-arch`` value, e.g. ``sm_86``."""
         return self.cuda_arch or detect_cuda_arch()
 
     @property
     def resolved_gpu_name(self) -> str:
+        """Human-readable GPU name for prompts."""
         return self.gpu_name or detect_gpu_name()
 
     @property
     def resolved_cuda_version(self) -> str:
+        """Toolkit version string from ``nvcc --version``."""
         return detect_cuda_version(self.resolved_cuda_home)
 
     @property
     def nvcc_bin(self) -> str:
+        """Path to the nvcc binary."""
         home_nvcc = Path(self.resolved_cuda_home) / "bin" / "nvcc"
         if home_nvcc.exists():
             return str(home_nvcc)
         return detect_nvcc()
 
     @property
+    def resolved_api_key(self) -> str:
+        """API key for the active :attr:`llm_provider`."""
+        if self.llm_provider == "nvidia":
+            return self.nvidia_api_key.strip()
+        return self.openrouter_api_key.strip()
+
+    @property
+    def resolved_base_url(self) -> str:
+        """HTTP base URL for the active provider."""
+        if self.llm_provider == "nvidia":
+            return self.nvidia_base_url.rstrip("/")
+        return self.openrouter_base_url
+
+    @property
+    def resolved_model(self) -> str:
+        """Model id: ``MODEL`` override, else provider-specific default."""
+        if self.model.strip():
+            return self.model.strip()
+        if self.llm_provider == "nvidia":
+            return self.nvidia_model.strip()
+        return self.openrouter_model.strip()
+
+    @property
     def data_path(self) -> Path:
+        """Directory for sft/progress/abandoned jsonl and ``run.log``."""
         return Path(self.data_dir)
 
     @property
     def work_path(self) -> Path:
+        """Scratch directory for per-attempt ``solution.cu`` files."""
         return Path(self.work_dir)
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return process-wide settings, filling empty CUDA fields via detection."""
     settings = Settings()
     updates: dict[str, str] = {}
     if not settings.cuda_arch:

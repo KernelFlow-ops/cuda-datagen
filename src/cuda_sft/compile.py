@@ -1,5 +1,8 @@
+"""Compile generated CUDA with ``nvcc -c`` (stubs + optional ``-rdc=true``)."""
+
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +70,16 @@ void launch_add(const float* a, const float* b, float* c, int n) {
 
 @dataclass
 class CompileResult:
+    """Outcome of one ``nvcc -c`` invocation.
+
+    Attributes:
+        ok: True if the compiler returned 0.
+        command: Exact nvcc argv used for the last attempt.
+        output: Combined stdout/stderr.
+        used_rdc: True if the successful (or last) compile used ``-rdc=true``.
+        source_path: Path of the written ``solution.cu``, if any.
+    """
+
     ok: bool
     command: list[str]
     output: str
@@ -75,6 +88,11 @@ class CompileResult:
 
 
 def ensure_stubs(workdir: Path) -> None:
+    """Write permissive ``helpers.h`` / ``solution_header.h`` stubs into ``workdir``.
+
+    Args:
+        workdir: Per-attempt directory that will hold ``solution.cu``.
+    """
     include_dir = workdir / "include"
     include_dir.mkdir(parents=True, exist_ok=True)
     (include_dir / "helpers.h").write_text(HELPERS_STUB, encoding="utf-8")
@@ -84,6 +102,11 @@ def ensure_stubs(workdir: Path) -> None:
 
 
 def looks_like_rdc_error(output: str) -> bool:
+    """Return True if nvcc output suggests relocatable device code is required.
+
+    Args:
+        output: Compiler stdout/stderr.
+    """
     lowered = output.lower()
     return any(hint in lowered for hint in RDC_HINTS)
 
@@ -95,6 +118,17 @@ def _nvcc_command(
     *,
     rdc: bool,
 ) -> list[str]:
+    """Build an ``nvcc -c`` command line.
+
+    Args:
+        settings: Runtime CUDA paths and arch.
+        source: Path to ``solution.cu``.
+        output: Path to the ``.o`` file.
+        rdc: If True, add ``-rdc=true`` for dynamic parallelism.
+
+    Returns:
+        Argument list suitable for ``subprocess.run``.
+    """
     workdir = source.parent
     cmd = [
         settings.nvcc_bin,
@@ -116,6 +150,12 @@ def _nvcc_command(
 
 
 def _run_nvcc(cmd: list[str], timeout: int) -> tuple[int, str]:
+    """Run nvcc and return ``(exit_code, combined_output)``.
+
+    Args:
+        cmd: nvcc argv.
+        timeout: Kill the process after this many seconds.
+    """
     try:
         proc = subprocess.run(
             cmd,
@@ -143,6 +183,18 @@ def compile_cuda_source(
     workdir: Path,
     settings: Settings | None = None,
 ) -> CompileResult:
+    """Write ``source`` to ``workdir/solution.cu`` and compile with ``nvcc -c``.
+
+    On dynamic-parallelism errors, retries once with ``-rdc=true``.
+
+    Args:
+        source: Full CUDA translation unit.
+        workdir: Scratch directory for this attempt.
+        settings: CUDA toolchain config; defaults to :func:`get_settings`.
+
+    Returns:
+        Compile result (success or last failure).
+    """
     settings = settings or get_settings()
     workdir.mkdir(parents=True, exist_ok=True)
     ensure_stubs(workdir)
@@ -173,7 +225,61 @@ def compile_cuda_source(
     return CompileResult(False, cmd, output, used_rdc=False, source_path=source_path)
 
 
+def attempt_workdir(
+    settings: Settings,
+    question_id: int,
+    candidate_idx: int,
+    repair_idx: int,
+) -> Path:
+    """Return the directory used to compile one attempt.
+
+    ``WORK_KEEP=simple`` overwrites ``work/q{id}/`` in place.
+    ``WORK_KEEP=detailed`` uses ``work/q{id}/c{c}/r{r}/``.
+    """
+    base = settings.work_path / f"q{question_id}"
+    if settings.work_keep == "simple":
+        return base
+    return base / f"c{candidate_idx}" / f"r{repair_idx}"
+
+
+def finalize_question_work(
+    settings: Settings,
+    question_id: int,
+    *,
+    code: str,
+    success: bool,
+) -> None:
+    """In simple mode, keep only the last ``solution.cu`` (and ``nvcc.log`` if failed).
+
+    Args:
+        settings: Pipeline settings (``work_keep``).
+        question_id: Question id.
+        code: Last CUDA source for this question.
+        success: True if compile passed (drop nvcc.log); False keeps the last log.
+    """
+    if settings.work_keep != "simple":
+        return
+    qdir = settings.work_path / f"q{question_id}"
+    qdir.mkdir(parents=True, exist_ok=True)
+    if (code or "").strip():
+        (qdir / "solution.cu").write_text(code, encoding="utf-8")
+    for child in list(qdir.iterdir()):
+        name = child.name
+        if child.is_dir() and (name.startswith("c") or name == "include"):
+            shutil.rmtree(child, ignore_errors=True)
+        elif name in {"helpers.h", "solution_header.h", "solution.o"}:
+            child.unlink(missing_ok=True)
+        elif name == "nvcc.log" and success:
+            child.unlink(missing_ok=True)
+
+
 def smoke_compile(settings: Settings | None = None, workdir: Path | None = None) -> CompileResult:
+    """Compile a tiny built-in kernel to verify nvcc is usable.
+
+    Args:
+        settings: Optional settings override.
+        workdir: Optional scratch dir; defaults to ``work/_smoke``.
+    """
     settings = settings or get_settings()
     target = workdir or (settings.work_path / "_smoke")
     return compile_cuda_source(SMOKE_SOURCE, target, settings=settings)

@@ -1,3 +1,5 @@
+"""Convert generation archive rows to ms-swift / OpenRLHF SFT jsonl."""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +10,7 @@ from cuda_sft.prompt import SYSTEM_PROMPT
 
 
 def _content(msg: dict[str, Any]) -> str:
+    """Return the string ``content`` of a chat message dict, or empty."""
     value = msg.get("content")
     return value if isinstance(value, str) else ""
 
@@ -36,6 +39,11 @@ def split_user_assistant(row: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def extract_system(row: dict[str, Any]) -> str:
+    """Read the system prompt from ``messages`` or ``metadata``, else default.
+
+    Args:
+        row: One jsonl object from ``sft.jsonl``.
+    """
     messages = row.get("messages")
     if isinstance(messages, list):
         for msg in messages:
@@ -52,9 +60,14 @@ def extract_system(row: dict[str, Any]) -> str:
 
 
 def to_ms_swift(user: str, assistant: str, *, system: str = SYSTEM_PROMPT) -> dict[str, Any]:
-    """ms-swift SFT standard messages format.
+    """Build one ms-swift SFT record (``messages`` only).
 
-    https://github.com/modelscope/ms-swift/blob/main/docs/source/Customization/Custom-dataset.md
+    See Custom-dataset.md in modelscope/ms-swift.
+
+    Args:
+        user: Instruction (question + generation suffix).
+        assistant: CUDA source used as the label.
+        system: Optional system prompt prepended to ``messages``.
     """
     messages: list[dict[str, str]] = []
     if system.strip():
@@ -65,13 +78,14 @@ def to_ms_swift(user: str, assistant: str, *, system: str = SYSTEM_PROMPT) -> di
 
 
 def to_openrlhf(user: str, assistant: str, *, system: str = SYSTEM_PROMPT) -> dict[str, Any]:
-    """OpenRLHF SFT format for --apply_chat_template.
+    """Build one OpenRLHF SFT record (``input`` / ``output`` chat lists).
 
-    Train with:
-      --input_key input --output_key output --apply_chat_template
+    Train with ``--input_key input --output_key output --apply_chat_template``.
 
-    Prompt messages go in `input`, target assistant turn in `output`.
-    See openrlhf/datasets/sft_dataset.py preprocess_data().
+    Args:
+        user: Instruction text.
+        assistant: CUDA source label.
+        system: Optional system message in ``input``.
     """
     prompt: list[dict[str, str]] = []
     if system.strip():
@@ -84,6 +98,11 @@ def to_openrlhf(user: str, assistant: str, *, system: str = SYSTEM_PROMPT) -> di
 
 
 def iter_sft_rows(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield valid JSON objects from a jsonl file, skipping bad lines.
+
+    Args:
+        path: Path to ``sft.jsonl``.
+    """
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()

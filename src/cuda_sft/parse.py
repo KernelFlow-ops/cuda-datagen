@@ -1,3 +1,5 @@
+"""Extract CUDA source from model replies (markdown fences / thinking tags)."""
+
 from __future__ import annotations
 
 import re
@@ -26,11 +28,24 @@ CUDA_HINTS = (
 
 
 def strip_thinking(text: str) -> str:
+    """Remove leaked ``<think>`` / ``<thinking>`` / ``<reasoning>`` blocks.
+
+    Args:
+        text: Raw model output.
+
+    Returns:
+        Text with thinking tags stripped.
+    """
     cleaned = THINK_BLOCK_RE.sub("", text or "")
     return cleaned.strip()
 
 
 def looks_like_cuda(source: str) -> bool:
+    """Return True if ``source`` looks like CUDA/C++ device code.
+
+    Args:
+        source: Candidate source text.
+    """
     lowered = source.lower()
     return any(hint.lower() in lowered for hint in CUDA_HINTS)
 
@@ -56,6 +71,14 @@ def extract_cuda_source(text: str) -> str:
 
 
 def _ensure_trailing_newline(source: str) -> str:
+    """Strip surrounding whitespace and ensure a trailing newline.
+
+    Args:
+        source: CUDA source fragment.
+
+    Returns:
+        Normalized source, or empty string if ``source`` is blank.
+    """
     source = source.strip()
     if not source:
         return ""

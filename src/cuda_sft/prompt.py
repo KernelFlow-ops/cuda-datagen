@@ -1,5 +1,8 @@
+"""System / user / repair prompt pools and stable per-question selection."""
+
 from __future__ import annotations
 
+import re
 from typing import NamedTuple
 
 # Fallback / first variant. Kept as SYSTEM_PROMPT for older imports.
@@ -173,7 +176,7 @@ REPAIR_PROMPTS: tuple[str, ...] = (
     """上一版 CUDA 代码未能通过 nvcc 编译。请输出**完整修正后**的 `solution.cu`（不要只给 diff）。
 目标架构：{cuda_arch}。保持题面要求的算法与函数职责，只修编译问题。
 
-编译错误：
+nvcc 输出（过长则已去重摘要）：
 ```
 {error}
 ```
@@ -187,7 +190,7 @@ REPAIR_PROMPTS: tuple[str, ...] = (
     """nvcc failed on the previous kernel (arch {cuda_arch}). Return a full corrected `solution.cu`, not a patch.
 Keep the same algorithm and host responsibilities; fix compile errors only.
 
-Compiler output:
+nvcc output (deduplicated summary if over the size limit):
 ```
 {error}
 ```
@@ -201,7 +204,7 @@ Reply with exactly one ```cuda fence.""",
     """请根据 nvcc 报错修复上一版实现，目标 `{cuda_arch}`。
 给出整份可编译源码，不要解释，不要省略未改动的函数。
 
-报错：
+nvcc 输出（过长则已去重摘要）：
 ```
 {error}
 ```
@@ -218,6 +221,15 @@ CANDIDATE_TEMPERATURES = (0.2, 0.5, 0.8)
 
 
 class SelectedPrompts(NamedTuple):
+    """Prompts chosen for one candidate.
+
+    Attributes:
+        system: System prompt text.
+        user: Full user message (question + suffix).
+        system_index: Index into :data:`SYSTEM_PROMPTS`.
+        suffix_index: Index into :data:`USER_SUFFIXES`.
+    """
+
     system: str
     user: str
     system_index: int
@@ -225,6 +237,11 @@ class SelectedPrompts(NamedTuple):
 
 
 def candidate_temperature(candidate_idx: int) -> float:
+    """Temperature for candidate 1/2/3 (0.2 / 0.5 / 0.8).
+
+    Args:
+        candidate_idx: 1-based candidate number.
+    """
     if candidate_idx <= 1:
         return CANDIDATE_TEMPERATURES[0]
     if candidate_idx >= len(CANDIDATE_TEMPERATURES):
@@ -233,12 +250,26 @@ def candidate_temperature(candidate_idx: int) -> float:
 
 
 def _stable_index(n: int, question_id: int, candidate_idx: int, salt: int) -> int:
+    """Deterministic index in ``[0, n)`` (no randomness; resume-stable).
+
+    Args:
+        n: Pool size.
+        question_id: 1-based jsonl line id.
+        candidate_idx: 1-based candidate number.
+        salt: Distinguishes system vs suffix vs repair pools.
+    """
     if n <= 0:
         raise ValueError("empty prompt pool")
     return (int(question_id) * 31 + int(candidate_idx) * 17 + salt) % n
 
 
 def select_system_prompt(question_id: int, candidate_idx: int = 1) -> str:
+    """Pick a system prompt from :data:`SYSTEM_PROMPTS`.
+
+    Args:
+        question_id: Question id used for hashing.
+        candidate_idx: Candidate number (later candidates get another variant).
+    """
     idx = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
     return SYSTEM_PROMPTS[idx]
 
@@ -252,6 +283,16 @@ def build_user_prompt(
     question_id: int = 1,
     candidate_idx: int = 1,
 ) -> str:
+    """Concatenate the raw question with a varied generation suffix.
+
+    Args:
+        question: Original problem text.
+        gpu_name: Target GPU name inserted into the suffix.
+        cuda_arch: e.g. ``sm_86``.
+        cuda_version: e.g. ``12.6``.
+        question_id: Used to pick the suffix variant.
+        candidate_idx: Later candidates use a different suffix.
+    """
     idx = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
     suffix = USER_SUFFIXES[idx].format(
         gpu_name=gpu_name,
@@ -270,6 +311,16 @@ def select_prompts(
     cuda_arch: str,
     cuda_version: str,
 ) -> SelectedPrompts:
+    """Select system + user prompts for this question/candidate pair.
+
+    Args:
+        question: Original problem text.
+        question_id: 1-based id.
+        candidate_idx: 1-based candidate.
+        gpu_name: Inserted into the user suffix.
+        cuda_arch: Inserted into the user suffix.
+        cuda_version: Inserted into the user suffix.
+    """
     system_idx = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
     suffix_idx = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
     suffix = USER_SUFFIXES[suffix_idx].format(
@@ -295,6 +346,16 @@ def build_repair_prompt(
     candidate_idx: int = 1,
     repair_idx: int = 1,
 ) -> str:
+    """Build a compile-fix user message (full file, not a diff).
+
+    Args:
+        cuda_arch: Target nvcc arch.
+        compile_error: Truncated nvcc output.
+        previous_code: Last extracted CUDA source.
+        question_id: For variant selection.
+        candidate_idx: For variant selection.
+        repair_idx: 1-based repair round (changes wording).
+    """
     error = compile_error.strip() or "(empty compiler output)"
     code = previous_code.strip() or "(no source extracted)"
     idx = _stable_index(
@@ -307,23 +368,146 @@ def build_repair_prompt(
     )
 
 
-def truncate_compile_error(error: str, max_chars: int = 6000) -> str:
-    text = (error or "").strip()
-    if len(text) <= max_chars:
+_NVCC_DIAG_RE = re.compile(
+    r"^(?P<loc>\S.*?)\((?P<line>\d+)\):\s+"
+    r"(?P<kind>error|warning|fatal error)\b"
+    r"(?:\s+#\S+)?:\s+(?P<msg>.*)$",
+    re.IGNORECASE,
+)
+_NVCC_FATAL_RE = re.compile(
+    r"^(?:(?P<loc>\S.*?):\s+)?fatal error:\s+(?P<msg>.*)$",
+    re.IGNORECASE,
+)
+_TEMPLATE_CHUNK_RE = re.compile(r"<[^>]{24,}>")
+_CARET_LINE_RE = re.compile(r"^[\s^~]+$")
+_NOISE_SNIPPETS = (
+    "the warnings can be suppressed",
+    "remark: the warnings can be suppressed",
+)
+
+
+def _is_noise_line(line: str) -> bool:
+    """Return True for caret pointers, empty lines, and nvcc remark boilerplate."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _CARET_LINE_RE.match(stripped):
+        return True
+    lowered = stripped.lower()
+    return any(snippet in lowered for snippet in _NOISE_SNIPPETS)
+
+
+def _normalize_diag_message(message: str) -> str:
+    """Collapse whitespace and long template argument lists for dedup keys."""
+    collapsed = _TEMPLATE_CHUNK_RE.sub("<>", message)
+    return re.sub(r"\s+", " ", collapsed).strip().lower()
+
+
+def format_nvcc_for_prompt(output: str, max_chars: int = 6000) -> str:
+    """Prepare nvcc output for the repair prompt.
+
+    If ``output`` is at most ``max_chars``, return it unchanged. Otherwise build
+    a deduplicated summary of error/fatal lines (warnings only if space remains).
+
+    Args:
+        output: Full compiler stdout/stderr.
+        max_chars: Threshold from ``REPAIR_ERROR_MAX_CHARS``.
+
+    Returns:
+        Full log or a summary that fits in ``max_chars``.
+    """
+    text = (output or "").strip()
+    if not text:
+        return "(empty compiler output)"
+    if max_chars <= 0 or len(text) <= max_chars:
         return text
 
-    lines = text.splitlines()
-    important = [
-        line
-        for line in lines
-        if any(
-            token in line.lower()
-            for token in ("error:", "fatal error", "undefined", "error ")
-        )
-    ]
-    if important:
-        joined = "\n".join(important)
-        if len(joined) <= max_chars:
-            return joined
-        return joined[-max_chars:]
-    return text[-max_chars:]
+    errors: list[str] = []
+    warnings: list[str] = []
+    seen_error: set[str] = set()
+    seen_warning: set[str] = set()
+    error_count = 0
+    warning_count = 0
+
+    for raw in text.splitlines():
+        if _is_noise_line(raw):
+            continue
+        match = _NVCC_DIAG_RE.match(raw.strip())
+        kind = ""
+        msg = ""
+        loc = ""
+        line_no = ""
+        if match:
+            kind = match.group("kind").lower()
+            msg = match.group("msg")
+            loc = match.group("loc")
+            line_no = match.group("line")
+        else:
+            fatal = _NVCC_FATAL_RE.match(raw.strip())
+            if fatal:
+                kind = "fatal error"
+                msg = fatal.group("msg")
+                loc = fatal.group("loc") or ""
+        if not kind:
+            continue
+        key = f"{kind}|{_normalize_diag_message(msg)}"
+        display = raw.strip()
+        if loc and line_no and loc not in display:
+            display = f"{loc}({line_no}): {kind}: {msg.strip()}"
+        if kind in {"error", "fatal error"}:
+            error_count += 1
+            if key not in seen_error:
+                seen_error.add(key)
+                errors.append(display)
+        else:
+            warning_count += 1
+            if key not in seen_warning:
+                seen_warning.add(key)
+                warnings.append(display)
+
+    header = (
+        f"{error_count} errors ({len(errors)} unique), "
+        f"{warning_count} warnings ({len(warnings)} unique); "
+        f"log truncated from {len(text)} chars"
+    )
+    parts = [header, ""]
+    if errors:
+        parts.append("errors:")
+        parts.extend(errors)
+        parts.append("")
+    if warnings:
+        parts.append("warnings:")
+        parts.extend(warnings)
+
+    summary = "\n".join(parts).strip()
+    if len(summary) <= max_chars:
+        return summary
+
+    # Prefer unique errors over warnings if still too long.
+    kept: list[str] = [header, "", "errors:"]
+    used = len("\n".join(kept))
+    for item in errors:
+        extra = len(item) + 1
+        if used + extra > max_chars:
+            break
+        kept.append(item)
+        used += extra
+    if used < max_chars - 20 and warnings:
+        kept.append("")
+        kept.append("warnings:")
+        used = len("\n".join(kept))
+        for item in warnings:
+            extra = len(item) + 1
+            if used + extra > max_chars:
+                break
+            kept.append(item)
+            used += extra
+    result = "\n".join(kept).strip()
+    if len(result) > max_chars:
+        return result[:max_chars]
+    return result
+
+
+def truncate_compile_error(error: str, max_chars: int = 6000) -> str:
+    """Backward-compatible alias of :func:`format_nvcc_for_prompt`."""
+    return format_nvcc_for_prompt(error, max_chars=max_chars)

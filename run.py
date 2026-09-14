@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Project launcher: puts ``src/`` on ``sys.path`` then runs the CLI."""
+
 from __future__ import annotations
 
 import sys
