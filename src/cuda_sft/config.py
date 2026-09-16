@@ -185,6 +185,15 @@ class Settings(BaseSettings):
     use_judge_optimization: bool = Field(default=False)
     async_llm_enabled: bool = Field(default=True)
     async_llm_max_workers: int = Field(default=2, ge=1, le=4)
+    cot_enabled: bool = Field(default=True)
+    cot_agent_enabled: bool = Field(default=True)
+    cot_in_assistant: bool = Field(default=True)
+    cot_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    cot_max_chars: int = Field(default=8000, ge=200)
+    cot_raw_max_chars: int = Field(default=24000, ge=200)
+    cot_raw_store_max_chars: int = Field(default=32768, ge=0)
+    cot_on_empty: str = Field(default="synthetic")
+    cot_on_agent_fail: str = Field(default="raw")
 
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
@@ -246,6 +255,25 @@ class Settings(BaseSettings):
         name = aliases.get(name, name)
         if name not in {"simple", "detailed"}:
             raise ValueError("WORK_KEEP must be 'simple' or 'detailed'")
+        return name
+
+    @field_validator("cot_on_empty", "cot_on_agent_fail")
+    @classmethod
+    def _normalize_cot_fallback(cls, value: str) -> str:
+        """Map CoT fallback aliases to ``raw``, ``synthetic``, or ``empty``."""
+        name = (value or "").strip().lower()
+        aliases = {
+            "none": "empty",
+            "off": "empty",
+            "skip": "empty",
+            "teacher": "raw",
+            "thinking": "raw",
+            "rewrite": "synthetic",
+            "synth": "synthetic",
+        }
+        name = aliases.get(name, name)
+        if name not in {"raw", "synthetic", "empty"}:
+            raise ValueError("CoT fallback must be 'raw', 'synthetic', or 'empty'")
         return name
 
     @property

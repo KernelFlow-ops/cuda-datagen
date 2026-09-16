@@ -10,6 +10,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as Futur
 from dataclasses import dataclass
 from typing import Any
 
+from cuda_sft.llm import LLMCompletion
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,12 +21,12 @@ class PendingRequest:
 
     Attributes:
         request_id: Unique identifier (e.g., "c1_r2" for candidate 1, repair 2).
-        future: Future that will hold the LLM response text.
+        future: Future that will hold the LLM completion (text + reasoning).
         started_at: Timestamp when the request was initiated.
     """
 
     request_id: str
-    future: Future[str]
+    future: Future[LLMCompletion]
     started_at: float
 
 
@@ -72,20 +74,36 @@ class AsyncLLMPool:
                 logger.warning("Request %s already pending; skipping duplicate", request_id)
                 return
 
-        def _call() -> str:
+        def _call() -> LLMCompletion:
             """Wrapper for executor."""
             try:
                 logger.info("Async LLM call started: %s", request_id)
-                # Disable print_stream for background calls
-                text = llm_client.stream_text(
-                    messages=messages,
-                    system=system,
-                    temperature=temperature,
-                    print_stream=False,
+                stream_completion = getattr(llm_client, "stream_completion", None)
+                if callable(stream_completion):
+                    completion = stream_completion(
+                        messages=messages,
+                        system=system,
+                        temperature=temperature,
+                        print_stream=False,
+                    )
+                else:
+                    text = llm_client.stream_text(
+                        messages=messages,
+                        system=system,
+                        temperature=temperature,
+                        print_stream=False,
+                    )
+                    completion = LLMCompletion(
+                        text=text, reasoning="", reasoning_source="empty"
+                    )
+                logger.info(
+                    "Async LLM call completed: %s (%d chars, reasoning=%d)",
+                    request_id,
+                    len(completion.text or ""),
+                    len(completion.reasoning or ""),
                 )
-                logger.info("Async LLM call completed: %s (%d chars)", request_id, len(text))
-                return text
-            except Exception as exc:
+                return completion
+            except Exception:
                 logger.exception("Async LLM call failed: %s", request_id)
                 raise
 
@@ -104,7 +122,7 @@ class AsyncLLMPool:
         with self._lock:
             return request_id in self.pending
 
-    def try_get(self, request_id: str, timeout_sec: float = 0) -> str | None:
+    def try_get(self, request_id: str, timeout_sec: float = 0) -> LLMCompletion | None:
         """Attempt to retrieve a completed LLM response.
 
         A timeout leaves the request in the pool so the caller can wait
@@ -117,7 +135,7 @@ class AsyncLLMPool:
             timeout_sec: How long to wait. 0 = non-blocking check.
 
         Returns:
-            LLM response text if ready, else None.
+            LLM completion if ready, else None.
         """
         with self._lock:
             req = self.pending.get(request_id)

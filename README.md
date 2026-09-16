@@ -34,6 +34,15 @@ cp .env.example .env   # 若还没有 .env
 | `WORKERS` | `1` | `WORKERS_PER_PROVIDER=0` 时的总进程数；nvidia worker 在多个 key 间轮询 |
 | `JUDGE_ENABLED` | `true` | 启用 Judge Agent 代码质量评估 |
 | `USE_JUDGE_OPTIMIZATION` | `false` | 是否应用 Judge 的轻量优化建议（需重新编译验证） |
+| `COT_ENABLED` | `true` | 采集 API reasoning/thinking，并走 CoT 节点 |
+| `COT_AGENT_ENABLED` | `true` | 用 CoT Agent 把原始 thinking 整理成教学型 CoT（额外一次 LLM 调用） |
+| `COT_IN_ASSISTANT` | `true` | 训练标签是否包 `<think>…</think>` + 源码 |
+| `COT_TEMPERATURE` | `0.2` | CoT Agent 采样温度 |
+| `COT_MAX_CHARS` | `8000` | 整理后 CoT 字符上限 |
+| `COT_RAW_MAX_CHARS` | `24000` | 送进 Agent 的原始 thinking 上限 |
+| `COT_RAW_STORE_MAX_CHARS` | `32768` | `sft.jsonl` metadata 里归档 raw thinking 的上限 |
+| `COT_ON_EMPTY` | `synthetic` | 教师 thinking 为空时：`synthetic`（由终稿代码反写）/ `empty` |
+| `COT_ON_AGENT_FAIL` | `raw` | Agent 失败回退：`raw` / `synthetic` / `empty` |
 | `ASYNC_LLM_ENABLED` | `true` | 启用异步 LLM 调用（编译期间预生成修复轮响应） |
 | `ASYNC_LLM_MAX_WORKERS` | `2` | 异步 LLM 并发数（1-4） |
 | `LLM_PROVIDERS` | 空 | 逗号分隔多 provider，如 `nvidia,openrouter` |
@@ -99,7 +108,7 @@ python run.py --workers 6 --limit 12 --quiet   # 并发试跑
 
 | 文件 | 内容 |
 |---|---|
-| `data/sft.jsonl` | 生成归档（`messages` + `id`/`metadata`，便于排查） |
+| `data/sft.jsonl` | 生成归档（`messages` + `id`/`metadata`；`metadata.raw_reasoning` 为原始 thinking，`metadata.cot` 为整理结果） |
 | `data/sft_ms_swift.jsonl` | **ms-swift SFT** 标准 `messages` 格式 |
 | `data/sft_openrlhf.jsonl` | **OpenRLHF SFT** 的 `input`/`output` 对话格式 |
 | `data/abandoned.jsonl` | 3 个候选都失败的题目和最后编译错误 |
@@ -107,7 +116,18 @@ python run.py --workers 6 --limit 12 --quiet   # 并发试跑
 | `data/run.log` | 当次运行日志（每次启动会清空旧的 `run*.log`，多进程共用这一份） |
 | `work/` | `WORK_KEEP=simple` 时每题只留最后 `solution.cu`；`detailed` 时为 `q{id}/c{c}/r{r}/` |
 
-SFT 的 assistant 内容是抽取后的 CUDA 源码，不含 thinking。已有 `sft.jsonl` 时可以只做格式导出（不调 API）：
+默认 SFT assistant 是「整理后的 CoT + 抽取后的 CUDA 源码」：
+
+```
+<think>
+1. Problem restatement
+...
+</think>
+#include <cuda_runtime.h>
+...
+```
+
+原始 API thinking 写在 `sft.jsonl` 的 `metadata.raw_reasoning`，不进 ms-swift / OpenRLHF。`COT_IN_ASSISTANT=false` 时训练 jsonl 仍为纯代码。已有 `sft.jsonl` 时可以只做格式导出（不调 API）：
 
 ```bash
 python run.py --export-sft
@@ -151,10 +171,10 @@ deepspeed --module openrlhf.cli.train_sft \
 
 ```
 prepare → generate → extract → compile
-                         ├ compile ok → save_success
+                         ├ compile ok → judge → cot → save_success
                          ├ repair < 3 → repair → generate
                          ├ candidate < 3 → next_candidate → generate
                          └ else → save_abandoned
 ```
 
-LLM：`LLM_PROVIDER=openrouter` 时走 Anthropic Messages（`POST {OPENROUTER_BASE_URL}/v1/messages`）；`nvidia` 时走 OpenAI Chat Completions 流式（`{NVIDIA_BASE_URL}/chat/completions`），thinking 只用于推理，不写入 SFT。
+LLM：`LLM_PROVIDER=openrouter` 时走 Anthropic Messages（`POST {OPENROUTER_BASE_URL}/v1/messages`）；`nvidia` 时走 OpenAI Chat Completions 流式（`{NVIDIA_BASE_URL}/chat/completions`）。生成时采集 reasoning/thinking（OpenRouter：`thinking` block / `reasoning` 字段；NVIDIA：`delta.reasoning_content`，必要时再从 `<think>` 标签兜底）。`judge` 与 `cot` 在开关关闭时 no-op。CoT Agent 只整理胜出样本的推理，不改已经通过编译的代码。高质量 CoT 建议保持 `THINKING_LEVEL=medium` 或 `high`，并让 `MAX_OUTPUT_TOKENS` 明显大于思考预算。

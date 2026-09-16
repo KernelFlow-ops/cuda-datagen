@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
 
 import anthropic
 from anthropic import Anthropic
 
 from cuda_sft.config import Settings, get_settings
+from cuda_sft.parse import extract_thinking, strip_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +32,34 @@ class LLMError(Exception):
     """Retryable LLM / transport failure."""
 
 
+@dataclass(frozen=True)
+class LLMCompletion:
+    """One streamed completion, with visible text split from reasoning.
+
+    Attributes:
+        text: Visible assistant text (think tags stripped when they were extracted).
+        reasoning: Concatenated chain-of-thought / thinking.
+        reasoning_source: How reasoning was obtained.
+    """
+
+    text: str
+    reasoning: str = ""
+    reasoning_source: str = "empty"
+
+
 class LLMClient(Protocol):
     """Minimal interface used by the generate node."""
+
+    def stream_completion(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        system: str,
+        temperature: float,
+        print_stream: bool = True,
+    ) -> LLMCompletion:
+        """Stream a completion and return visible text plus reasoning."""
+        ...
 
     def stream_text(
         self,
@@ -120,16 +148,144 @@ def is_retryable_llm_error(exc: BaseException) -> bool:
     return any(hint in _error_text(exc) for hint in UPSTREAM_RETRY_HINTS)
 
 
+def _block_type(block: Any) -> str:
+    """Return a content-block type string from an object or dict."""
+    if isinstance(block, dict):
+        return str(block.get("type") or "")
+    return str(getattr(block, "type", None) or "")
+
+
+def _block_field(block: Any, *names: str) -> str:
+    """Read the first non-empty string field from a content block."""
+    for name in names:
+        if isinstance(block, dict):
+            value = block.get(name)
+        else:
+            value = getattr(block, name, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def _text_from_content_blocks(content: Iterable[Any]) -> str:
     """Join Anthropic ``type=text`` content blocks into one string."""
     parts: list[str] = []
     for block in content:
-        block_type = getattr(block, "type", None)
-        if block_type == "text":
-            parts.append(getattr(block, "text", "") or "")
-        elif isinstance(block, dict) and block.get("type") == "text":
-            parts.append(str(block.get("text") or ""))
+        if _block_type(block) == "text":
+            parts.append(_block_field(block, "text"))
     return "".join(parts)
+
+
+def _thinking_from_content_blocks(content: Iterable[Any]) -> str:
+    """Join Anthropic thinking / reasoning content blocks."""
+    parts: list[str] = []
+    for block in content:
+        block_type = _block_type(block)
+        if block_type in {"thinking", "redacted_thinking"}:
+            parts.append(_block_field(block, "thinking", "text"))
+        elif block_type in {"reasoning", "reasoning.text"}:
+            parts.append(_block_field(block, "text", "thinking", "reasoning"))
+    return "".join(parts)
+
+
+def _extra_mapping(obj: Any) -> dict[str, Any]:
+    """Best-effort extra-field dict from an SDK model or mapping."""
+    if isinstance(obj, dict):
+        return obj
+    for attr in ("model_extra", "__pydantic_extra__", "extra"):
+        extra = getattr(obj, attr, None)
+        if isinstance(extra, dict):
+            return extra
+    return {}
+
+
+def _attr_text(obj: Any, *names: str) -> str:
+    """Read the first non-empty string attribute / extra field / dict key."""
+    extra = _extra_mapping(obj)
+    for name in names:
+        value = getattr(obj, name, None)
+        if value:
+            return str(value)
+        if extra.get(name):
+            return str(extra[name])
+        if isinstance(obj, dict) and obj.get(name):
+            return str(obj[name])
+    return ""
+
+
+def reasoning_from_openrouter_message(message: Any) -> str:
+    """Collect OpenRouter ``reasoning`` / ``reasoning_details`` from a message."""
+    text = _attr_text(message, "reasoning", "reasoning_content")
+    details = getattr(message, "reasoning_details", None)
+    extra = _extra_mapping(message)
+    if details is None:
+        details = extra.get("reasoning_details")
+    if isinstance(message, dict) and details is None:
+        details = message.get("reasoning_details")
+    if not details:
+        return text
+    parts: list[str] = []
+    for item in details:
+        chunk = _attr_text(item, "text", "reasoning", "thinking")
+        if chunk:
+            parts.append(chunk)
+    detail_text = "".join(parts)
+    if detail_text.strip() and (not text.strip() or len(detail_text) > len(text)):
+        return detail_text
+    return text
+
+
+def assemble_completion(
+    *,
+    visible_text: str,
+    reasoning_candidates: list[tuple[str, str]],
+) -> LLMCompletion:
+    """Pick the first non-empty reasoning candidate, then think-tag fallback.
+
+    Args:
+        visible_text: Streamed or final visible assistant text.
+        reasoning_candidates: ``(text, source)`` pairs in priority order.
+
+    Returns:
+        Completion with think tags stripped from ``text`` when they were used
+        as the reasoning source (or when tags were present alongside API fields).
+    """
+    tagged = extract_thinking(visible_text)
+    visible = strip_thinking(visible_text) if tagged else (visible_text or "")
+    for candidate, source in reasoning_candidates:
+        if candidate and str(candidate).strip():
+            return LLMCompletion(
+                text=visible or (visible_text or ""),
+                reasoning=str(candidate).strip(),
+                reasoning_source=source,
+            )
+    if tagged.strip():
+        return LLMCompletion(
+            text=visible,
+            reasoning=tagged.strip(),
+            reasoning_source="think_tags",
+        )
+    return LLMCompletion(
+        text=visible or (visible_text or ""),
+        reasoning="",
+        reasoning_source="empty",
+    )
+
+
+def _stream_event_delta(event: Any) -> Any:
+    """Return the delta payload of an Anthropic stream event, if any."""
+    if event is None:
+        return None
+    if isinstance(event, dict):
+        return event.get("delta")
+    return getattr(event, "delta", None)
+
+
+def _stream_event_type(event: Any) -> str:
+    """Return the type of an Anthropic stream event."""
+    if isinstance(event, dict):
+        return str(event.get("type") or "")
+    return str(getattr(event, "type", None) or "")
 
 
 def approx_tokens(text: str) -> int:
@@ -264,7 +420,23 @@ class AnthropicOpenRouterClient:
         temperature: float,
         print_stream: bool = True,
     ) -> str:
-        """Stream an Anthropic Messages completion; return text (not thinking).
+        """Stream an Anthropic Messages completion; return visible text."""
+        return self.stream_completion(
+            messages=messages,
+            system=system,
+            temperature=temperature,
+            print_stream=print_stream,
+        ).text
+
+    def stream_completion(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        system: str,
+        temperature: float,
+        print_stream: bool = True,
+    ) -> LLMCompletion:
+        """Stream an Anthropic Messages completion with reasoning captured.
 
         Args:
             messages: User/assistant turns (no system role).
@@ -273,7 +445,7 @@ class AnthropicOpenRouterClient:
             print_stream: Echo content tokens to stdout.
 
         Returns:
-            Assistant visible text.
+            Visible text plus reasoning (thinking blocks / OpenRouter field).
 
         Raises:
             LLMError: Retryable HTTP/transport failures.
@@ -281,7 +453,7 @@ class AnthropicOpenRouterClient:
         extra_body: dict[str, Any] = {}
         thinking = self.settings.thinking_level.strip()
         if _thinking_enabled(self.settings):
-            extra_body["reasoning"] = {"effort": thinking}
+            extra_body["reasoning"] = {"effort": thinking, "exclude": False}
 
         system, messages = fit_to_input_budget(
             system, messages, self.settings.max_input_tokens
@@ -297,14 +469,27 @@ class AnthropicOpenRouterClient:
             request["extra_body"] = extra_body
 
         streamed_text: list[str] = []
+        streamed_reasoning: list[str] = []
         try:
             with self._client.messages.stream(**request) as stream:
-                for chunk in stream.text_stream:
-                    if not chunk:
+                for event in stream:
+                    if _stream_event_type(event) != "content_block_delta":
                         continue
-                    streamed_text.append(chunk)
-                    if print_stream:
-                        print(chunk, end="", file=sys.stdout, flush=True)
+                    delta = _stream_event_delta(event)
+                    if delta is None:
+                        continue
+                    delta_type = _block_type(delta)
+                    if delta_type == "thinking_delta":
+                        chunk = _attr_text(delta, "thinking", "text")
+                        if chunk:
+                            streamed_reasoning.append(chunk)
+                    elif delta_type == "text_delta":
+                        chunk = _attr_text(delta, "text")
+                        if not chunk:
+                            continue
+                        streamed_text.append(chunk)
+                        if print_stream:
+                            print(chunk, end="", file=sys.stdout, flush=True)
                 final = stream.get_final_message()
         except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
             status = getattr(exc, "status_code", None)
@@ -319,11 +504,22 @@ class AnthropicOpenRouterClient:
         if print_stream and streamed_text:
             print(file=sys.stdout, flush=True)
 
-        final_text = _text_from_content_blocks(getattr(final, "content", []) or [])
+        content = getattr(final, "content", None) or []
+        final_text = _text_from_content_blocks(content)
         text = final_text or "".join(streamed_text)
-        if not text.strip():
+        block_reasoning = _thinking_from_content_blocks(content)
+        field_reasoning = reasoning_from_openrouter_message(final)
+        completion = assemble_completion(
+            visible_text=text,
+            reasoning_candidates=[
+                (block_reasoning, "anthropic_thinking"),
+                (field_reasoning, "openrouter_reasoning"),
+                ("".join(streamed_reasoning), "anthropic_thinking"),
+            ],
+        )
+        if not completion.text.strip():
             logger.warning("LLM returned empty text content (thinking-only or blank).")
-        return text
+        return completion
 
 
 class NvidiaOpenAIClient:
@@ -362,7 +558,23 @@ class NvidiaOpenAIClient:
         temperature: float,
         print_stream: bool = True,
     ) -> str:
-        """Stream Chat Completions; collect ``delta.content`` only (not reasoning).
+        """Stream Chat Completions; return visible text (not reasoning)."""
+        return self.stream_completion(
+            messages=messages,
+            system=system,
+            temperature=temperature,
+            print_stream=print_stream,
+        ).text
+
+    def stream_completion(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        system: str,
+        temperature: float,
+        print_stream: bool = True,
+    ) -> LLMCompletion:
+        """Stream Chat Completions; collect content and reasoning deltas.
 
         Args:
             messages: User/assistant turns.
@@ -371,7 +583,7 @@ class NvidiaOpenAIClient:
             print_stream: Echo content tokens to stdout.
 
         Returns:
-            Assistant visible text.
+            Visible text plus ``reasoning_content`` / think-tag fallback.
 
         Raises:
             LLMError: Retryable HTTP/transport failures.
@@ -396,6 +608,7 @@ class NvidiaOpenAIClient:
             extra_body["chat_template_kwargs"]["reasoning_effort"] = thinking
 
         streamed_text: list[str] = []
+        streamed_reasoning: list[str] = []
         try:
             completion = self._client.chat.completions.create(
                 model=self.settings.resolved_model,
@@ -410,7 +623,10 @@ class NvidiaOpenAIClient:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
+                reason = _attr_text(delta, "reasoning_content", "reasoning")
+                if reason:
+                    streamed_reasoning.append(reason)
+                content = _attr_text(delta, "content")
                 if content:
                     streamed_text.append(content)
                     if print_stream:
@@ -432,9 +648,15 @@ class NvidiaOpenAIClient:
             print(file=sys.stdout, flush=True)
 
         text = "".join(streamed_text)
-        if not text.strip():
+        result = assemble_completion(
+            visible_text=text,
+            reasoning_candidates=[
+                ("".join(streamed_reasoning), "nvidia_delta"),
+            ],
+        )
+        if not result.text.strip():
             logger.warning("LLM returned empty text content (thinking-only or blank).")
-        return text
+        return result
 
 
 _client: LLMClient | None = None

@@ -219,6 +219,97 @@ nvcc 输出（过长则已去重摘要）：
 
 CANDIDATE_TEMPERATURES = (0.2, 0.5, 0.8)
 
+COT_SYSTEM_PROMPT = """你是 CUDA SFT 思维链编辑器，不是写代码的人。最终 solution.cu 已经通过编译；你只整理可学习的推理。
+You are the CUDA SFT Chain-of-Thought editor.
+
+Your job is NOT to write a new kernel. A compilable solution.cu already exists.
+You rewrite the teacher's raw reasoning into a clean, pedagogical CoT that a
+student CUDA model should imitate before emitting code.
+
+Role constraints:
+- Faithful to the FINAL source: every claim in the CoT must match the given
+  solution.cu. Do not invent algorithms, headers, APIs, or optimizations that
+  the code does not implement.
+- Teaching voice: concise, ordered, technical. Prefer "what we chose and why"
+  over inner monologue, self-doubt, or abandoned drafts.
+- If raw thinking contradicts the final code, trust the code and briefly note
+  the correction (e.g. indexing, bounds, sync) without replaying the wrong path.
+- If raw thinking is missing or noisy, reconstruct CoT from the problem and the
+  final code only.
+- Do not emit CUDA source, markdown fences, diffs, or a second solution.
+- Do not mention this editor role, the judge, nvcc, or the data pipeline.
+- Match the problem language (Chinese problem → Chinese CoT; English → English).
+- Target length: 400–1200 Chinese characters or 250–800 English words; never
+  exceed the stated character budget.
+
+Required CoT skeleton (use these headings, keep them short):
+1. Problem restatement — tensors/shapes, host entry, success criteria.
+2. Algorithm — formula, reduction/scan/gemm pattern, numerical notes.
+3. Thread/block mapping — index math, grid/block, why this layout.
+4. Memory and sync — global/shared/registers, coalescing, __syncthreads__.
+5. Bounds and edge cases — empty n, misaligned tails, overflow.
+6. Implementation checklist — 4–8 bullets that map onto the actual code
+   (includes, kernel name, host launcher, key locals).
+"""
+
+COT_USER_TEMPLATE = """## Problem
+{question}
+
+## Final CUDA (compile-passed, do not change)
+```cuda
+{code}
+```
+
+## Raw teacher thinking (may be empty, noisy, or contradictory)
+{raw_reasoning}
+
+## Optional compile/repair notes (context only; do not copy logs into CoT)
+repairs={repair_idx}; last_error_summary={error_summary}
+judge_issues={judge_issues}
+judge_suggestions={judge_suggestions}
+
+## Output
+Return ONLY the polished CoT using the six headings. No code fences. Character budget: {max_chars}.
+"""
+
+
+def build_cot_user_prompt(
+    *,
+    question: str,
+    code: str,
+    raw_reasoning: str,
+    repair_idx: int = 0,
+    error_summary: str = "",
+    judge_issues: list[str] | None = None,
+    judge_suggestions: list[str] | None = None,
+    max_chars: int = 8000,
+) -> str:
+    """Build the CoT-editor user message for one winning sample.
+
+    Args:
+        question: Original problem text (not the generation suffix).
+        code: Compile-passed CUDA source.
+        raw_reasoning: Teacher thinking, already truncated/cleaned.
+        repair_idx: How many compile-fix rounds the winner used.
+        error_summary: Last nvcc summary (optional context).
+        judge_issues: Judge issues, if any.
+        judge_suggestions: Judge suggestions, if any.
+        max_chars: Character budget told to the editor.
+    """
+    issues = judge_issues or []
+    suggestions = judge_suggestions or []
+    return COT_USER_TEMPLATE.format(
+        question=(question or "").strip() or "(empty problem)",
+        code=(code or "").strip() or "(no source)",
+        raw_reasoning=(raw_reasoning or "").strip() or "(none)",
+        repair_idx=int(repair_idx or 0),
+        error_summary=(error_summary or "").strip() or "(none)",
+        judge_issues="; ".join(issues) if issues else "(none)",
+        judge_suggestions="; ".join(suggestions) if suggestions else "(none)",
+        max_chars=int(max_chars),
+    ).strip()
+
+
 
 class SelectedPrompts(NamedTuple):
     """Prompts chosen for one candidate.

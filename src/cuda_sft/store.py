@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from cuda_sft.config import get_settings
 from cuda_sft.formats import to_ms_swift, to_openrlhf
+from cuda_sft.parse import wrap_cot_assistant
 from cuda_sft.state import GraphState
 
 
@@ -110,9 +112,48 @@ class Store:
             state: Final graph state (must include ``user_prompt`` and ``code``).
             model_name: Provider model id stored in metadata.
         """
+        settings = get_settings()
         user = state["user_prompt"]
-        assistant = state["code"]
+        code = state["code"]
+        cot = str(state.get("cot") or "")
+        if settings.cot_enabled and settings.cot_in_assistant and cot.strip():
+            assistant = wrap_cot_assistant(cot, code)
+        else:
+            assistant = code
         system = str(state.get("system_prompt") or "")
+        extra_meta = dict(state.get("metadata") or {})
+        metadata: dict[str, Any] = {
+            "candidate": state.get("candidate_idx", 1),
+            "repairs": state.get("repair_idx", 0),
+            "arch": state.get("cuda_arch", ""),
+            "gpu_name": state.get("gpu_name", ""),
+            "model": model_name,
+            "used_rdc": state.get("used_rdc", False),
+            "system": system,
+            "judge_score": state.get("judge_score", 0),
+        }
+        if extra_meta.get("judge"):
+            metadata["judge"] = extra_meta["judge"]
+        if settings.cot_enabled:
+            cot_meta = extra_meta.get("cot")
+            if not isinstance(cot_meta, dict):
+                cot_meta = {}
+            metadata["cot"] = {
+                "source": state.get("cot_source") or cot_meta.get("source") or "empty",
+                "text": cot,
+                "reasoning_source": state.get("reasoning_source")
+                or cot_meta.get("reasoning_source")
+                or "",
+                "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
+                "polished_chars": len(cot),
+                "error": state.get("cot_error") or cot_meta.get("error") or "",
+            }
+            raw = str(state.get("raw_reasoning") or "")
+            limit = settings.cot_raw_store_max_chars
+            if raw:
+                if limit > 0 and len(raw) > limit:
+                    raw = raw[:limit].rstrip() + "\n...[truncated reasoning]..."
+                metadata["raw_reasoning"] = raw
         sample = {
             "id": state["question_id"],
             "messages": [
@@ -120,21 +161,7 @@ class Store:
                 {"role": "user", "content": user},
                 {"role": "assistant", "content": assistant},
             ],
-            "metadata": {
-                "candidate": state.get("candidate_idx", 1),
-                "repairs": state.get("repair_idx", 0),
-                "arch": state.get("cuda_arch", ""),
-                "gpu_name": state.get("gpu_name", ""),
-                "model": model_name,
-                "used_rdc": state.get("used_rdc", False),
-                "system": system,
-                "judge_score": state.get("judge_score", 0),
-                **(
-                    {"judge": (state.get("metadata") or {}).get("judge")}
-                    if (state.get("metadata") or {}).get("judge")
-                    else {}
-                ),
-            },
+            "metadata": metadata,
         }
         _append_jsonl(self.sft_path, sample)
         _append_jsonl(self.swift_path, to_ms_swift(user, assistant, system=system))

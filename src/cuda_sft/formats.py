@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from cuda_sft.config import get_settings
+from cuda_sft.parse import extract_cuda_source, extract_thinking, wrap_cot_assistant
 from cuda_sft.prompt import SYSTEM_PROMPT
 
 
@@ -116,11 +118,39 @@ def iter_sft_rows(path: Path) -> Iterable[dict[str, Any]]:
                 yield row
 
 
+def resolve_export_assistant(row: dict[str, Any], *, cot_in_assistant: bool) -> str:
+    """Build the training assistant label, optionally wrapping archived CoT.
+
+    If the archive assistant already contains a ``<think>`` block, keep it when
+    ``cot_in_assistant`` is true, otherwise strip to CUDA source. If the
+    assistant is code-only but ``metadata.cot.text`` is present, wrap on export.
+    """
+    pair = split_user_assistant(row)
+    assistant = pair[1] if pair else str(row.get("code") or "")
+    tagged = extract_thinking(assistant)
+    code = extract_cuda_source(assistant)
+    if not (code or "").strip():
+        code = str(row.get("code") or "")
+    cot = tagged
+    if not cot.strip():
+        metadata = row.get("metadata")
+        if isinstance(metadata, dict):
+            info = metadata.get("cot")
+            if isinstance(info, dict):
+                cot = str(info.get("text") or "")
+            if not cot.strip():
+                cot = str(metadata.get("cot_text") or "")
+    if cot_in_assistant and cot.strip():
+        return wrap_cot_assistant(cot, code or assistant)
+    return (code or assistant).strip() + ("\n" if (code or assistant).strip() else "")
+
+
 def export_training_files(src: Path, data_dir: Path) -> tuple[int, Path, Path]:
     """Rewrite framework-specific jsonl from the generation archive."""
     data_dir.mkdir(parents=True, exist_ok=True)
     swift_path = data_dir / "sft_ms_swift.jsonl"
     openrlhf_path = data_dir / "sft_openrlhf.jsonl"
+    cot_in_assistant = bool(get_settings().cot_in_assistant)
     count = 0
     with swift_path.open("w", encoding="utf-8") as swift_f, openrlhf_path.open(
         "w", encoding="utf-8"
@@ -129,7 +159,10 @@ def export_training_files(src: Path, data_dir: Path) -> tuple[int, Path, Path]:
             pair = split_user_assistant(row)
             if pair is None:
                 continue
-            user, assistant = pair
+            user, _assistant = pair
+            assistant = resolve_export_assistant(row, cot_in_assistant=cot_in_assistant)
+            if not assistant.strip():
+                continue
             system = extract_system(row)
             swift_f.write(
                 json.dumps(to_ms_swift(user, assistant, system=system), ensure_ascii=False)

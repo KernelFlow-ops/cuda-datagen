@@ -1,4 +1,4 @@
-"""LangGraph: generate → extract → compile → repair / next candidate / save."""
+"""LangGraph: generate → extract → compile → repair / judge → cot / save."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from langgraph.graph import END, START, StateGraph
 
 from cuda_sft.compile import attempt_workdir, compile_cuda_source, finalize_question_work
 from cuda_sft.config import get_settings
+from cuda_sft.cot import CotAgent
 from cuda_sft.judge import CudaCodeJudge
-from cuda_sft.llm import get_llm_client, is_retryable_llm_error
+from cuda_sft.llm import LLMCompletion, get_llm_client, is_retryable_llm_error
 from cuda_sft.llm_async import get_async_pool
 from cuda_sft.parse import extract_cuda_source
 from cuda_sft.prompt import (
@@ -97,6 +98,11 @@ def prepare(state: GraphState) -> dict[str, Any]:
         "judge_suggestions": [],
         "metadata": {},
         "speculative_requests": [],
+        "raw_reasoning": "",
+        "reasoning_source": "empty",
+        "cot": "",
+        "cot_source": "empty",
+        "cot_error": "",
     }
 
 
@@ -120,30 +126,59 @@ def generate(state: GraphState) -> dict[str, Any]:
 
     # Check if we have a speculative response ready
     request_id = f"q{qid}_c{cand}_r{repair}"
-    text = None
+    completion: LLMCompletion | None = None
 
     if settings.async_llm_enabled:
         pool = get_async_pool(settings.async_llm_max_workers)
         if pool.is_pending(request_id):
-            text = pool.try_get(request_id, timeout_sec=settings.llm_timeout_sec)
-            if text:
+            completion = pool.try_get(request_id, timeout_sec=settings.llm_timeout_sec)
+            if completion is not None:
                 logger.info("%s using speculative LLM response (saved ~10-30s)", header)
                 print(f"\n{header} using cached response...", flush=True)
 
-    if text is None:
+    if completion is None:
         logger.info("%s calling model", header)
         print(f"\n{header} generating...", flush=True)
-        text = client.stream_text(
-            messages=state["messages"],
-            system=state.get("system_prompt") or SYSTEM_PROMPT,
-            temperature=temperature,
-            print_stream=PRINT_STREAM,
-        )
+        stream_completion = getattr(client, "stream_completion", None)
+        if callable(stream_completion):
+            completion = stream_completion(
+                messages=state["messages"],
+                system=state.get("system_prompt") or SYSTEM_PROMPT,
+                temperature=temperature,
+                print_stream=PRINT_STREAM,
+            )
+        else:
+            text = client.stream_text(
+                messages=state["messages"],
+                system=state.get("system_prompt") or SYSTEM_PROMPT,
+                temperature=temperature,
+                print_stream=PRINT_STREAM,
+            )
+            completion = LLMCompletion(
+                text=text, reasoning="", reasoning_source="empty"
+            )
 
+    text = completion.text
+    reasoning = completion.reasoning if settings.cot_enabled else ""
+    reasoning_source = (
+        completion.reasoning_source if settings.cot_enabled else "empty"
+    )
+    if reasoning:
+        logger.info(
+            "%s captured reasoning (%s chars, source=%s)",
+            header,
+            len(reasoning),
+            reasoning_source,
+        )
     assistant_content = text if text.strip() else "(empty response)"
     messages = list(state.get("messages") or [])
     messages.append({"role": "assistant", "content": assistant_content})
-    return {"raw_response": text, "messages": messages}
+    return {
+        "raw_response": text,
+        "messages": messages,
+        "raw_reasoning": reasoning,
+        "reasoning_source": reasoning_source,
+    }
 
 
 def extract(state: GraphState) -> dict[str, Any]:
@@ -355,6 +390,11 @@ def next_candidate(state: GraphState) -> dict[str, Any]:
         "compile_ok": False,
         "compile_error": "",
         "used_rdc": False,
+        "raw_reasoning": "",
+        "reasoning_source": "empty",
+        "cot": "",
+        "cot_source": "empty",
+        "cot_error": "",
     }
 
 
@@ -369,11 +409,12 @@ def save_success(state: GraphState) -> dict[str, Any]:
         success=True,
     )
     logger.info(
-        "Q%s saved SFT sample (candidate=%s repairs=%s judge_score=%s)",
+        "Q%s saved SFT sample (candidate=%s repairs=%s judge_score=%s cot=%s)",
         state["question_id"],
         state.get("candidate_idx", 1),
         state.get("repair_idx", 0),
         state.get("judge_score", 0),
+        state.get("cot_source", "empty"),
     )
     return {"status": "success"}
 
@@ -404,6 +445,8 @@ def judge(state: GraphState) -> dict[str, Any]:
             "judge_issues": [],
             "judge_suggestions": [],
             "speculative_requests": [],
+            "winner_found": True,
+            "winner_candidate": int(state.get("candidate_idx") or 1),
         }
 
     judge_engine = CudaCodeJudge(settings)
@@ -446,6 +489,51 @@ def judge(state: GraphState) -> dict[str, Any]:
     }
 
 
+def cot(state: GraphState) -> dict[str, Any]:
+    """Polish teacher thinking into SFT CoT after a compile-passing sample.
+
+    Args:
+        state: Winning state; uses ``raw_reasoning`` and ``code``.
+    """
+    settings = get_settings()
+    if not settings.cot_enabled:
+        return {
+            "cot": "",
+            "cot_source": "empty",
+            "cot_error": "",
+        }
+
+    result = CotAgent(settings).refine(state)
+    metadata = dict(state.get("metadata") or {})
+    metadata["cot"] = {
+        "source": result.source,
+        "text": result.cot,
+        "reasoning_source": state.get("reasoning_source") or "",
+        "raw_chars": len(result.raw_reasoning or ""),
+        "polished_chars": len(result.cot or ""),
+        "error": result.error,
+    }
+    logger.info(
+        "Q%s cot: source=%s raw=%s polished=%s",
+        state["question_id"],
+        result.source,
+        len(result.raw_reasoning or ""),
+        len(result.cot or ""),
+    )
+    print(
+        f"[Q{state['question_id']}] cot: source={result.source} "
+        f"chars={len(result.cot or '')}",
+        flush=True,
+    )
+    return {
+        "cot": result.cot,
+        "cot_source": result.source,
+        "cot_error": result.error,
+        "raw_reasoning": result.raw_reasoning,
+        "metadata": metadata,
+    }
+
+
 def save_abandoned(state: GraphState) -> dict[str, Any]:
     """Write the abandoned record after all candidates failed."""
     settings = get_settings()
@@ -463,11 +551,11 @@ def save_abandoned(state: GraphState) -> dict[str, Any]:
 
 def route_after_compile(
     state: GraphState,
-) -> Literal["judge", "save_success", "repair", "next_candidate", "save_abandoned"]:
+) -> Literal["judge", "repair", "next_candidate", "save_abandoned"]:
     """Route after compile: judge (if ok), repair, next candidate, or abandon."""
     settings = get_settings()
     if state.get("compile_ok"):
-        return "judge" if settings.judge_enabled else "save_success"
+        return "judge"
     if int(state.get("repair_idx") or 0) < settings.max_repairs:
         return "repair"
     if int(state.get("candidate_idx") or 1) < settings.max_candidates:
@@ -492,6 +580,7 @@ def build_graph():
     builder.add_node("repair", repair)
     builder.add_node("next_candidate", next_candidate)
     builder.add_node("judge", judge)
+    builder.add_node("cot", cot)
     builder.add_node("save_success", save_success)
     builder.add_node("save_abandoned", save_abandoned)
 
@@ -504,7 +593,6 @@ def build_graph():
         route_after_compile,
         {
             "judge": "judge",
-            "save_success": "save_success",
             "repair": "repair",
             "next_candidate": "next_candidate",
             "save_abandoned": "save_abandoned",
@@ -519,7 +607,8 @@ def build_graph():
         },
     )
     builder.add_edge("next_candidate", "generate")
-    builder.add_edge("judge", "save_success")
+    builder.add_edge("judge", "cot")
+    builder.add_edge("cot", "save_success")
     builder.add_edge("save_success", END)
     builder.add_edge("save_abandoned", END)
     return builder.compile()
@@ -528,6 +617,6 @@ def build_graph():
 def recursion_limit() -> int:
     """LangGraph superstep cap covering 3 candidates x (1 gen + 3 repairs)."""
     settings = get_settings()
-    # prepare + per attempt (generate/extract/compile) + repair/next + judge + save
-    per_candidate = (settings.max_repairs + 1) * 3 + settings.max_repairs + 4
+    # prepare + per attempt (generate/extract/compile) + repair/next + judge + cot + save
+    per_candidate = (settings.max_repairs + 1) * 3 + settings.max_repairs + 5
     return max(80, 10 + settings.max_candidates * per_candidate)

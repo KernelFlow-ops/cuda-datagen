@@ -341,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         f"providers={','.join(providers)} nvidia_keys={nvidia_n} "
         f"assignments={labels} "
         f"thinking={settings.thinking_level} "
+        f"cot={settings.cot_enabled}/{settings.cot_agent_enabled} "
         f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
         f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
     )

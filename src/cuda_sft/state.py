@@ -44,4 +44,9 @@ class GraphState(TypedDict, total=False):
     speculative_requests: list[str]
     skip_repair: bool
     metadata: dict[str, Any]
+    raw_reasoning: str
+    reasoning_source: str
+    cot: str
+    cot_source: str
+    cot_error: str
 
