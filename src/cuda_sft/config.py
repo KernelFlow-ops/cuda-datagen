@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 from pydantic import Field, field_validator
@@ -118,6 +119,29 @@ def detect_nvcc() -> str:
     return "nvcc"
 
 
+def _split_api_keys(raw: str) -> list[str]:
+    """Split one env value into unique keys (comma / whitespace / newline)."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\s,;]+", (raw or "").strip()):
+        key = part.strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
+
+
+class WorkerSlot(NamedTuple):
+    """One worker process: which provider and which NVIDIA key to use.
+
+    ``label`` is safe to print (``nvidia#2``); ``api_key`` is the secret.
+    """
+
+    provider: str
+    api_key: str
+    label: str
+
+
 class Settings(BaseSettings):
     """Pipeline config loaded from environment / ``.env``.
 
@@ -134,15 +158,21 @@ class Settings(BaseSettings):
     )
 
     llm_provider: str = Field(default="openrouter")
+    llm_providers: str = Field(default="")
+    workers_per_provider: int = Field(default=0, ge=0)
     openrouter_api_key: str = Field(default="")
     openrouter_base_url: str = Field(default="https://openrouter.ai/api")
     openrouter_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
     nvidia_api_key: str = Field(default="")
+    nvidia_api_key_2: str = Field(default="")
+    nvidia_api_key_3: str = Field(default="")
     nvidia_base_url: str = Field(default="https://integrate.api.nvidia.com/v1")
     nvidia_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b")
     model: str = Field(default="")
     thinking_level: str = Field(default="medium")
-    max_tokens: int = Field(default=16384)
+    max_input_tokens: int = Field(default=131072, ge=1024)
+    max_output_tokens: int = Field(default=0, ge=0)
+    max_tokens: int = Field(default=50000, ge=1)
     top_p: float = Field(default=0.95)
     llm_timeout_sec: float = Field(default=600.0)
 
@@ -151,6 +181,10 @@ class Settings(BaseSettings):
     workers: int = Field(default=1, ge=1)
     repair_error_max_chars: int = Field(default=6000, ge=500)
     work_keep: str = Field(default="simple")
+    judge_enabled: bool = Field(default=True)
+    use_judge_optimization: bool = Field(default=False)
+    async_llm_enabled: bool = Field(default=True)
+    async_llm_max_workers: int = Field(default=2, ge=1, le=4)
 
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
@@ -242,11 +276,150 @@ class Settings(BaseSettings):
             return str(home_nvcc)
         return detect_nvcc()
 
+    def provider_pool(self) -> list[str]:
+        """Providers to run in parallel, e.g. ``[nvidia, openrouter]``.
+
+        ``LLM_PROVIDERS`` is a comma-separated list; empty falls back to
+        ``LLM_PROVIDER``.
+        """
+        raw = (self.llm_providers or "").strip()
+        if not raw:
+            return [self.llm_provider]
+        names: list[str] = []
+        for part in raw.split(","):
+            item = part.strip().lower()
+            if not item:
+                continue
+            aliases = {
+                "nim": "nvidia",
+                "nv": "nvidia",
+                "integrate": "nvidia",
+                "or": "openrouter",
+                "open-router": "openrouter",
+            }
+            item = aliases.get(item, item)
+            if item not in {"openrouter", "nvidia"}:
+                raise ValueError(f"unknown provider in LLM_PROVIDERS: {part!r}")
+            if item not in names:
+                names.append(item)
+        return names or [self.llm_provider]
+
+    def nvidia_api_keys(self) -> list[str]:
+        """Unique NVIDIA NIM keys from ``NVIDIA_API_KEY`` / ``_2`` / ``_3``.
+
+        Each field also accepts comma-separated keys. Order is preserved;
+        empty values are skipped. At most three keys are used. Multiple
+        keys are separate concurrency slots (NIM rate-limits per key).
+        """
+        keys: list[str] = []
+        seen: set[str] = set()
+        for raw in (self.nvidia_api_key, self.nvidia_api_key_2, self.nvidia_api_key_3):
+            for key in _split_api_keys(raw):
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+            if len(keys) >= 3:
+                break
+        return keys[:3]
+
+    def missing_provider_secrets(self, providers: list[str] | None = None) -> list[str]:
+        """Env var names that are empty for the active provider pool."""
+        missing: list[str] = []
+        for name in providers or self.provider_pool():
+            if name == "nvidia" and not self.nvidia_api_keys():
+                missing.append("NVIDIA_API_KEY")
+            elif name == "openrouter" and not self.openrouter_api_key.strip():
+                missing.append("OPENROUTER_API_KEY")
+        return missing
+
+    def build_worker_assignments(
+        self,
+        *,
+        workers: int,
+        workers_per_provider: int = 0,
+        providers: list[str] | None = None,
+    ) -> list[WorkerSlot]:
+        """Map each worker process to a provider and NVIDIA key.
+
+        NVIDIA keys (``NVIDIA_API_KEY`` / ``_2`` / ``_3``) each become one
+        nvidia slot. When ``workers_per_provider > 0``, every slot — each
+        NVIDIA key and each other provider — gets that many processes, so
+        three NVIDIA keys with ``WORKERS_PER_PROVIDER=2`` yield six nvidia
+        workers (two per key).
+
+        When ``workers_per_provider`` is 0, ``workers`` is the process
+        count and NVIDIA keys are round-robin'd across nvidia workers.
+
+        Args:
+            workers: Process count used when ``workers_per_provider`` is 0.
+            workers_per_provider: If >0, overrides ``workers``.
+            providers: Provider names; defaults to :meth:`provider_pool`.
+
+        Returns:
+            One :class:`WorkerSlot` per worker. ``label`` is log-safe.
+        """
+        names = list(providers or self.provider_pool())
+        nvidia_keys = self.nvidia_api_keys()
+        openrouter_key = self.openrouter_api_key.strip()
+
+        def nvidia_slots() -> list[tuple[str, str]]:
+            """``(api_key, label)`` for each NVIDIA key (one empty slot if none)."""
+            if not nvidia_keys:
+                return [("", "nvidia")]
+            if len(nvidia_keys) == 1:
+                return [(nvidia_keys[0], "nvidia")]
+            return [
+                (key, f"nvidia#{index}")
+                for index, key in enumerate(nvidia_keys, start=1)
+            ]
+
+        def slots_for(name: str) -> list[WorkerSlot]:
+            if name == "nvidia":
+                return [
+                    WorkerSlot("nvidia", key, label) for key, label in nvidia_slots()
+                ]
+            key = openrouter_key if name == "openrouter" else ""
+            return [WorkerSlot(name, key, name)]
+
+        if workers_per_provider and workers_per_provider > 0:
+            out: list[WorkerSlot] = []
+            for name in names:
+                for slot in slots_for(name):
+                    out.extend([slot] * int(workers_per_provider))
+            return out
+
+        count = max(1, int(workers))
+        if len(names) == 1:
+            pool = slots_for(names[0])
+            return [pool[i % len(pool)] for i in range(count)]
+
+        nvidia_pool = nvidia_slots()
+        nvidia_i = 0
+        out = []
+        for i in range(count):
+            name = names[i % len(names)]
+            if name == "nvidia":
+                key, label = nvidia_pool[nvidia_i % len(nvidia_pool)]
+                nvidia_i += 1
+                out.append(WorkerSlot("nvidia", key, label))
+            else:
+                key = openrouter_key if name == "openrouter" else ""
+                out.append(WorkerSlot(name, key, name))
+        return out
+
+    @property
+    def resolved_max_output_tokens(self) -> int:
+        """Max completion tokens: ``MAX_OUTPUT_TOKENS`` or fallback ``MAX_TOKENS``."""
+        if self.max_output_tokens > 0:
+            return self.max_output_tokens
+        return self.max_tokens
+
     @property
     def resolved_api_key(self) -> str:
-        """API key for the active :attr:`llm_provider`."""
+        """API key for the active :attr:`llm_provider` (first NVIDIA key)."""
         if self.llm_provider == "nvidia":
-            return self.nvidia_api_key.strip()
+            keys = self.nvidia_api_keys()
+            return keys[0] if keys else ""
         return self.openrouter_api_key.strip()
 
     @property

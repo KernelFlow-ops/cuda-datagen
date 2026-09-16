@@ -28,6 +28,14 @@ HELPERS_STUB = """#pragma once
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(call) CUDA_CHECK(call)
 #endif
+
+#ifndef CHECK_CUDA_ERROR
+#define CHECK_CUDA_ERROR(call) CUDA_CHECK(call)
+#endif
+
+#ifndef CUDA_ERROR_CHECK
+#define CUDA_ERROR_CHECK(call) CUDA_CHECK(call)
+#endif
 """
 
 SOLUTION_HEADER_STUB = """#pragma once
@@ -45,7 +53,9 @@ RDC_HINTS = (
     "calling a __global__ function from device",
     "cannot call a __global__ function from device",
     "kernel launch from device",
+    "kernel launch from __device__",
     "device-side kernel launch",
+    "separate compilation mode",
     "cdp",
     "cudaDeviceSynchronize from device",
 )

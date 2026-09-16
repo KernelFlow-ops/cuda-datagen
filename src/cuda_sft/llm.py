@@ -132,6 +132,97 @@ def _text_from_content_blocks(content: Iterable[Any]) -> str:
     return "".join(parts)
 
 
+def approx_tokens(text: str) -> int:
+    """Rough token count without a tokenizer (ASCII ~4 chars, other ~1 char)."""
+    if not text:
+        return 0
+    ascii_n = 0
+    other = 0
+    for char in text:
+        if ord(char) < 128:
+            ascii_n += 1
+        else:
+            other += 1
+    return (ascii_n + 3) // 4 + other
+
+
+def _message_tokens(messages: list[dict[str, str]]) -> int:
+    return sum(approx_tokens(m.get("content") or "") + 4 for m in messages)
+
+
+def _clip_text_tail(text: str, max_tokens: int) -> str:
+    """Keep the tail of ``text`` so estimated tokens stay within ``max_tokens``."""
+    if max_tokens <= 0 or approx_tokens(text) <= max_tokens:
+        return text
+    # Binary-search a suffix; CUDA repair prompts keep latest code/errors at the end.
+    lo, hi = 0, len(text)
+    best = text[- min(len(text), max(1, max_tokens)) :]
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        suffix = text[len(text) - mid :] if mid else ""
+        if approx_tokens(suffix) <= max_tokens:
+            best = suffix
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best and not text.endswith(best):
+        return "\n...[truncated input]...\n" + best
+    return best
+
+
+def fit_to_input_budget(
+    system: str,
+    messages: list[dict[str, str]],
+    max_input_tokens: int,
+) -> tuple[str, list[dict[str, str]]]:
+    """Drop oldest turns, then trim system / last message to fit ``max_input_tokens``.
+
+    Args:
+        system: System prompt.
+        messages: User/assistant turns (copied, not mutated).
+        max_input_tokens: Budget from ``MAX_INPUT_TOKENS``. ``<=0`` disables clipping.
+
+    Returns:
+        Possibly truncated ``(system, messages)``.
+    """
+    if max_input_tokens <= 0:
+        return system, messages
+    msgs = [{"role": m.get("role", "user"), "content": m.get("content") or ""} for m in messages]
+    sys_text = system or ""
+
+    def total() -> int:
+        return approx_tokens(sys_text) + 4 + _message_tokens(msgs)
+
+    if total() <= max_input_tokens:
+        return sys_text, msgs
+
+    logger.warning(
+        "input ~%s tokens exceeds MAX_INPUT_TOKENS=%s; clipping",
+        total(),
+        max_input_tokens,
+    )
+    while len(msgs) > 1 and total() > max_input_tokens:
+        msgs.pop(0)
+
+    if total() <= max_input_tokens:
+        return sys_text, msgs
+
+    last_min = min(256, max_input_tokens // 4)
+    sys_budget = max(0, max_input_tokens - _message_tokens(msgs) - 8)
+    if approx_tokens(sys_text) > sys_budget:
+        sys_text = _clip_text_tail(sys_text, sys_budget)
+
+    if total() <= max_input_tokens:
+        return sys_text, msgs
+
+    if msgs:
+        last = dict(msgs[-1])
+        room = max(last_min, max_input_tokens - approx_tokens(sys_text) - 8)
+        last["content"] = _clip_text_tail(last.get("content") or "", room)
+        msgs[-1] = last
+    return sys_text, msgs
+
+
 def _thinking_enabled(settings: Settings) -> bool:
     """True unless ``THINKING_LEVEL`` is none/off/false/0."""
     thinking = settings.thinking_level.strip().lower()
@@ -192,9 +283,12 @@ class AnthropicOpenRouterClient:
         if _thinking_enabled(self.settings):
             extra_body["reasoning"] = {"effort": thinking}
 
+        system, messages = fit_to_input_budget(
+            system, messages, self.settings.max_input_tokens
+        )
         request: dict[str, Any] = {
             "model": self.settings.resolved_model,
-            "max_tokens": self.settings.max_tokens,
+            "max_tokens": self.settings.resolved_max_output_tokens,
             "temperature": temperature,
             "system": system,
             "messages": messages,
@@ -245,7 +339,8 @@ class NvidiaOpenAIClient:
             LLMError: Missing ``NVIDIA_API_KEY`` or missing ``openai`` package.
         """
         self.settings = settings or get_settings()
-        if not self.settings.nvidia_api_key.strip():
+        api_key = self.settings.resolved_api_key
+        if not api_key:
             raise LLMError(
                 "NVIDIA_API_KEY is empty. Put the nvapi- key in .env before generating."
             )
@@ -255,7 +350,7 @@ class NvidiaOpenAIClient:
             raise LLMError("openai package is required for LLM_PROVIDER=nvidia") from exc
         self._client = OpenAI(
             base_url=self.settings.nvidia_base_url,
-            api_key=self.settings.nvidia_api_key,
+            api_key=api_key,
             timeout=self.settings.llm_timeout_sec,
         )
 
@@ -283,6 +378,9 @@ class NvidiaOpenAIClient:
         """
         import openai
 
+        system, messages = fit_to_input_budget(
+            system, messages, self.settings.max_input_tokens
+        )
         oa_messages: list[dict[str, str]] = []
         if system.strip():
             oa_messages.append({"role": "system", "content": system})
@@ -304,7 +402,7 @@ class NvidiaOpenAIClient:
                 messages=oa_messages,
                 temperature=temperature,
                 top_p=self.settings.top_p,
-                max_tokens=self.settings.max_tokens,
+                max_tokens=self.settings.resolved_max_output_tokens,
                 extra_body=extra_body,
                 stream=True,
             )
@@ -322,6 +420,7 @@ class NvidiaOpenAIClient:
             openai.APIConnectionError,
             openai.APITimeoutError,
             openai.RateLimitError,
+            openai.APIError,
         ) as exc:
             status = getattr(exc, "status_code", None)
             message = f"NVIDIA NIM HTTP {status}: {exc}"

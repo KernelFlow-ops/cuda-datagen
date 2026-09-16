@@ -128,6 +128,12 @@ class Store:
                 "model": model_name,
                 "used_rdc": state.get("used_rdc", False),
                 "system": system,
+                "judge_score": state.get("judge_score", 0),
+                **(
+                    {"judge": (state.get("metadata") or {}).get("judge")}
+                    if (state.get("metadata") or {}).get("judge")
+                    else {}
+                ),
             },
         }
         _append_jsonl(self.sft_path, sample)

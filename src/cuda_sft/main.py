@@ -15,7 +15,7 @@ from typing import Any
 from tqdm import tqdm
 
 from cuda_sft.compile import smoke_compile
-from cuda_sft.config import PROJECT_ROOT, get_settings
+from cuda_sft.config import PROJECT_ROOT, WorkerSlot, get_settings
 from cuda_sft.graph import build_graph, recursion_limit, set_print_stream
 from cuda_sft.parse import extract_cuda_source
 from cuda_sft.formats import export_training_files
@@ -86,6 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="parallel worker processes (default: WORKERS in .env, else 1)",
+    )
+    parser.add_argument(
+        "--providers",
+        type=str,
+        default=None,
+        help="comma-separated providers, e.g. nvidia,openrouter",
+    )
+    parser.add_argument(
+        "--workers-per-provider",
+        type=int,
+        default=None,
+        help="workers per provider slot (NVIDIA: each API key is a slot; overrides WORKERS)",
     )
     parser.add_argument(
         "--data-dir",
@@ -278,11 +290,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"openrlhf   {orl_path}")
         return 0 if n else 1
 
-    if not settings.resolved_api_key:
-        if settings.llm_provider == "nvidia":
-            print("NVIDIA_API_KEY is empty. Put the nvapi- key in .env and retry.", file=sys.stderr)
-        else:
-            print("OPENROUTER_API_KEY is empty. Put your key in .env and retry.", file=sys.stderr)
+    if args.providers:
+        object.__setattr__(settings, "llm_providers", args.providers)
+    providers = settings.provider_pool()
+    missing = settings.missing_provider_secrets(providers)
+    if missing:
+        joined = " / ".join(missing)
+        print(f"{joined} is empty. Put the key(s) in .env and retry.", file=sys.stderr)
         return 2
 
     questions_path = Path(args.input) if args.input else Path(settings.questions_path)
@@ -306,16 +320,30 @@ def main(argv: list[str] | None = None) -> int:
         done=done,
     )
 
-    print(
-        f"provider={settings.llm_provider} model={settings.resolved_model} "
-        f"thinking={settings.thinking_level} base={settings.resolved_base_url} "
-        f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
+    wpp = (
+        args.workers_per_provider
+        if args.workers_per_provider is not None
+        else settings.workers_per_provider
     )
-    workers = args.workers if args.workers is not None else settings.workers
-    workers = max(1, int(workers))
+    workers_arg = args.workers if args.workers is not None else settings.workers
+    assignments = settings.build_worker_assignments(
+        workers=max(1, int(workers_arg)),
+        workers_per_provider=int(wpp) if wpp else 0,
+        providers=providers,
+    )
+    workers = max(1, len(assignments))
     if workers > 1:
         set_print_stream(False)
 
+    nvidia_n = len(settings.nvidia_api_keys()) if "nvidia" in providers else 0
+    labels = [slot.label for slot in assignments]
+    print(
+        f"providers={','.join(providers)} nvidia_keys={nvidia_n} "
+        f"assignments={labels} "
+        f"thinking={settings.thinking_level} "
+        f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
+        f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
+    )
     print(
         f"candidates={settings.max_candidates} repairs={settings.max_repairs} "
         f"workers={workers} queued={len(jobs)} skipped_done={len(done)}"
@@ -325,12 +353,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if workers == 1:
+        _apply_worker_slot(assignments[0] if assignments else None)
         success, abandoned, failed = run_job_list(
             jobs, data_dir=data_dir, worker_id=0, show_progress=True
         )
     else:
         success, abandoned, failed = run_multiprocess(
-            jobs, data_dir=data_dir, workers=workers, log_level=args.log_level
+            jobs,
+            data_dir=data_dir,
+            workers=workers,
+            log_level=args.log_level,
+            assignments=assignments,
         )
 
     print(
@@ -415,24 +448,68 @@ def run_job_list(
     return success, abandoned, failed
 
 
+def _apply_worker_slot(slot: WorkerSlot | None) -> None:
+    """Pin this process to one provider / NVIDIA key and drop cached clients.
+
+    Extra NVIDIA keys are cleared so the child only uses the assigned key.
+
+    Args:
+        slot: Worker assignment; ignored if None or missing a provider name.
+    """
+    if slot is None or not slot.provider:
+        return
+    os.environ["LLM_PROVIDER"] = slot.provider
+    if slot.provider == "nvidia" and slot.api_key:
+        os.environ["NVIDIA_API_KEY"] = slot.api_key
+        os.environ["NVIDIA_API_KEY_2"] = ""
+        os.environ["NVIDIA_API_KEY_3"] = ""
+    elif slot.provider == "openrouter" and slot.api_key:
+        os.environ["OPENROUTER_API_KEY"] = slot.api_key
+    from cuda_sft.config import get_settings as _gs
+    from cuda_sft.llm import reset_llm_client
+
+    _gs.cache_clear()
+    reset_llm_client()
+
+
 def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
     """Spawn-worker entry: configure logging then :func:`run_job_list`.
 
     Args:
-        payload: ``worker_id``, ``data_dir``, ``jobs``, ``log_level``.
+        payload: ``worker_id``, ``data_dir``, ``jobs``, ``log_level``,
+            plus optional ``provider`` / ``api_key`` / ``label``.
     """
     worker_id = int(payload["worker_id"])
     data_dir = Path(payload["data_dir"])
     jobs: list[tuple[int, str]] = payload["jobs"]
     log_level = str(payload["log_level"])
+    provider = str(payload.get("provider") or "").strip().lower()
+    label = str(payload.get("label") or provider or "-")
+    slot = WorkerSlot(
+        provider=provider,
+        api_key=str(payload.get("api_key") or ""),
+        label=label,
+    )
+    _apply_worker_slot(slot if provider else None)
     time.sleep(0.6 * worker_id)
     _configure_logging(log_level, data_dir / "run.log", worker_id=worker_id)
     set_print_stream(False)
+    if provider:
+        from cuda_sft.config import get_settings as _gs2
+
+        cfg = _gs2()
+        logger.info(
+            "worker %s provider=%s model=%s",
+            worker_id,
+            label,
+            cfg.resolved_model,
+        )
     success, abandoned, failed = run_job_list(
         jobs, data_dir=data_dir, worker_id=worker_id, show_progress=True
     )
     return {
         "worker_id": worker_id,
+        "provider": label,
         "success": success,
         "abandoned": abandoned,
         "failed": failed,
@@ -446,6 +523,7 @@ def run_multiprocess(
     data_dir: Path,
     workers: int,
     log_level: str,
+    assignments: list[WorkerSlot] | None = None,
 ) -> tuple[int, int, int]:
     """Shard ``jobs`` round-robin across ``workers`` spawn processes.
 
@@ -454,6 +532,7 @@ def run_multiprocess(
         data_dir: Shared output directory (jsonl writes are flocked).
         workers: Process count.
         log_level: Passed to each child.
+        assignments: Provider + NVIDIA key per worker (same length as shards).
 
     Returns:
         Aggregated ``(success, abandoned, crashed)``.
@@ -468,16 +547,22 @@ def run_multiprocess(
 
     ctx = mp.get_context("spawn")
     with ctx.Pool(processes=workers) as pool:
-        payloads = [
-            {
-                "worker_id": i,
-                "data_dir": str(data_dir),
-                "jobs": shard,
-                "log_level": log_level,
-            }
-            for i, shard in enumerate(shards)
-            if shard
-        ]
+        payloads = []
+        for i, shard in enumerate(shards):
+            if not shard:
+                continue
+            slot = assignments[i] if assignments and i < len(assignments) else None
+            payloads.append(
+                {
+                    "worker_id": i,
+                    "data_dir": str(data_dir),
+                    "jobs": shard,
+                    "log_level": log_level,
+                    "provider": slot.provider if slot else "",
+                    "api_key": slot.api_key if slot else "",
+                    "label": slot.label if slot else "",
+                }
+            )
         try:
             results = pool.map(_mp_entry, payloads)
         except KeyboardInterrupt:
@@ -489,7 +574,8 @@ def run_multiprocess(
     failed = sum(r["failed"] for r in results)
     for r in results:
         print(
-            f"worker {r['worker_id']}: n={r['n']} success={r['success']} "
+            f"worker {r['worker_id']} provider={r.get('provider') or '-'}: "
+            f"n={r['n']} success={r['success']} "
             f"abandoned={r['abandoned']} crashed={r['failed']}",
             flush=True,
         )

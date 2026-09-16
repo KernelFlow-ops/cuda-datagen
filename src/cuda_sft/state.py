@@ -36,3 +36,12 @@ class GraphState(TypedDict, total=False):
     gpu_name: str
     cuda_arch: str
     cuda_version: str
+    winner_found: bool
+    winner_candidate: int
+    judge_score: int
+    judge_issues: list[str]
+    judge_suggestions: list[str]
+    speculative_requests: list[str]
+    skip_repair: bool
+    metadata: dict[str, Any]
+

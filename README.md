@@ -20,16 +20,24 @@ cp .env.example .env   # 若还没有 .env
 |---|---|---|
 | `LLM_PROVIDER` | `openrouter` | `openrouter`（Anthropic Messages）或 `nvidia`（官方 OpenAI 兼容接口） |
 | `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | OpenRouter | `LLM_PROVIDER=openrouter` 时使用 |
-| `NVIDIA_API_KEY` / `NVIDIA_BASE_URL` | NIM | `LLM_PROVIDER=nvidia` 时使用，默认 `https://integrate.api.nvidia.com/v1` |
+| `NVIDIA_API_KEY` / `_2` / `_3` / `NVIDIA_BASE_URL` | NIM | 最多 3 个 NVIDIA key（也可在 `NVIDIA_API_KEY` 里逗号分隔）；每个 key 独立占一个 nvidia 槽位。默认 `https://integrate.api.nvidia.com/v1` |
 | `OPENROUTER_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter 模型 |
 | `NVIDIA_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | NVIDIA 官方模型 |
 | `MODEL` | 空 | 非空时覆盖上面两个，一般留空 |
 | `THINKING_LEVEL` | `medium` | OpenRouter 走 `reasoning.effort`；NVIDIA 走 `chat_template_kwargs.enable_thinking` |
-| `MAX_TOKENS` | `50000` | 生成上限 |
+| `MAX_INPUT_TOKENS` | `131072` | 输入上下文上限（超出则丢掉旧轮、截尾；约按字符估算 token） |
+| `MAX_OUTPUT_TOKENS` | `50000` | 输出 token 上限，对应 API 的 `max_tokens` |
+| `MAX_TOKENS` | `50000` | 兼容别名；若未设 `MAX_OUTPUT_TOKENS` 则用它 |
 | `TOP_P` | `0.95` | NVIDIA Chat Completions 的 top_p |
 | `MAX_CANDIDATES` | `3` | 每题最多候选数 |
 | `MAX_REPAIRS` | `3` | 每个候选最多修正次数 |
-| `WORKERS` | `1` | 并行进程数 |
+| `WORKERS` | `1` | `WORKERS_PER_PROVIDER=0` 时的总进程数；nvidia worker 在多个 key 间轮询 |
+| `JUDGE_ENABLED` | `true` | 启用 Judge Agent 代码质量评估 |
+| `USE_JUDGE_OPTIMIZATION` | `false` | 是否应用 Judge 的轻量优化建议（需重新编译验证） |
+| `ASYNC_LLM_ENABLED` | `true` | 启用异步 LLM 调用（编译期间预生成修复轮响应） |
+| `ASYNC_LLM_MAX_WORKERS` | `2` | 异步 LLM 并发数（1-4） |
+| `LLM_PROVIDERS` | 空 | 逗号分隔多 provider，如 `nvidia,openrouter` |
+| `WORKERS_PER_PROVIDER` | `0` | 每个槽位的并发数；NVIDIA 每个 key 各算一个槽位。例如 3 个 NVIDIA key + openrouter、值为 2 → 6 个 nvidia + 2 个 openrouter |
 | `REPAIR_ERROR_MAX_CHARS` | `6000` | 修复轮 nvcc 日志上限；超过则去重摘要，不超过则全文 |
 | `WORK_KEEP` | `simple` | `simple`：每题 `work/q{id}/` 只留最后一份 `solution.cu`；`detailed`：保留全部 `c*/r*` 尝试 |
 | `CUDA_ARCH` | 空则自动探测 | 如 `sm_86` |
@@ -41,9 +49,13 @@ NVIDIA 官方示例对应配置：
 LLM_PROVIDER=nvidia
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_API_KEY=nvapi-...
+NVIDIA_API_KEY_2=nvapi-...
+NVIDIA_API_KEY_3=nvapi-...
 MODEL=nvidia/nemotron-3-ultra-550b-a55b
 THINKING_LEVEL=medium
 ```
+
+三个 NVIDIA key 用来提高 NIM 并发（额度按 key 独立计算）。配合 `LLM_PROVIDERS=nvidia,openrouter` 和 `WORKERS_PER_PROVIDER=1` 时，会启动 3 个 nvidia worker（每 key 一个）+ 1 个 openrouter worker。日志里只打印 `nvidia#1` / `nvidia#2` / `nvidia#3`，不会写出 key 本身。
 
 本机默认会探测到 RTX 3060 / `sm_86` / CUDA 12.6。
 
