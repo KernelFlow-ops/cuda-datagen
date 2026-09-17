@@ -59,6 +59,9 @@ class AsyncLLMPool:
         messages: list[dict[str, str]],
         system: str,
         temperature: float,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        reasoning_max_tokens: int | None = None,
     ) -> None:
         """Start a speculative LLM call in the background.
 
@@ -68,6 +71,9 @@ class AsyncLLMPool:
             messages: Chat history.
             system: System prompt.
             temperature: Sampling temperature.
+            thinking_level: Optional per-call thinking override.
+            max_output_tokens: Optional per-call max_tokens override.
+            reasoning_max_tokens: Optional reasoning token cap.
         """
         with self._lock:
             if request_id in self.pending:
@@ -85,6 +91,9 @@ class AsyncLLMPool:
                         system=system,
                         temperature=temperature,
                         print_stream=False,
+                        thinking_level=thinking_level,
+                        max_output_tokens=max_output_tokens,
+                        reasoning_max_tokens=reasoning_max_tokens,
                     )
                 else:
                     text = llm_client.stream_text(

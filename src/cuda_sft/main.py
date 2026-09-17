@@ -14,12 +14,12 @@ from typing import Any
 
 from tqdm import tqdm
 
-from cuda_sft.compile import smoke_compile
 from cuda_sft.config import PROJECT_ROOT, WorkerSlot, get_settings
+from cuda_sft.dialects.agent import get_dialect_agent
 from cuda_sft.graph import build_graph, recursion_limit, set_print_stream
-from cuda_sft.parse import extract_cuda_source
+from cuda_sft.llm import is_retryable_llm_error
 from cuda_sft.formats import export_training_files
-from cuda_sft.store import init_store, iter_questions, load_done_ids
+from cuda_sft.store import init_store, iter_questions, load_done_keys
 
 logger = logging.getLogger("cuda_sft")
 
@@ -106,6 +106,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory for sft/abandoned/progress jsonl",
     )
     parser.add_argument(
+        "--dialects",
+        type=str,
+        default=None,
+        help="comma-separated kernel dialects: cuda,cutlass,triton,tilelang (aliases: cute)",
+    )
+    parser.add_argument(
+        "--kernel-mode",
+        type=str,
+        default=None,
+        help="single (one dialect) or all (every listed dialect per question)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="logging level (default: INFO)",
@@ -160,22 +172,26 @@ class _LockedFileHandler(logging.Handler):
 
 
 def _reset_run_logs(data_dir: Path) -> Path:
-    """Delete previous ``run*.log`` files and create an empty ``run.log``.
+    """Open ``run.log`` for this process; keep prior sessions when resuming.
+
+    A resume (same ``data_dir``, existing progress) must not wipe compile
+    diagnostics. Start a new file only when none exists.
 
     Args:
         data_dir: Output directory.
 
     Returns:
-        Path to the new ``run.log``.
+        Path to ``run.log``.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
-    for old in data_dir.glob("run*.log"):
-        try:
-            old.unlink()
-        except OSError:
-            pass
     log_file = data_dir / "run.log"
-    log_file.write_text("", encoding="utf-8")
+    if log_file.exists() and log_file.stat().st_size > 0:
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n===== session {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+            )
+    else:
+        log_file.write_text("", encoding="utf-8")
     return log_file
 
 
@@ -238,24 +254,42 @@ def _select_questions(
     return rows
 
 
+def _apply_kernel_cli(args: argparse.Namespace) -> None:
+    """Copy ``--dialects`` / ``--kernel-mode`` into env and drop settings cache."""
+    changed = False
+    if args.dialects:
+        os.environ["KERNEL_DIALECTS"] = args.dialects
+        changed = True
+    if args.kernel_mode:
+        os.environ["KERNEL_MODE"] = args.kernel_mode
+        changed = True
+    if changed:
+        get_settings.cache_clear()
+
+
 def run_dry_compile() -> int:
-    """Compile a tiny kernel to verify nvcc; return process exit code."""
+    """Smoke-compile every available kernel dialect and return process exit code."""
     settings = get_settings()
+    agent = get_dialect_agent()
     print(
         f"nvcc={settings.nvcc_bin} arch={settings.resolved_cuda_arch} "
-        f"gpu={settings.resolved_gpu_name} cuda={settings.resolved_cuda_version}"
+        f"gpu={settings.resolved_gpu_name} cuda={settings.resolved_cuda_version} "
+        f"dialects={','.join(agent.requested_names(settings))}"
     )
-    parsed = extract_cuda_source("```cuda\n__global__ void k() {}\n```")
-    if "__global__" not in parsed:
-        print("parse smoke failed", file=sys.stderr)
+    failed = 0
+    for spec in agent.resolve(settings):
+        workdir = settings.work_path / f"_smoke_{spec.name}"
+        result = spec.smoke(settings, workdir)
+        status = "PASS" if result.ok else "FAIL"
+        print(f"dry-compile {spec.name}: {status}")
+        if not result.ok:
+            failed += 1
+            print(result.output, file=sys.stderr)
+    if failed:
+        print(f"dry-compile FAIL ({failed} dialect(s))", file=sys.stderr)
         return 1
-    result = smoke_compile(settings)
-    if result.ok:
-        print("dry-compile PASS")
-        return 0
-    print("dry-compile FAIL", file=sys.stderr)
-    print(result.output, file=sys.stderr)
-    return 1
+    print("dry-compile PASS")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -268,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         0 on success, non-zero on failure / missing config.
     """
     args = build_parser().parse_args(argv)
+    _apply_kernel_cli(args)
     settings = get_settings()
     set_print_stream(not args.quiet)
 
@@ -310,15 +345,20 @@ def main(argv: list[str] | None = None) -> int:
     log_file = _reset_run_logs(data_dir)
     _configure_logging(args.log_level, log_file, worker_id=0)
     store = init_store(data_dir)
-    done: set[int] = set() if args.overwrite else load_done_ids(store.progress_path)
     ids = _parse_ids(args.ids)
-    jobs = _select_questions(
+    questions = _select_questions(
         questions_path,
         offset=args.offset,
         limit=args.limit,
         ids=ids,
-        done=done,
+        done=set(),
     )
+    agent = get_dialect_agent()
+    jobs = agent.expand_jobs(questions, settings)
+    if not args.overwrite:
+        done_keys = load_done_keys(store.progress_path)
+        jobs = [job for job in jobs if (job[0], job[2]) not in done_keys]
+    skipped_done = 0 if args.overwrite else len(agent.expand_jobs(questions, settings)) - len(jobs)
 
     wpp = (
         args.workers_per_provider
@@ -342,12 +382,14 @@ def main(argv: list[str] | None = None) -> int:
         f"assignments={labels} "
         f"thinking={settings.thinking_level} "
         f"cot={settings.cot_enabled}/{settings.cot_agent_enabled} "
+        f"dialects={','.join(s.name for s in get_dialect_agent().resolve(settings))} "
+        f"kernel_mode={settings.kernel_mode} "
         f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
         f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
     )
     print(
         f"candidates={settings.max_candidates} repairs={settings.max_repairs} "
-        f"workers={workers} queued={len(jobs)} skipped_done={len(done)}"
+        f"workers={workers} queued={len(jobs)} skipped_done={skipped_done}"
     )
     if not jobs:
         print("nothing to do")
@@ -375,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_job_list(
-    jobs: list[tuple[int, str]],
+    jobs: list[tuple[int, str, str]] | list[tuple[int, str]],
     *,
     data_dir: Path,
     worker_id: int = 0,
@@ -384,7 +426,7 @@ def run_job_list(
     """Run the LangGraph pipeline on ``jobs`` in this process.
 
     Args:
-        jobs: ``(question_id, question)`` pairs.
+        jobs: ``(question_id, question, dialect)`` triples (dialect optional).
         data_dir: Output directory for jsonl / logs.
         worker_id: Index used in log prefixes.
         show_progress: If True, wrap the loop in tqdm.
@@ -403,13 +445,26 @@ def run_job_list(
     if show_progress:
         iterable = tqdm(jobs, desc=f"questions[{prefix}]", file=sys.stderr, unit="q")
 
-    for index, (qid, question) in enumerate(iterable, start=1):
-        print(f"\n===== [{prefix} {index}/{len(jobs)}] question {qid} =====", flush=True)
+    for index, job in enumerate(iterable, start=1):
+        if len(job) == 3:
+            qid, question, dialect = job
+        else:
+            qid, question = job[0], job[1]
+            dialect = "cuda"
+        print(
+            f"\n===== [{prefix} {index}/{len(jobs)}] question {qid} dialect={dialect} =====",
+            flush=True,
+        )
         final = None
         for attempt in range(1, 4):
             try:
                 final = app.invoke(
-                    {"question_id": qid, "question": question, "status": "running"},
+                    {
+                        "question_id": qid,
+                        "question": question,
+                        "dialect": dialect,
+                        "status": "running",
+                    },
                     {"recursion_limit": limit},
                 )
                 break
@@ -417,17 +472,27 @@ def run_job_list(
                 print("\ninterrupted", file=sys.stderr)
                 raise
             except Exception as exc:
-                if attempt >= 3:
-                    logger.exception(
-                        "[%s] question %s crashed after %s attempts", prefix, qid, attempt
+                retryable = is_retryable_llm_error(exc)
+                if attempt >= 3 or not retryable:
+                    log = logger.exception if retryable else logger.error
+                    log(
+                        "[%s] question %s dialect=%s crashed after %s attempts "
+                        "(retryable=%s): %s",
+                        prefix,
+                        qid,
+                        dialect,
+                        attempt,
+                        retryable,
+                        exc,
                     )
                     failed += 1
                     break
                 wait = 8 * attempt
                 logger.warning(
-                    "[%s] question %s crashed (attempt %s/3): %s; retrying in %ss",
+                    "[%s] question %s dialect=%s crashed (attempt %s/3): %s; retrying in %ss",
                     prefix,
                     qid,
+                    dialect,
                     attempt,
                     exc,
                     wait,
@@ -519,7 +584,7 @@ def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_multiprocess(
-    jobs: list[tuple[int, str]],
+    jobs: list[tuple[int, str, str]] | list[tuple[int, str]],
     *,
     data_dir: Path,
     workers: int,

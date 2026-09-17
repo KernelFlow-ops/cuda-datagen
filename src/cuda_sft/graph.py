@@ -7,19 +7,17 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
-from cuda_sft.compile import attempt_workdir, compile_cuda_source, finalize_question_work
+from cuda_sft.compile import attempt_workdir, finalize_question_work
 from cuda_sft.config import get_settings
 from cuda_sft.cot import CotAgent
-from cuda_sft.judge import CudaCodeJudge
+from cuda_sft.dialects.agent import get_dialect_agent, get_spec
+
 from cuda_sft.llm import LLMCompletion, get_llm_client, is_retryable_llm_error
 from cuda_sft.llm_async import get_async_pool
-from cuda_sft.parse import extract_cuda_source
 from cuda_sft.prompt import (
     SYSTEM_PROMPT,
-    build_repair_prompt,
     candidate_temperature,
     format_nvcc_for_prompt,
-    select_prompts,
     truncate_compile_error,
 )
 from cuda_sft.state import GraphState
@@ -28,6 +26,16 @@ from cuda_sft.store import get_store
 logger = logging.getLogger(__name__)
 
 PRINT_STREAM = True
+
+
+def _dialect_name(state: GraphState) -> str:
+    """Canonical dialect id for this graph state (default cuda)."""
+    return str(state.get("dialect") or "cuda")
+
+
+def _spec(state: GraphState):
+    """Kernel dialect spec for this state."""
+    return get_spec(_dialect_name(state))
 
 
 def set_print_stream(enabled: bool) -> None:
@@ -66,7 +74,9 @@ def prepare(state: GraphState) -> dict[str, Any]:
     gpu_name = settings.resolved_gpu_name
     cuda_arch = settings.resolved_cuda_arch
     cuda_version = settings.resolved_cuda_version
-    selected = select_prompts(
+    dialect = str(state.get("dialect") or "cuda")
+    spec = get_spec(dialect)
+    selected = spec.select_prompts(
         state["question"],
         question_id=int(state["question_id"]),
         candidate_idx=1,
@@ -75,6 +85,7 @@ def prepare(state: GraphState) -> dict[str, Any]:
         cuda_version=cuda_version,
     )
     return {
+        "dialect": spec.name,
         "system_prompt": selected.system,
         "user_prompt": selected.user,
         "messages": [{"role": "user", "content": selected.user}],
@@ -119,13 +130,14 @@ def generate(state: GraphState) -> dict[str, Any]:
     cand = state.get("candidate_idx", 1)
     repair = state.get("repair_idx", 0)
     temperature = float(state.get("temperature") or candidate_temperature(cand))
-    header = f"[Q{qid} candidate={cand} repair={repair} temp={temperature}]"
+    dialect = _dialect_name(state)
+    header = f"[Q{qid} {dialect} candidate={cand} repair={repair} temp={temperature}]"
 
     settings = get_settings()
     client = get_llm_client()
 
     # Check if we have a speculative response ready
-    request_id = f"q{qid}_c{cand}_r{repair}"
+    request_id = f"q{qid}_{dialect}_c{cand}_r{repair}"
     completion: LLMCompletion | None = None
 
     if settings.async_llm_enabled:
@@ -146,6 +158,7 @@ def generate(state: GraphState) -> dict[str, Any]:
                 system=state.get("system_prompt") or SYSTEM_PROMPT,
                 temperature=temperature,
                 print_stream=PRINT_STREAM,
+                **get_dialect_agent().llm_call_options(dialect, settings),
             )
         else:
             text = client.stream_text(
@@ -187,9 +200,10 @@ def extract(state: GraphState) -> dict[str, Any]:
     Args:
         state: Must contain ``raw_response``.
     """
-    code = extract_cuda_source(state.get("raw_response") or "")
+    spec = _spec(state)
+    code = spec.extract(state.get("raw_response") or "")
     if not code.strip():
-        logger.warning("Q%s: no CUDA source extracted", state["question_id"])
+        logger.warning("Q%s %s: no source extracted", state["question_id"], spec.name)
     return {"code": code}
 
 
@@ -200,17 +214,22 @@ def compile_node(state: GraphState) -> dict[str, Any]:
         state: Must contain ``code`` and ``question_id``.
     """
     settings = get_settings()
+    spec = _spec(state)
+    nest = get_dialect_agent().nest_workdir(spec.name, settings)
     workdir = attempt_workdir(
         settings,
         int(state["question_id"]),
         int(state.get("candidate_idx") or 1),
         int(state.get("repair_idx") or 0),
+        spec.name,
+        nest_dialect=nest,
     )
     code = state.get("code") or ""
     attempts = list(state.get("attempts") or [])
+    log_name = "nvcc.log" if spec.language == "cuda-cpp" else "compile.log"
 
     if not code.strip():
-        error = "no CUDA source extracted from model output"
+        error = f"no {spec.name} source extracted from model output"
         attempts.append(
             {
                 "candidate": state.get("candidate_idx", 1),
@@ -220,9 +239,9 @@ def compile_node(state: GraphState) -> dict[str, Any]:
                 "error": error,
             }
         )
-        print(f"[Q{state['question_id']}] compile FAIL: {error}", flush=True)
+        print(f"[Q{state['question_id']} {spec.name}] compile FAIL: {error}", flush=True)
         workdir.mkdir(parents=True, exist_ok=True)
-        (workdir / "nvcc.log").write_text(error + "\n", encoding="utf-8")
+        (workdir / log_name).write_text(error + "\n", encoding="utf-8")
         return {
             "compile_ok": False,
             "compile_error": error,
@@ -230,12 +249,15 @@ def compile_node(state: GraphState) -> dict[str, Any]:
             "attempts": attempts,
         }
 
-    result = compile_cuda_source(code, workdir, settings=settings)
-    error = "" if result.ok else (result.output or "nvcc failed with empty output")
-    (workdir / "nvcc.log").write_text((result.output or error or "") + "\n", encoding="utf-8")
-    prompt_error = (
-        format_nvcc_for_prompt(error, settings.repair_error_max_chars) if not result.ok else ""
-    )
+    result = spec.compile(code, workdir, settings)
+    error = "" if result.ok else (result.output or "compile failed with empty output")
+    (workdir / log_name).write_text((result.output or error or "") + "\n", encoding="utf-8")
+    if result.ok:
+        prompt_error = ""
+    elif spec.language == "cuda-cpp":
+        prompt_error = format_nvcc_for_prompt(error, settings.repair_error_max_chars)
+    else:
+        prompt_error = (error or "")[: settings.repair_error_max_chars]
     attempts.append(
         {
             "candidate": state.get("candidate_idx", 1),
@@ -247,9 +269,9 @@ def compile_node(state: GraphState) -> dict[str, Any]:
     )
     status = "PASS" if result.ok else "FAIL"
     extra = " (rdc)" if result.used_rdc else ""
-    print(f"[Q{state['question_id']}] compile {status}{extra}", flush=True)
+    print(f"[Q{state['question_id']} {spec.name}] compile {status}{extra}", flush=True)
     if not result.ok:
-        logger.info("nvcc error:\n%s", truncate_compile_error(error, 2000))
+        logger.info("compile error:\n%s", truncate_compile_error(error, 2000))
 
     # Async LLM: If compile failed and repairs remain, speculatively start next repair
     speculative_requests = list(state.get("speculative_requests") or [])
@@ -258,10 +280,9 @@ def compile_node(state: GraphState) -> dict[str, Any]:
         if next_repair <= settings.max_repairs:
             qid = state["question_id"]
             cand = state.get("candidate_idx", 1)
-            request_id = f"q{qid}_c{cand}_r{next_repair}"
+            request_id = f"q{qid}_{spec.name}_c{cand}_r{next_repair}"
 
-            # Build repair prompt
-            repair_prompt = build_repair_prompt(
+            repair_prompt = spec.build_repair(
                 cuda_arch=state.get("cuda_arch") or settings.resolved_cuda_arch,
                 compile_error=prompt_error,
                 previous_code=code,
@@ -284,6 +305,7 @@ def compile_node(state: GraphState) -> dict[str, Any]:
                     messages=future_messages,
                     system=state.get("system_prompt") or SYSTEM_PROMPT,
                     temperature=float(state.get("temperature") or candidate_temperature(cand)),
+                    **get_dialect_agent().llm_call_options(spec.name, settings),
                 )
                 speculative_requests.append(request_id)
                 logger.info("Started speculative repair request: %s", request_id)
@@ -320,8 +342,9 @@ def repair(state: GraphState) -> dict[str, Any]:
         return {"skip_repair": True}
 
     settings = get_settings()
+    spec = _spec(state)
     next_repair = int(state.get("repair_idx") or 0) + 1
-    repair_user = build_repair_prompt(
+    repair_user = spec.build_repair(
         cuda_arch=state.get("cuda_arch") or settings.resolved_cuda_arch,
         compile_error=format_nvcc_for_prompt(
             state.get("compile_error") or "",
@@ -357,9 +380,10 @@ def next_candidate(state: GraphState) -> dict[str, Any]:
         state: State after the previous candidate exhausted repairs.
     """
     settings = get_settings()
+    spec = _spec(state)
     next_idx = int(state.get("candidate_idx") or 1) + 1
     temperature = candidate_temperature(next_idx)
-    selected = select_prompts(
+    selected = spec.select_prompts(
         state["question"],
         question_id=int(state["question_id"]),
         candidate_idx=next_idx,
@@ -401,16 +425,22 @@ def next_candidate(state: GraphState) -> dict[str, Any]:
 def save_success(state: GraphState) -> dict[str, Any]:
     """Write SFT jsonl rows and mark the question successful."""
     settings = get_settings()
+    spec = _spec(state)
+    nest = get_dialect_agent().nest_workdir(spec.name, settings)
     get_store().write_success(state, model_name=settings.resolved_model)
     finalize_question_work(
         settings,
         int(state["question_id"]),
         code=state.get("code") or "",
         success=True,
+        dialect=spec.name,
+        filename=spec.source_filename,
+        nest_dialect=nest,
     )
     logger.info(
-        "Q%s saved SFT sample (candidate=%s repairs=%s judge_score=%s cot=%s)",
+        "Q%s %s saved SFT sample (candidate=%s repairs=%s judge_score=%s cot=%s)",
         state["question_id"],
+        _dialect_name(state),
         state.get("candidate_idx", 1),
         state.get("repair_idx", 0),
         state.get("judge_score", 0),
@@ -449,9 +479,9 @@ def judge(state: GraphState) -> dict[str, Any]:
             "winner_candidate": int(state.get("candidate_idx") or 1),
         }
 
-    judge_engine = CudaCodeJudge(settings)
+    spec = _spec(state)
     code = state.get("code") or ""
-    result = judge_engine.judge(code)
+    result = spec.judge(code)
 
     logger.info(
         "Q%s judge: score=%s issues=%s suggestions=%s",
@@ -537,12 +567,17 @@ def cot(state: GraphState) -> dict[str, Any]:
 def save_abandoned(state: GraphState) -> dict[str, Any]:
     """Write the abandoned record after all candidates failed."""
     settings = get_settings()
+    spec = _spec(state)
+    nest = get_dialect_agent().nest_workdir(spec.name, settings)
     get_store().write_abandoned(state)
     finalize_question_work(
         settings,
         int(state["question_id"]),
         code=state.get("code") or "",
         success=False,
+        dialect=spec.name,
+        filename=spec.source_filename,
+        nest_dialect=nest,
     )
     logger.info("Q%s abandoned after all candidates failed", state["question_id"])
     print(f"[Q{state['question_id']}] abandoned", flush=True)

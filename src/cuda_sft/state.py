@@ -20,6 +20,7 @@ class GraphState(TypedDict, total=False):
 
     question_id: int
     question: str
+    dialect: str
     system_prompt: str
     user_prompt: str
     messages: list[dict[str, str]]

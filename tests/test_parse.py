@@ -6,6 +6,7 @@ import unittest
 
 from cuda_sft.parse import (
     extract_cuda_source,
+    extract_fenced_source,
     extract_thinking,
     split_visible_and_thinking,
     strip_code_from_cot,
@@ -40,9 +41,28 @@ class ParseThinkingTests(unittest.TestCase):
         self.assertEqual(got_code, code if code.endswith("\n") else code + "\n")
         self.assertEqual(extract_cuda_source(assistant), got_code)
 
+    def test_extract_strips_leading_language_line(self) -> None:
+        text = "```\ncuda\n#include <cuda_runtime.h>\n__global__ void k() {}\n```\n"
+        src = extract_cuda_source(text)
+        self.assertTrue(src.lstrip().startswith("#include"))
+        self.assertNotIn("\ncuda\n", "\n" + src)
+
     def test_wrap_empty_cot_is_code_only(self) -> None:
         code = "__global__ void k() {}\n"
         self.assertEqual(wrap_cot_assistant("  ", code), code)
+
+    def test_strip_leading_fence_language_line(self) -> None:
+        text = "```cuda\ncuda\n__global__ void k() {}\n```\n"
+        src = extract_cuda_source(text)
+        self.assertTrue(src.startswith("__global__"))
+        self.assertNotEqual(src.splitlines()[0].strip(), "cuda")
+
+    def test_python_fence_keeps_kernel(self) -> None:
+        text = "```python\n@triton.jit\ndef k():\n    return\n```\n"
+        src = extract_fenced_source(
+            text, fence_langs=("python", "triton"), looks_like=lambda s: "@triton.jit" in s
+        )
+        self.assertIn("@triton.jit", src)
 
     def test_strip_code_from_cot_drops_cuda_fence(self) -> None:
         text = (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 THINK_BLOCK_RE = re.compile(
     r"<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>",
@@ -19,6 +20,14 @@ FENCE_RE = re.compile(
 ANY_FENCE_RE = re.compile(
     r"```[^\n]*\n(.*?)```",
     re.DOTALL,
+)
+LABELED_FENCE_RE = re.compile(
+    r"```([^\n]*)\n(.*?)```",
+    re.DOTALL,
+)
+LEADING_FENCE_LANG_RE = re.compile(
+    r"^(?:cuda|cu|cpp|c\+\+|python|py|triton|tilelang|cutlass|cute|c|cc|cxx|hpp)\s*$",
+    re.IGNORECASE,
 )
 CUDA_HINTS = (
     "__global__",
@@ -169,18 +178,56 @@ def extract_cuda_source(text: str) -> str:
     Prefer the last fenced block that looks like CUDA; otherwise the last
     fenced block; otherwise the full reply with thinking stripped.
     """
+    return extract_fenced_source(
+        text,
+        fence_langs=("cuda", "cu", "cpp", "c++", "cc", "cxx", "c", "hpp"),
+        looks_like=looks_like_cuda,
+    )
+
+
+def extract_fenced_source(
+    text: str,
+    *,
+    fence_langs: tuple[str, ...] | None = None,
+    looks_like: Callable[[str], bool] | None = None,
+) -> str:
+    """Extract a source block from markdown fences.
+
+    Prefer the last fence whose body matches ``looks_like``, then the last
+    fence whose language tag is in ``fence_langs``, then the last fence,
+    then the full reply with thinking stripped.
+    """
     cleaned = strip_thinking(text)
     if not cleaned:
         return ""
 
-    fences = [block.strip() for block in FENCE_RE.findall(cleaned) if block.strip()]
-    if fences:
-        for block in reversed(fences):
-            if looks_like_cuda(block):
-                return _ensure_trailing_newline(block)
-        return _ensure_trailing_newline(fences[-1])
+    langs = {item.strip().lower() for item in (fence_langs or ()) if item.strip()}
+    labeled = [
+        (str(lang or "").strip().lower(), body.strip())
+        for lang, body in LABELED_FENCE_RE.findall(cleaned)
+        if body.strip()
+    ]
+    if not labeled:
+        return _ensure_trailing_newline(cleaned)
 
-    return _ensure_trailing_newline(cleaned)
+    if looks_like is not None:
+        for _lang, body in reversed(labeled):
+            if looks_like(body):
+                return _ensure_trailing_newline(_strip_leading_fence_lang(body))
+    if langs:
+        for lang, body in reversed(labeled):
+            token = lang.split()[0] if lang else ""
+            if token in langs:
+                return _ensure_trailing_newline(_strip_leading_fence_lang(body))
+    return _ensure_trailing_newline(_strip_leading_fence_lang(labeled[-1][1]))
+
+
+def _strip_leading_fence_lang(body: str) -> str:
+    """Drop a first line that is only a markdown language tag (e.g. ``cuda``)."""
+    lines = (body or "").splitlines()
+    if lines and LEADING_FENCE_LANG_RE.match(lines[0].strip()):
+        return "\n".join(lines[1:]).lstrip("\n")
+    return body
 
 
 def _ensure_trailing_newline(source: str) -> str:

@@ -177,6 +177,16 @@ class CotAgent:
     def _run_agent(self, state: GraphState, *, raw_reasoning: str) -> str:
         """Call the editor model; retry retryable LLM errors a few times."""
         settings = self.settings
+        dialect = str(state.get("dialect") or "cuda")
+        language = "python" if dialect in {"triton", "tilelang"} else "cuda-cpp"
+        fence = "python" if language == "python" else "cuda"
+        skeleton = ""
+        try:
+            from cuda_sft.dialects.agent import get_spec
+
+            skeleton = get_spec(dialect).cot_skeleton()
+        except Exception:
+            skeleton = ""
         user = build_cot_user_prompt(
             question=str(state.get("question") or ""),
             code=str(state.get("code") or ""),
@@ -186,6 +196,10 @@ class CotAgent:
             judge_issues=list(state.get("judge_issues") or []),
             judge_suggestions=list(state.get("judge_suggestions") or []),
             max_chars=settings.cot_max_chars,
+            dialect=dialect,
+            language=language,
+            skeleton=skeleton,
+            fence=fence,
         )
         client = self._client_or_default()
         last_exc: BaseException | None = None

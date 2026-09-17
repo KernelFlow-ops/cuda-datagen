@@ -1,0 +1,260 @@
+"""CUTLASS 4.x + CuTe dialect (nvcc -c with CUTLASS headers)."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from cuda_sft.compile import CompileResult, compile_cuda_source
+from cuda_sft.config import Settings
+from cuda_sft.judge import JudgeResult
+from cuda_sft.parse import extract_fenced_source, looks_like_cuda
+from cuda_sft.prompt import (
+    SelectedPrompts,
+    _stable_index,
+    format_nvcc_for_prompt,
+)
+
+CUTLASS_MAJOR_RE = re.compile(r"#define\s+CUTLASS_MAJOR\s+(\d+)")
+
+SYSTEM_PROMPTS = (
+    (
+        "You are a CUTLASS 4.x / CuTe kernel engineer. "
+        "Write one self-contained CUDA translation unit that compiles with nvcc -c "
+        "against CUTLASS 4 headers and CuTe. Target Ampere (sm_86). "
+        "Do not use SM90, TMA, cluster launch, or Hopper WGMMA. "
+        "Do not wrap kernels in an anonymous namespace (conflicts with CuTe under nvcc). "
+        "Do not use CUTLASS 2.x device::Gemm<> templates."
+    ),
+    (
+        "你是 CUTLASS 4.x + CuTe 工程师。输出可 nvcc -c 通过的单文件 .cu。"
+        "只使用 CUTLASS 4 / CuTe 头文件；架构 sm_86；禁止 Hopper-only API。"
+    ),
+    (
+        "Act as an expert in NVIDIA CUTLASS 4.x and CuTe layouts. "
+        "Prefer cute::Tensor, make_layout, make_tensor for indexing. "
+        "One compilable .cu file; CUDA Toolkit + CUTLASS 4 includes only."
+    ),
+)
+
+USER_SUFFIXES = (
+    """## 生成要求（CUTLASS 4.x + CuTe）
+
+请为以上题目生成**等价算子**的 CUTLASS 4 / CuTe 实现（不要死守 solution.cu 路径字面量）。
+
+1. 目标：{gpu_name}，`{cuda_arch}`，CUDA {cuda_version}。CUTLASS **4.x** 头文件已在 include path。
+2. 单文件 `solution.cu`：必要 `#include`、`__global__`、host 入口。可用 `<cute/tensor.hpp>`、`<cute/layout.hpp>`、`<cutlass/cutlass.h>`。
+3. 禁止 SM90 / TMA / `cute::SM90` / cluster / WGMMA；禁止 CUTLASS 2.x `device::Gemm<>`。禁止匿名 namespace（与 CuTe 冲突）。
+4. 不要编造缺失工程头；`include/solution_header.h` 若被引用，环境会提供空 stubs，请把声明写在本文件。
+5. 不要 `main()`。门闩是 `nvcc -c`，不跑数值。
+6. 只输出一个 ```cuda 代码块。""",
+    """## Requirements (CUTLASS 4.x + CuTe)
+
+Implement the **same operator** with CUTLASS 4 / CuTe, compile-gated.
+
+- Target {gpu_name} / `{cuda_arch}` / CUDA {cuda_version}.
+- One `solution.cu`. Use CuTe tensors/layouts. No Hopper-only APIs.
+- No `main()`. Gate: `nvcc -c` with CUTLASS 4 includes.
+- Reply with exactly one ```cuda fence.""",
+)
+
+REPAIR_PROMPTS = (
+    """上一版 CUTLASS 4 / CuTe 代码未能通过 nvcc 编译。请输出完整修正后的 `solution.cu`。
+目标架构 {cuda_arch}。保持算法，只修编译问题。禁止改用 SM90 API。若报 anonymous namespace / cudafe stub 冲突，去掉匿名 namespace。
+
+nvcc 输出：
+```
+{error}
+```
+
+上一版：
+```cuda
+{code}
+```
+
+只输出一个 ```cuda 代码块。""",
+    """nvcc failed on the CUTLASS 4.x kernel (arch {cuda_arch}). Return a full corrected `solution.cu`.
+Keep Ampere-only CuTe/CUTLASS 4 APIs.
+
+```
+{error}
+```
+
+```cuda
+{code}
+```
+
+Exactly one ```cuda fence.""",
+)
+
+SMOKE_SOURCE = r"""
+#include <cuda_runtime.h>
+#include <cutlass/cutlass.h>
+#include <cute/tensor.hpp>
+
+__global__ void cute_scale_kernel(float* x, float s, int n) {
+  using namespace cute;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    auto tensor = make_tensor(x, make_layout(make_shape(n)));
+    tensor(i) = tensor(i) * s;
+  }
+}
+
+void launch_cute_scale(float* x, float s, int n) {
+  int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  cute_scale_kernel<<<blocks, threads>>>(x, s, n);
+}
+"""
+
+COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry, success criteria.
+2. Algorithm — formula and numeric type notes.
+3. CuTe layout / thread mapping — make_layout, make_tensor, tile vs thread index.
+4. Memory and copy — gmem/smem, cute copy atoms if used; no TMA on sm_86.
+5. Bounds and edge cases — predicated tails, empty n.
+6. Implementation checklist — CUTLASS 4 headers, kernel name, host launcher."""
+
+
+def looks_like_cutlass(source: str) -> bool:
+    """True if source looks like CUDA or CUTLASS/CuTe C++."""
+    if looks_like_cuda(source):
+        return True
+    return any(tok in source for tok in ("cute::", "cutlass::", "make_tensor", "make_layout"))
+
+
+def read_cutlass_major(home: Path) -> int | None:
+    """Parse ``CUTLASS_MAJOR`` from ``include/cutlass/version.h``."""
+    header = home / "include" / "cutlass" / "version.h"
+    if not header.is_file():
+        return None
+    try:
+        text = header.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = CUTLASS_MAJOR_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def cutlass_include_dirs(settings: Settings) -> list[str]:
+    """Include paths for CUTLASS 4.x headers."""
+    home = Path(settings.cutlass_home or "")
+    includes = [str(home / "include")]
+    util = home / "tools" / "util" / "include"
+    if util.is_dir():
+        includes.append(str(util))
+    return includes
+
+
+class CutlassDialect:
+    """CUTLASS 4.x + CuTe C++ compiled with nvcc -c."""
+
+    name = "cutlass"
+    language = "cuda-cpp"
+    source_filename = "solution.cu"
+    fence_langs = ("cuda", "cu", "cpp", "c++", "cc", "cxx", "cutlass", "cute")
+
+    def available(self, settings: Settings) -> tuple[bool, str]:
+        home = Path(settings.cutlass_home or "")
+        if not home.is_dir():
+            return False, f"CUTLASS_HOME not a directory: {home}"
+        if not (home / "include" / "cute").is_dir():
+            return False, f"CuTe headers missing under {home}/include/cute"
+        major = read_cutlass_major(home)
+        if major is None:
+            return False, f"cannot read CUTLASS_MAJOR from {home}/include/cutlass/version.h"
+        if major != 4:
+            return False, f"CUTLASS major version is {major}, need 4.x (home={home})"
+        return True, ""
+
+    def extract(self, text: str) -> str:
+        return extract_fenced_source(
+            text, fence_langs=self.fence_langs, looks_like=looks_like_cutlass
+        )
+
+    def compile(self, code: str, workdir: Path, settings: Settings) -> CompileResult:
+        return compile_cuda_source(
+            code,
+            workdir,
+            settings=settings,
+            extra_includes=cutlass_include_dirs(settings),
+            std=settings.cutlass_cxx_std,
+            filename=self.source_filename,
+            dialect="cutlass",
+        )
+
+    def select_prompts(
+        self,
+        question: str,
+        *,
+        question_id: int,
+        candidate_idx: int,
+        gpu_name: str,
+        cuda_arch: str,
+        cuda_version: str,
+    ) -> SelectedPrompts:
+        sys_i = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
+        suf_i = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+        suffix = USER_SUFFIXES[suf_i].format(
+            gpu_name=gpu_name, cuda_arch=cuda_arch, cuda_version=cuda_version
+        ).strip()
+        user = f"{question.rstrip()}\n\n{suffix}\n"
+        return SelectedPrompts(
+            system=SYSTEM_PROMPTS[sys_i],
+            user=user,
+            system_index=sys_i,
+            suffix_index=suf_i,
+        )
+
+    def build_repair(
+        self,
+        *,
+        cuda_arch: str,
+        compile_error: str,
+        previous_code: str,
+        question_id: int,
+        candidate_idx: int,
+        repair_idx: int,
+    ) -> str:
+        idx = _stable_index(
+            len(REPAIR_PROMPTS), question_id, candidate_idx, salt=13 + int(repair_idx)
+        )
+        return REPAIR_PROMPTS[idx].format(
+            cuda_arch=cuda_arch,
+            error=format_nvcc_for_prompt(compile_error),
+            code=previous_code.strip() or "(no source extracted)",
+        )
+
+    def judge(self, code: str) -> JudgeResult:
+        source = code or ""
+        issues: list[str] = []
+        suggestions: list[str] = []
+        score = 10
+        lowered = source.lower()
+        if "cute::" not in source and "cutlass::" not in source and "make_tensor" not in source:
+            issues.append("no CuTe/CUTLASS 4 APIs detected")
+            score -= 2
+        if any(tok in source for tok in ("SM90", "cute::SM90", "tma_load", "cp.async.bulk")):
+            issues.append("Hopper/SM90 API used; target is sm_86")
+            score -= 3
+        if "cutlass::gemm::device::Gemm" in source:
+            suggestions.append("prefer CUTLASS 4 CuTe style over 2.x device::Gemm")
+            score -= 1
+        if "__global__" not in source:
+            issues.append("no __global__ kernel")
+            score -= 2
+        if "sm90" in lowered or "hopper" in lowered:
+            suggestions.append("comments mention Hopper; keep Ampere-only")
+        return JudgeResult(
+            quality_score=max(1, min(10, score)),
+            issues=issues,
+            suggestions=suggestions,
+        )
+
+    def smoke(self, settings: Settings, workdir: Path) -> CompileResult:
+        return self.compile(SMOKE_SOURCE, workdir, settings)
+
+    def cot_skeleton(self) -> str:
+        return COT_SKELETON

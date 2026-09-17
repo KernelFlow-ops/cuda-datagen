@@ -195,6 +195,17 @@ class Settings(BaseSettings):
     cot_on_empty: str = Field(default="synthetic")
     cot_on_agent_fail: str = Field(default="raw")
 
+    kernel_dialects: str = Field(default="cuda")
+    kernel_mode: str = Field(default="single")
+    kernel_dialect: str = Field(default="")
+    cutlass_home: str = Field(default="/usr/local/cutlass-4.3.5")
+    cutlass_cxx_std: str = Field(default="c++17")
+    cutlass_thinking_level: str = Field(default="low")
+    cutlass_max_output_tokens: int = Field(default=8192, ge=256)
+    cutlass_reasoning_max_tokens: int = Field(default=2048, ge=0)
+    triton_timeout_sec: int = Field(default=90, ge=5)
+    tilelang_timeout_sec: int = Field(default=180, ge=10)
+
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
     cuda_home: str = Field(default="")
@@ -213,7 +224,7 @@ class Settings(BaseSettings):
         """Strip a trailing ``/v1`` so the Anthropic SDK does not double it."""
         return normalize_anthropic_base_url(value)
 
-    @field_validator("thinking_level")
+    @field_validator("thinking_level", "cutlass_thinking_level")
     @classmethod
     def _normalize_thinking(cls, value: str) -> str:
         """Lowercase thinking level (``medium``, ``high``, ``none``, ...)."""
@@ -255,6 +266,34 @@ class Settings(BaseSettings):
         name = aliases.get(name, name)
         if name not in {"simple", "detailed"}:
             raise ValueError("WORK_KEEP must be 'simple' or 'detailed'")
+        return name
+
+    @field_validator("kernel_mode")
+    @classmethod
+    def _normalize_kernel_mode(cls, value: str) -> str:
+        """Map aliases to ``single`` or ``all``."""
+        name = (value or "single").strip().lower()
+        aliases = {
+            "one": "single",
+            "only": "single",
+            "multi": "all",
+            "each": "all",
+            "every": "all",
+        }
+        name = aliases.get(name, name)
+        if name not in {"single", "all"}:
+            raise ValueError("KERNEL_MODE must be 'single' or 'all'")
+        return name
+
+    @field_validator("cutlass_cxx_std")
+    @classmethod
+    def _normalize_cxx_std(cls, value: str) -> str:
+        """Normalize ``c++17`` / ``17`` to a ``-std`` value."""
+        name = (value or "c++17").strip().lower().replace("gnu++", "c++")
+        if name.isdigit():
+            name = f"c++{name}"
+        if name not in {"c++14", "c++17", "c++20", "c++23"}:
+            raise ValueError("CUTLASS_CXX_STD must be c++17 or c++20")
         return name
 
     @field_validator("cot_on_empty", "cot_on_agent_fail")

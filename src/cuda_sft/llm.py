@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
@@ -26,6 +27,10 @@ UPSTREAM_RETRY_HINTS = (
     "try again",
     "capacity",
 )
+_AFFORD_TOKENS_RE = re.compile(r"can only afford (\d+)", re.IGNORECASE)
+# OpenRouter reserves max_tokens against remaining credits; 100k often 402s.
+OPENROUTER_MAX_TOKENS_CAP = 32768
+OPENROUTER_MIN_TOKENS = 256
 
 
 class LLMError(Exception):
@@ -109,6 +114,38 @@ def _openai_retryable_types() -> tuple[type[BaseException], ...]:
         if isinstance(cls, type):
             types.append(cls)
     return tuple(types)
+
+
+def affordable_max_tokens(exc: BaseException, current: int) -> int | None:
+    """Return a smaller ``max_tokens`` when OpenRouter 402 blames the budget.
+
+    OpenRouter rejects the request if ``max_tokens`` exceeds remaining credits,
+    even when the actual completion would be much shorter.
+
+    Args:
+        exc: HTTP error from the Anthropic/OpenRouter SDK.
+        current: ``max_tokens`` used on the failed attempt.
+
+    Returns:
+        Next budget to try, or ``None`` if this is not a credit/max_tokens 402
+        or the budget cannot be reduced further.
+    """
+    status = getattr(exc, "status_code", None)
+    text = _error_text(exc)
+    billing = (
+        status == 402
+        or "billing_error" in text
+        or "can only afford" in text
+        or ("payment_required" in text and "credits" in text)
+    )
+    if not billing:
+        return None
+    match = _AFFORD_TOKENS_RE.search(text)
+    if match:
+        nxt = min(int(current) - 1, int(match.group(1)) - 1)
+        return nxt if nxt >= OPENROUTER_MIN_TOKENS else None
+    nxt = min(int(current) // 2, OPENROUTER_MAX_TOKENS_CAP)
+    return nxt if nxt >= OPENROUTER_MIN_TOKENS and nxt < int(current) else None
 
 
 def is_retryable_llm_error(exc: BaseException) -> bool:
@@ -379,9 +416,9 @@ def fit_to_input_budget(
     return sys_text, msgs
 
 
-def _thinking_enabled(settings: Settings) -> bool:
-    """True unless ``THINKING_LEVEL`` is none/off/false/0."""
-    thinking = settings.thinking_level.strip().lower()
+def _thinking_enabled(settings: Settings, level: str | None = None) -> bool:
+    """True unless the thinking level is none/off/false/0."""
+    thinking = (level if level is not None else settings.thinking_level).strip().lower()
     return thinking not in {"", "none", "off", "false", "0"}
 
 
@@ -435,6 +472,9 @@ class AnthropicOpenRouterClient:
         system: str,
         temperature: float,
         print_stream: bool = True,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        reasoning_max_tokens: int | None = None,
     ) -> LLMCompletion:
         """Stream an Anthropic Messages completion with reasoning captured.
 
@@ -443,6 +483,9 @@ class AnthropicOpenRouterClient:
             system: System prompt.
             temperature: Sampling temperature.
             print_stream: Echo content tokens to stdout.
+            thinking_level: Override ``THINKING_LEVEL`` for this call.
+            max_output_tokens: Override completion ``max_tokens``.
+            reasoning_max_tokens: OpenRouter ``reasoning.max_tokens`` budget.
 
         Returns:
             Visible text plus reasoning (thinking blocks / OpenRouter field).
@@ -451,75 +494,101 @@ class AnthropicOpenRouterClient:
             LLMError: Retryable HTTP/transport failures.
         """
         extra_body: dict[str, Any] = {}
-        thinking = self.settings.thinking_level.strip()
-        if _thinking_enabled(self.settings):
-            extra_body["reasoning"] = {"effort": thinking, "exclude": False}
+        thinking = (thinking_level or self.settings.thinking_level).strip()
+        if _thinking_enabled(self.settings, thinking):
+            reasoning: dict[str, Any] = {"effort": thinking, "exclude": False}
+            budget = int(reasoning_max_tokens or 0)
+            if budget > 0:
+                reasoning["max_tokens"] = budget
+            extra_body["reasoning"] = reasoning
 
         system, messages = fit_to_input_budget(
             system, messages, self.settings.max_input_tokens
         )
-        request: dict[str, Any] = {
-            "model": self.settings.resolved_model,
-            "max_tokens": self.settings.resolved_max_output_tokens,
-            "temperature": temperature,
-            "system": system,
-            "messages": messages,
-        }
-        if extra_body:
-            request["extra_body"] = extra_body
+        requested = int(max_output_tokens or self.settings.resolved_max_output_tokens)
+        max_tokens = min(requested, OPENROUTER_MAX_TOKENS_CAP)
+        last_exc: BaseException | None = None
+        for _attempt in range(4):
+            request: dict[str, Any] = {
+                "model": self.settings.resolved_model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system,
+                "messages": messages,
+            }
+            if extra_body:
+                request["extra_body"] = extra_body
 
-        streamed_text: list[str] = []
-        streamed_reasoning: list[str] = []
-        try:
-            with self._client.messages.stream(**request) as stream:
-                for event in stream:
-                    if _stream_event_type(event) != "content_block_delta":
-                        continue
-                    delta = _stream_event_delta(event)
-                    if delta is None:
-                        continue
-                    delta_type = _block_type(delta)
-                    if delta_type == "thinking_delta":
-                        chunk = _attr_text(delta, "thinking", "text")
-                        if chunk:
-                            streamed_reasoning.append(chunk)
-                    elif delta_type == "text_delta":
-                        chunk = _attr_text(delta, "text")
-                        if not chunk:
+            streamed_text: list[str] = []
+            streamed_reasoning: list[str] = []
+            try:
+                with self._client.messages.stream(**request) as stream:
+                    for event in stream:
+                        if _stream_event_type(event) != "content_block_delta":
                             continue
-                        streamed_text.append(chunk)
-                        if print_stream:
-                            print(chunk, end="", file=sys.stdout, flush=True)
-                final = stream.get_final_message()
-        except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
-            status = getattr(exc, "status_code", None)
-            body = getattr(exc, "body", None)
-            message = f"OpenRouter HTTP {status}: {exc}"
-            if body:
-                message = f"{message} body={body}"
-            if is_retryable_llm_error(exc):
-                raise LLMError(message) from exc
-            raise
+                        delta = _stream_event_delta(event)
+                        if delta is None:
+                            continue
+                        delta_type = _block_type(delta)
+                        if delta_type == "thinking_delta":
+                            chunk = _attr_text(delta, "thinking", "text")
+                            if chunk:
+                                streamed_reasoning.append(chunk)
+                        elif delta_type == "text_delta":
+                            chunk = _attr_text(delta, "text")
+                            if not chunk:
+                                continue
+                            streamed_text.append(chunk)
+                            if print_stream:
+                                print(chunk, end="", file=sys.stdout, flush=True)
+                    final = stream.get_final_message()
+            except (
+                anthropic.APIStatusError,
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+            ) as exc:
+                last_exc = exc
+                nxt = affordable_max_tokens(exc, max_tokens)
+                if nxt is not None:
+                    logger.warning(
+                        "OpenRouter HTTP %s max_tokens=%s; retrying with %s",
+                        getattr(exc, "status_code", None),
+                        max_tokens,
+                        nxt,
+                    )
+                    max_tokens = nxt
+                    continue
+                status = getattr(exc, "status_code", None)
+                body = getattr(exc, "body", None)
+                message = f"OpenRouter HTTP {status}: {exc}"
+                if body:
+                    message = f"{message} body={body}"
+                if is_retryable_llm_error(exc):
+                    raise LLMError(message) from exc
+                raise
 
-        if print_stream and streamed_text:
-            print(file=sys.stdout, flush=True)
+            if print_stream and streamed_text:
+                print(file=sys.stdout, flush=True)
 
-        content = getattr(final, "content", None) or []
-        final_text = _text_from_content_blocks(content)
-        text = final_text or "".join(streamed_text)
-        block_reasoning = _thinking_from_content_blocks(content)
-        field_reasoning = reasoning_from_openrouter_message(final)
-        completion = assemble_completion(
-            visible_text=text,
-            reasoning_candidates=[
-                (block_reasoning, "anthropic_thinking"),
-                (field_reasoning, "openrouter_reasoning"),
-                ("".join(streamed_reasoning), "anthropic_thinking"),
-            ],
-        )
-        if not completion.text.strip():
-            logger.warning("LLM returned empty text content (thinking-only or blank).")
-        return completion
+            content = getattr(final, "content", None) or []
+            final_text = _text_from_content_blocks(content)
+            text = final_text or "".join(streamed_text)
+            block_reasoning = _thinking_from_content_blocks(content)
+            field_reasoning = reasoning_from_openrouter_message(final)
+            completion = assemble_completion(
+                visible_text=text,
+                reasoning_candidates=[
+                    (block_reasoning, "anthropic_thinking"),
+                    (field_reasoning, "openrouter_reasoning"),
+                    ("".join(streamed_reasoning), "anthropic_thinking"),
+                ],
+            )
+            if not completion.text.strip():
+                logger.warning("LLM returned empty text content (thinking-only or blank).")
+            return completion
+
+        assert last_exc is not None
+        raise last_exc
 
 
 class NvidiaOpenAIClient:
@@ -573,6 +642,9 @@ class NvidiaOpenAIClient:
         system: str,
         temperature: float,
         print_stream: bool = True,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        reasoning_max_tokens: int | None = None,
     ) -> LLMCompletion:
         """Stream Chat Completions; collect content and reasoning deltas.
 
@@ -581,6 +653,9 @@ class NvidiaOpenAIClient:
             system: Prepended as a system message if non-empty.
             temperature: Sampling temperature.
             print_stream: Echo content tokens to stdout.
+            thinking_level: Override ``THINKING_LEVEL`` for this call.
+            max_output_tokens: Override completion ``max_tokens``.
+            reasoning_max_tokens: Optional NVIDIA ``max_thinking_tokens``.
 
         Returns:
             Visible text plus ``reasoning_content`` / think-tag fallback.
@@ -598,15 +673,16 @@ class NvidiaOpenAIClient:
             oa_messages.append({"role": "system", "content": system})
         oa_messages.extend(messages)
 
+        thinking = (thinking_level or self.settings.thinking_level).strip().lower()
         extra_body: dict[str, Any] = {
             "chat_template_kwargs": {
-                "enable_thinking": _thinking_enabled(self.settings),
+                "enable_thinking": _thinking_enabled(self.settings, thinking),
             }
         }
-        thinking = self.settings.thinking_level.strip().lower()
-        if _thinking_enabled(self.settings) and thinking in {"low", "medium", "high"}:
+        if _thinking_enabled(self.settings, thinking) and thinking in {"low", "medium", "high"}:
             extra_body["chat_template_kwargs"]["reasoning_effort"] = thinking
 
+        out_tokens = int(max_output_tokens or self.settings.resolved_max_output_tokens)
         streamed_text: list[str] = []
         streamed_reasoning: list[str] = []
         try:
@@ -615,7 +691,7 @@ class NvidiaOpenAIClient:
                 messages=oa_messages,
                 temperature=temperature,
                 top_p=self.settings.top_p,
-                max_tokens=self.settings.resolved_max_output_tokens,
+                max_tokens=out_tokens,
                 extra_body=extra_body,
                 stream=True,
             )

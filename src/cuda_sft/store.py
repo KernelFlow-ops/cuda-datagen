@@ -34,13 +34,12 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def load_done_ids(progress_path: Path) -> set[int]:
-    """Return question ids already marked ``success`` or ``abandoned``.
+def load_done_keys(progress_path: Path) -> set[tuple[int, str]]:
+    """Return ``(question_id, dialect)`` already marked success or abandoned.
 
-    Args:
-        progress_path: ``data/progress.jsonl``.
+    Rows without ``dialect`` are treated as ``cuda`` (legacy progress files).
     """
-    done: set[int] = set()
+    done: set[tuple[int, str]] = set()
     if not progress_path.exists():
         return done
     with progress_path.open("r", encoding="utf-8") as handle:
@@ -59,9 +58,18 @@ def load_done_ids(progress_path: Path) -> set[int]:
             continue
         status = row.get("status")
         qid = row.get("id")
-        if status in {"success", "abandoned"} and isinstance(qid, int):
-            done.add(qid)
+        if status not in {"success", "abandoned"} or not isinstance(qid, int):
+            continue
+        dialect = row.get("dialect")
+        if not isinstance(dialect, str) or not dialect.strip():
+            dialect = "cuda"
+        done.add((qid, dialect.strip().lower()))
     return done
+
+
+def load_done_ids(progress_path: Path) -> set[int]:
+    """Return question ids that have at least one finished dialect row."""
+    return {qid for qid, _dialect in load_done_keys(progress_path)}
 
 
 def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
@@ -122,6 +130,8 @@ class Store:
             assistant = code
         system = str(state.get("system_prompt") or "")
         extra_meta = dict(state.get("metadata") or {})
+        dialect = str(state.get("dialect") or "cuda")
+        language = "python" if dialect in {"triton", "tilelang"} else "cuda-cpp"
         metadata: dict[str, Any] = {
             "candidate": state.get("candidate_idx", 1),
             "repairs": state.get("repair_idx", 0),
@@ -131,6 +141,8 @@ class Store:
             "used_rdc": state.get("used_rdc", False),
             "system": system,
             "judge_score": state.get("judge_score", 0),
+            "dialect": dialect,
+            "language": language,
         }
         if extra_meta.get("judge"):
             metadata["judge"] = extra_meta["judge"]
@@ -170,6 +182,7 @@ class Store:
             self.progress_path,
             {
                 "id": state["question_id"],
+                "dialect": dialect,
                 "status": "success",
                 "candidate": state.get("candidate_idx", 1),
                 "repairs": state.get("repair_idx", 0),
@@ -182,8 +195,10 @@ class Store:
         Args:
             state: Graph state after the last failed candidate.
         """
+        dialect = str(state.get("dialect") or "cuda")
         record = {
             "id": state["question_id"],
+            "dialect": dialect,
             "question": state.get("question", ""),
             "reason": "all_candidates_failed",
             "last_error": state.get("compile_error", ""),
@@ -194,6 +209,7 @@ class Store:
             self.progress_path,
             {
                 "id": state["question_id"],
+                "dialect": dialect,
                 "status": "abandoned",
                 "reason": "all_candidates_failed",
             },

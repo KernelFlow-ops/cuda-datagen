@@ -43,6 +43,13 @@ cp .env.example .env   # 若还没有 .env
 | `COT_RAW_STORE_MAX_CHARS` | `32768` | `sft.jsonl` metadata 里归档 raw thinking 的上限 |
 | `COT_ON_EMPTY` | `synthetic` | 教师 thinking 为空时：`synthetic`（由终稿代码反写）/ `empty` |
 | `COT_ON_AGENT_FAIL` | `raw` | Agent 失败回退：`raw` / `synthetic` / `empty` |
+| `KERNEL_DIALECTS` | `cuda` | 逗号分隔：`cuda`,`cutlass`（CUTLASS **4.x** + CuTe，别名 `cute`）,`triton`,`tilelang` |
+| `KERNEL_MODE` | `single` | `single` 只跑一种；`all` 每题把列出的方言各生成一遍 |
+| `KERNEL_DIALECT` | 空 | `single` 时覆盖列表第一项 |
+| `CUTLASS_HOME` | `/usr/local/cutlass-4.3.5` | CUTLASS 4.x 根目录；`available()` 要求 `CUTLASS_MAJOR==4` |
+| `CUTLASS_CXX_STD` | `c++17` | cutlass 方言 `nvcc -std=` |
+| `TRITON_TIMEOUT_SEC` | `90` | Triton import/JIT 门闩超时 |
+| `TILELANG_TIMEOUT_SEC` | `180` | TileLang 门闩超时；未安装则自动跳过 |
 | `ASYNC_LLM_ENABLED` | `true` | 启用异步 LLM 调用（编译期间预生成修复轮响应） |
 | `ASYNC_LLM_MAX_WORKERS` | `2` | 异步 LLM 并发数（1-4） |
 | `LLM_PROVIDERS` | 空 | 逗号分隔多 provider，如 `nvidia,openrouter` |
@@ -102,7 +109,19 @@ python run.py --workers 6 --quiet
 python run.py --workers 6 --limit 12 --quiet   # 并发试跑
 ```
 
-常用参数：`--offset N`、`--ids 1,2,10`、`--overwrite`、`--quiet`、`--workers N`、`--data-dir DIR`。
+常用参数：`--offset N`、`--ids 1,2,10`、`--overwrite`、`--quiet`、`--workers N`、`--data-dir DIR`、`--dialects cuda,cutlass,triton`、`--kernel-mode all`。
+
+只写 CUTLASS 4.x / CuTe：
+
+```bash
+python run.py --dialects cutlass --limit 3
+```
+
+每题同时写 CUDA + CUTLASS 4 + Triton（TileLang 未安装会自动跳过）：
+
+```bash
+python run.py --dialects cuda,cutlass,triton --kernel-mode all --limit 3
+```
 
 ## 输出
 
@@ -176,5 +195,7 @@ prepare → generate → extract → compile
                          ├ candidate < 3 → next_candidate → generate
                          └ else → save_abandoned
 ```
+
+`KERNEL_MODE=all` 时在 CLI 层按方言展开 job（每题每种语言各跑一张上图），进度键是 `(id, dialect)`。CUTLASS 方言钉 **CUTLASS 4.x + CuTe**（本机 `/usr/local/cutlass-4.3.5`）。
 
 LLM：`LLM_PROVIDER=openrouter` 时走 Anthropic Messages（`POST {OPENROUTER_BASE_URL}/v1/messages`）；`nvidia` 时走 OpenAI Chat Completions 流式（`{NVIDIA_BASE_URL}/chat/completions`）。生成时采集 reasoning/thinking（OpenRouter：`thinking` block / `reasoning` 字段；NVIDIA：`delta.reasoning_content`，必要时再从 `<think>` 标签兜底）。`judge` 与 `cot` 在开关关闭时 no-op。CoT Agent 只整理胜出样本的推理，不改已经通过编译的代码。高质量 CoT 建议保持 `THINKING_LEVEL=medium` 或 `high`，并让 `MAX_OUTPUT_TOKENS` 明显大于思考预算。

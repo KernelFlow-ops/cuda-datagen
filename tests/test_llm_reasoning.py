@@ -6,6 +6,7 @@ import unittest
 
 from cuda_sft.llm import (
     assemble_completion,
+    affordable_max_tokens,
     reasoning_from_openrouter_message,
     _thinking_from_content_blocks,
 )
@@ -53,6 +54,24 @@ class AssembleCompletionTests(unittest.TestCase):
         )
         self.assertEqual(completion.reasoning_source, "anthropic_thinking")
         self.assertEqual(completion.reasoning, "from thinking block")
+
+
+class AffordableMaxTokensTests(unittest.TestCase):
+    def test_parses_openrouter_402(self) -> None:
+        class _Err(Exception):
+            status_code = 402
+
+        exc = _Err(
+            "Error code: 402 - you requested up to 100000 tokens, "
+            "but can only afford 24305"
+        )
+        self.assertEqual(affordable_max_tokens(exc, 100000), 24304)
+
+    def test_ignores_unrelated_404(self) -> None:
+        class _Err(Exception):
+            status_code = 404
+
+        self.assertIsNone(affordable_max_tokens(_Err("not found"), 100000))
 
 
 class OpenRouterMessageTests(unittest.TestCase):

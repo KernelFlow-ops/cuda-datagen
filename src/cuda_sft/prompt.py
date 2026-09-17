@@ -255,8 +255,14 @@ Required CoT skeleton (use these headings, keep them short):
 COT_USER_TEMPLATE = """## Problem
 {question}
 
-## Final CUDA (compile-passed, do not change)
-```cuda
+## Dialect
+{dialect} ({language}). CoT must match this source, not another language.
+
+Required headings:
+{skeleton}
+
+## Final source (compile-passed, do not change)
+```{fence}
 {code}
 ```
 
@@ -283,23 +289,39 @@ def build_cot_user_prompt(
     judge_issues: list[str] | None = None,
     judge_suggestions: list[str] | None = None,
     max_chars: int = 8000,
+    dialect: str = "cuda",
+    language: str = "cuda-cpp",
+    skeleton: str = "",
+    fence: str = "cuda",
 ) -> str:
     """Build the CoT-editor user message for one winning sample.
 
     Args:
         question: Original problem text (not the generation suffix).
-        code: Compile-passed CUDA source.
+        code: Compile-passed source.
         raw_reasoning: Teacher thinking, already truncated/cleaned.
         repair_idx: How many compile-fix rounds the winner used.
-        error_summary: Last nvcc summary (optional context).
+        error_summary: Last compiler summary (optional context).
         judge_issues: Judge issues, if any.
         judge_suggestions: Judge suggestions, if any.
         max_chars: Character budget told to the editor.
+        dialect: Kernel dialect id.
+        language: ``cuda-cpp`` or ``python``.
+        skeleton: Six-heading outline for this dialect.
+        fence: Markdown fence language for the frozen source.
     """
     issues = judge_issues or []
     suggestions = judge_suggestions or []
+    default_skel = (
+        "1. Problem restatement\n2. Algorithm\n3. Thread/block mapping\n"
+        "4. Memory and sync\n5. Bounds and edge cases\n6. Implementation checklist"
+    )
     return COT_USER_TEMPLATE.format(
         question=(question or "").strip() or "(empty problem)",
+        dialect=(dialect or "cuda"),
+        language=(language or "cuda-cpp"),
+        skeleton=(skeleton or default_skel).strip(),
+        fence=(fence or "cuda"),
         code=(code or "").strip() or "(no source)",
         raw_reasoning=(raw_reasoning or "").strip() or "(none)",
         repair_idx=int(repair_idx or 0),
@@ -465,6 +487,12 @@ _NVCC_DIAG_RE = re.compile(
     r"(?:\s+#\S+)?:\s+(?P<msg>.*)$",
     re.IGNORECASE,
 )
+# Host-compiler / cudafe stub lines: ``file:line:col: error: ...``
+_GCC_DIAG_RE = re.compile(
+    r"^(?P<loc>\S.*?):(?P<line>\d+)(?::(?P<col>\d+))?:\s+"
+    r"(?P<kind>error|warning|fatal error)\s*:\s+(?P<msg>.*)$",
+    re.IGNORECASE,
+)
 _NVCC_FATAL_RE = re.compile(
     r"^(?:(?P<loc>\S.*?):\s+)?fatal error:\s+(?P<msg>.*)$",
     re.IGNORECASE,
@@ -534,11 +562,18 @@ def format_nvcc_for_prompt(output: str, max_chars: int = 6000) -> str:
             loc = match.group("loc")
             line_no = match.group("line")
         else:
-            fatal = _NVCC_FATAL_RE.match(raw.strip())
-            if fatal:
-                kind = "fatal error"
-                msg = fatal.group("msg")
-                loc = fatal.group("loc") or ""
+            gcc = _GCC_DIAG_RE.match(raw.strip())
+            if gcc:
+                kind = gcc.group("kind").lower()
+                msg = gcc.group("msg")
+                loc = gcc.group("loc")
+                line_no = gcc.group("line")
+            else:
+                fatal = _NVCC_FATAL_RE.match(raw.strip())
+                if fatal:
+                    kind = "fatal error"
+                    msg = fatal.group("msg")
+                    loc = fatal.group("loc") or ""
         if not kind:
             continue
         key = f"{kind}|{_normalize_diag_message(msg)}"
@@ -561,6 +596,13 @@ def format_nvcc_for_prompt(output: str, max_chars: int = 6000) -> str:
         f"{warning_count} warnings ({len(warnings)} unique); "
         f"log truncated from {len(text)} chars"
     )
+    if error_count == 0 and warning_count == 0:
+        # Python/TVM dumps and cudafe stub text often lack nvcc ``file(line): error:``
+        # markers; keep a tail so repairs are not fed an empty summary.
+        if len(text) <= max_chars:
+            return text
+        keep = max(256, max_chars - 40)
+        return f"...[truncated {len(text) - keep} chars]...\n{text[-keep:]}"
     parts = [header, ""]
     if errors:
         parts.append("errors:")

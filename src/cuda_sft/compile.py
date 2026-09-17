@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -95,6 +96,7 @@ class CompileResult:
     output: str
     used_rdc: bool
     source_path: Path | None = None
+    dialect: str = "cuda"
 
 
 def ensure_stubs(workdir: Path) -> None:
@@ -127,6 +129,8 @@ def _nvcc_command(
     output: Path,
     *,
     rdc: bool,
+    extra_includes: list[str] | None = None,
+    std: str = "c++17",
 ) -> list[str]:
     """Build an ``nvcc -c`` command line.
 
@@ -135,18 +139,23 @@ def _nvcc_command(
         source: Path to ``solution.cu``.
         output: Path to the ``.o`` file.
         rdc: If True, add ``-rdc=true`` for dynamic parallelism.
+        extra_includes: Additional ``-I`` directories (CUTLASS 4.x, ...).
+        std: C++ standard flag without the ``-std=`` prefix.
 
     Returns:
         Argument list suitable for ``subprocess.run``.
     """
     workdir = source.parent
+    cxx = (std or "c++17").strip()
+    if not cxx.startswith("c++"):
+        cxx = "c++17"
     cmd = [
         settings.nvcc_bin,
         "-c",
         str(source),
         "-o",
         str(output),
-        "-std=c++17",
+        f"-std={cxx}",
         f"-arch={settings.resolved_cuda_arch}",
         "--expt-relaxed-constexpr",
         "--extended-lambda",
@@ -154,17 +163,38 @@ def _nvcc_command(
         f"-I{workdir}",
         f"-I{workdir / 'include'}",
     ]
+    for include in extra_includes or []:
+        path = str(include).strip()
+        if path:
+            cmd.append(f"-I{path}")
     if rdc:
         cmd.append("-rdc=true")
     return cmd
 
 
-def _run_nvcc(cmd: list[str], timeout: int) -> tuple[int, str]:
+def _nvcc_env(extra_includes: list[str] | None = None) -> dict[str, str]:
+    """Build an env so CPATH cannot shadow CUTLASS 4.x ``-I`` directories."""
+    env = os.environ.copy()
+    extras = [p for p in (extra_includes or []) if p]
+    if extras:
+        joined = os.pathsep.join(extras)
+        env["CPATH"] = joined
+        env["CPLUS_INCLUDE_PATH"] = joined
+        env["C_INCLUDE_PATH"] = joined
+    return env
+
+
+def _run_nvcc(
+    cmd: list[str],
+    timeout: int,
+    extra_includes: list[str] | None = None,
+) -> tuple[int, str]:
     """Run nvcc and return ``(exit_code, combined_output)``.
 
     Args:
         cmd: nvcc argv.
         timeout: Kill the process after this many seconds.
+        extra_includes: Prefer these over ambient ``CPATH`` (CUTLASS 4.x).
     """
     try:
         proc = subprocess.run(
@@ -173,6 +203,7 @@ def _run_nvcc(cmd: list[str], timeout: int) -> tuple[int, str]:
             text=True,
             timeout=timeout,
             check=False,
+            env=_nvcc_env(extra_includes),
         )
     except subprocess.TimeoutExpired as exc:
         tail = ""
@@ -192,8 +223,13 @@ def compile_cuda_source(
     source: str,
     workdir: Path,
     settings: Settings | None = None,
+    *,
+    extra_includes: list[str] | None = None,
+    std: str = "c++17",
+    filename: str = "solution.cu",
+    dialect: str = "cuda",
 ) -> CompileResult:
-    """Write ``source`` to ``workdir/solution.cu`` and compile with ``nvcc -c``.
+    """Write ``source`` to ``workdir/filename`` and compile with ``nvcc -c``.
 
     On dynamic-parallelism errors, retries once with ``-rdc=true``.
 
@@ -201,6 +237,10 @@ def compile_cuda_source(
         source: Full CUDA translation unit.
         workdir: Scratch directory for this attempt.
         settings: CUDA toolchain config; defaults to :func:`get_settings`.
+        extra_includes: Extra ``-I`` paths (CUTLASS 4.x headers).
+        std: C++ standard passed as ``-std=``.
+        filename: Source filename inside ``workdir``.
+        dialect: Recorded on the result (``cuda`` / ``cutlass``).
 
     Returns:
         Compile result (success or last failure).
@@ -209,30 +249,62 @@ def compile_cuda_source(
     workdir.mkdir(parents=True, exist_ok=True)
     ensure_stubs(workdir)
 
-    source_path = workdir / "solution.cu"
+    source_path = workdir / (filename or "solution.cu")
     object_path = workdir / "solution.o"
     source_path.write_text(source, encoding="utf-8")
     if object_path.exists():
         object_path.unlink()
 
-    cmd = _nvcc_command(settings, source_path, object_path, rdc=False)
-    code, output = _run_nvcc(cmd, settings.nvcc_timeout_sec)
+    cmd = _nvcc_command(
+        settings,
+        source_path,
+        object_path,
+        rdc=False,
+        extra_includes=extra_includes,
+        std=std,
+    )
+    code, output = _run_nvcc(
+        cmd, settings.nvcc_timeout_sec, extra_includes=extra_includes
+    )
     if code == 0:
-        return CompileResult(True, cmd, output, used_rdc=False, source_path=source_path)
+        return CompileResult(
+            True, cmd, output, used_rdc=False, source_path=source_path, dialect=dialect
+        )
 
     if looks_like_rdc_error(output):
-        rdc_cmd = _nvcc_command(settings, source_path, object_path, rdc=True)
-        rdc_code, rdc_output = _run_nvcc(rdc_cmd, settings.nvcc_timeout_sec)
+        rdc_cmd = _nvcc_command(
+            settings,
+            source_path,
+            object_path,
+            rdc=True,
+            extra_includes=extra_includes,
+            std=std,
+        )
+        rdc_code, rdc_output = _run_nvcc(
+            rdc_cmd, settings.nvcc_timeout_sec, extra_includes=extra_includes
+        )
         if rdc_code == 0:
             return CompileResult(
-                True, rdc_cmd, rdc_output, used_rdc=True, source_path=source_path
+                True,
+                rdc_cmd,
+                rdc_output,
+                used_rdc=True,
+                source_path=source_path,
+                dialect=dialect,
             )
         combined = f"{output}\n\n[retry with -rdc=true]\n{rdc_output}".strip()
         return CompileResult(
-            False, rdc_cmd, combined, used_rdc=True, source_path=source_path
+            False,
+            rdc_cmd,
+            combined,
+            used_rdc=True,
+            source_path=source_path,
+            dialect=dialect,
         )
 
-    return CompileResult(False, cmd, output, used_rdc=False, source_path=source_path)
+    return CompileResult(
+        False, cmd, output, used_rdc=False, source_path=source_path, dialect=dialect
+    )
 
 
 def attempt_workdir(
@@ -240,13 +312,18 @@ def attempt_workdir(
     question_id: int,
     candidate_idx: int,
     repair_idx: int,
+    dialect: str = "cuda",
+    *,
+    nest_dialect: bool = False,
 ) -> Path:
     """Return the directory used to compile one attempt.
 
-    ``WORK_KEEP=simple`` overwrites ``work/q{id}/`` in place.
-    ``WORK_KEEP=detailed`` uses ``work/q{id}/c{c}/r{r}/``.
+    ``WORK_KEEP=simple`` overwrites ``work/q{id}/`` (or ``.../{dialect}/``).
+    ``WORK_KEEP=detailed`` uses ``c{c}/r{r}/`` under that root.
     """
     base = settings.work_path / f"q{question_id}"
+    if nest_dialect:
+        base = base / (dialect or "cuda")
     if settings.work_keep == "simple":
         return base
     return base / f"c{candidate_idx}" / f"r{repair_idx}"
@@ -258,28 +335,37 @@ def finalize_question_work(
     *,
     code: str,
     success: bool,
+    dialect: str = "cuda",
+    filename: str = "solution.cu",
+    nest_dialect: bool = False,
 ) -> None:
-    """In simple mode, keep only the last ``solution.cu`` (and ``nvcc.log`` if failed).
+    """In simple mode, keep only the last source file (and compile log if failed).
 
     Args:
         settings: Pipeline settings (``work_keep``).
         question_id: Question id.
-        code: Last CUDA source for this question.
+        code: Last source for this question/dialect.
         success: True if compile passed (drop nvcc.log); False keeps the last log.
+        dialect: Kernel dialect name.
+        filename: ``solution.cu`` or ``solution.py``.
+        nest_dialect: If True, write under ``work/q{id}/{dialect}/``.
     """
     if settings.work_keep != "simple":
         return
     qdir = settings.work_path / f"q{question_id}"
+    if nest_dialect:
+        qdir = qdir / (dialect or "cuda")
     qdir.mkdir(parents=True, exist_ok=True)
+    out_name = filename or "solution.cu"
     if (code or "").strip():
-        (qdir / "solution.cu").write_text(code, encoding="utf-8")
+        (qdir / out_name).write_text(code, encoding="utf-8")
     for child in list(qdir.iterdir()):
         name = child.name
         if child.is_dir() and (name.startswith("c") or name == "include"):
             shutil.rmtree(child, ignore_errors=True)
         elif name in {"helpers.h", "solution_header.h", "solution.o"}:
             child.unlink(missing_ok=True)
-        elif name == "nvcc.log" and success:
+        elif name in {"nvcc.log", "compile.log"} and success:
             child.unlink(missing_ok=True)
 
 
