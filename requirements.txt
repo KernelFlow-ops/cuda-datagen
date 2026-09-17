@@ -6,3 +6,4 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 tqdm>=4.66.0
 tilelang>=0.1.14
+# triton usually ships with torch; `bash scripts/setup_env.sh` installs it if missing

@@ -138,9 +138,48 @@ def read_cutlass_major(home: Path) -> int | None:
     return int(match.group(1))
 
 
+def candidate_cutlass_homes(settings: Settings | None = None) -> list[Path]:
+    """Search order: ``CUTLASS_HOME``, system 4.3.5, project ``third_party/cutlass``."""
+    from cuda_sft.config import PROJECT_ROOT
+
+    homes: list[Path] = []
+    seen: set[str] = set()
+    raw = (settings.cutlass_home if settings is not None else "") or ""
+    for item in (
+        Path(raw) if raw.strip() else None,
+        Path("/usr/local/cutlass-4.3.5"),
+        PROJECT_ROOT / "third_party" / "cutlass",
+    ):
+        if item is None:
+            continue
+        key = str(item)
+        if key not in seen:
+            seen.add(key)
+            homes.append(item)
+    return homes
+
+
+def is_cutlass4_home(home: Path) -> bool:
+    """True if ``home`` looks like CUTLASS 4.x with CuTe headers."""
+    if not home.is_dir():
+        return False
+    if not (home / "include" / "cute").is_dir():
+        return False
+    major = read_cutlass_major(home)
+    return major == 4
+
+
+def resolved_cutlass_home(settings: Settings) -> Path | None:
+    """First valid CUTLASS 4.x tree, or None."""
+    for home in candidate_cutlass_homes(settings):
+        if is_cutlass4_home(home):
+            return home
+    return None
+
+
 def cutlass_include_dirs(settings: Settings) -> list[str]:
     """Include paths for CUTLASS 4.x headers."""
-    home = Path(settings.cutlass_home or "")
+    home = resolved_cutlass_home(settings) or Path(settings.cutlass_home or "")
     includes = [str(home / "include")]
     util = home / "tools" / "util" / "include"
     if util.is_dir():
@@ -157,17 +196,11 @@ class CutlassDialect:
     fence_langs = ("cuda", "cu", "cpp", "c++", "cc", "cxx", "cutlass", "cute")
 
     def available(self, settings: Settings) -> tuple[bool, str]:
-        home = Path(settings.cutlass_home or "")
-        if not home.is_dir():
-            return False, f"CUTLASS_HOME not a directory: {home}"
-        if not (home / "include" / "cute").is_dir():
-            return False, f"CuTe headers missing under {home}/include/cute"
-        major = read_cutlass_major(home)
-        if major is None:
-            return False, f"cannot read CUTLASS_MAJOR from {home}/include/cutlass/version.h"
-        if major != 4:
-            return False, f"CUTLASS major version is {major}, need 4.x (home={home})"
-        return True, ""
+        home = resolved_cutlass_home(settings)
+        if home is not None:
+            return True, str(home)
+        tried = ", ".join(str(p) for p in candidate_cutlass_homes(settings))
+        return False, f"no CUTLASS 4.x + CuTe tree (tried {tried})"
 
     def extract(self, text: str) -> str:
         return extract_fenced_source(

@@ -67,6 +67,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="reprocess questions even if they are already in progress.jsonl",
     )
     parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="detect kernel dialect environments and install anything missing (same as bash scripts/setup_env.sh)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="with --setup (or alone): only detect, do not install",
+    )
+    parser.add_argument(
+        "--no-smoke",
+        action="store_true",
+        help="with --setup: skip dialect smoke compiles",
+    )
+    parser.add_argument(
         "--dry-compile",
         action="store_true",
         help="compile a built-in smoke kernel and exit (no API calls)",
@@ -305,6 +320,18 @@ def main(argv: list[str] | None = None) -> int:
     _apply_kernel_cli(args)
     settings = get_settings()
     set_print_stream(not args.quiet)
+
+    if args.setup or args.check:
+        from cuda_sft.dialects.agent import parse_dialect_list
+        from cuda_sft.setup_env import run_setup
+
+        _configure_logging(args.log_level)
+        names = parse_dialect_list(args.dialects) if args.dialects else None
+        return run_setup(
+            dialects=names,
+            check_only=not args.setup or args.check,
+            no_smoke=args.no_smoke,
+        )
 
     if args.dry_compile:
         _configure_logging(args.log_level)

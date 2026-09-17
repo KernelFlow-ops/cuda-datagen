@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
@@ -82,13 +83,22 @@ def detect_cuda_home() -> str:
     if nvcc:
         # /usr/local/cuda-12.6/bin/nvcc -> /usr/local/cuda-12.6
         return str(Path(nvcc).resolve().parent.parent)
-    for candidate in (
+    prefixes = [
+        os.environ.get("CONDA_PREFIX"),
+        sys.prefix,
         "/usr/local/cuda",
         "/usr/local/cuda-12.6",
         "/usr/local/cuda-12",
-    ):
-        if Path(candidate).exists():
-            return candidate
+        "/usr/local/cuda-13",
+    ]
+    for candidate in prefixes:
+        if not candidate:
+            continue
+        root = Path(candidate)
+        if (root / "bin" / "nvcc").is_file():
+            return str(root)
+        if str(candidate).startswith("/usr/local/cuda") and root.exists():
+            return str(root)
     return "/usr/local/cuda"
 
 
@@ -116,6 +126,12 @@ def detect_nvcc() -> str:
     candidate = Path(home) / "bin" / "nvcc"
     if candidate.exists():
         return str(candidate)
+    for prefix in (os.environ.get("CONDA_PREFIX"), sys.prefix):
+        if not prefix:
+            continue
+        env_nvcc = Path(prefix) / "bin" / "nvcc"
+        if env_nvcc.is_file():
+            return str(env_nvcc)
     return "nvcc"
 
 

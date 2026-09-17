@@ -67,7 +67,11 @@ class KernelDialectAgent:
             spec = self.spec(name)
             ok, reason = spec.available(cfg)
             if not ok:
-                logger.warning("skipping dialect %s: %s", name, reason)
+                logger.warning(
+                "skipping dialect %s: %s (install with: bash scripts/setup_env.sh)",
+                name,
+                reason,
+            )
                 continue
             out.append(spec)
         if not out:

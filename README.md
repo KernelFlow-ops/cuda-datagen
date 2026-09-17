@@ -10,9 +10,28 @@
 
 ```bash
 conda activate langchain
-# 如缺依赖：pip install -r requirements.txt
 cp .env.example .env   # 若还没有 .env
+
+# 检测四种内核方言环境，缺什么就自动安装
+bash scripts/setup_env.sh
+# 只检测，不安装、不改 .env
+bash scripts/setup_env.sh --check
+# 只准备其中几种
+bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 ```
+
+等价入口：`python scripts/setup_env.py`、`python run.py --setup`。
+
+脚本会按需：
+
+1. `pip install -r requirements.txt`（核心 Python 依赖缺失时）
+2. `pip install triton`（缺 torch 时一并装）和 `tilelang`
+3. 没有 CUTLASS 4.x 时 `git clone` 到 `third_party/cutlass`，并写入 `CUTLASS_HOME`
+4. 没有 `nvcc` 时尝试 conda（`nvidia` 频道的 `cuda-nvcc`）或 pip `cuda-toolkit` / NVIDIA wheels
+5. 没有 `g++` 时尝试 conda-forge `cxx-compiler`
+6. 对各方言做一次 smoke compile（可用 `--no-smoke` 跳过）
+
+**不会**自动安装 GPU 驱动；没有 `nvidia-smi` 时 Triton JIT 可能不可用。conda/pip 装不上 `nvcc` 时请自行安装 CUDA Toolkit。
 
 在 `.env` 填入对应 provider 的 key。可改的项：
 
