@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from cuda_sft.config import get_settings
-from cuda_sft.parse import extract_cuda_source, extract_thinking, wrap_cot_assistant
+from cuda_sft.parse import (
+    extract_cuda_source,
+    extract_thinking,
+    strip_thinking,
+    wrap_cot_assistant,
+)
 from cuda_sft.prompt import SYSTEM_PROMPT
 
 
@@ -118,28 +123,50 @@ def iter_sft_rows(path: Path) -> Iterable[dict[str, Any]]:
                 yield row
 
 
+def _row_task(row: dict[str, Any]) -> str:
+    """Return ``knowledge`` when metadata says so, else ``kernel``."""
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        task = str(metadata.get("task") or "").strip().lower()
+        if task:
+            return task
+        language = str(metadata.get("language") or "").strip().lower()
+        if language == "prose":
+            return "knowledge"
+    return "kernel"
+
+
 def resolve_export_assistant(row: dict[str, Any], *, cot_in_assistant: bool) -> str:
     """Build the training assistant label, optionally wrapping archived CoT.
 
-    If the archive assistant already contains a ``<think>`` block, keep it when
-    ``cot_in_assistant`` is true, otherwise strip to CUDA source. If the
-    assistant is code-only but ``metadata.cot.text`` is present, wrap on export.
+    Knowledge rows keep prose (do not run the CUDA extractor). Kernel rows
+    strip to source when ``cot_in_assistant`` is false.
     """
     pair = split_user_assistant(row)
-    assistant = pair[1] if pair else str(row.get("code") or "")
+    assistant = pair[1] if pair else ""
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     tagged = extract_thinking(assistant)
+    cot = tagged
+    if not cot.strip() and isinstance(metadata, dict):
+        info = metadata.get("cot")
+        if isinstance(info, dict):
+            cot = str(info.get("text") or "")
+        if not cot.strip():
+            cot = str(metadata.get("cot_text") or "")
+
+    if _row_task(row) == "knowledge":
+        body = strip_thinking(assistant)
+        if not body.strip():
+            body = str(row.get("answer") or "")
+        if cot_in_assistant and cot.strip():
+            return wrap_cot_assistant(cot, body)
+        return (body or "").strip() + ("\n" if (body or "").strip() else "")
+
+    if not assistant:
+        assistant = str(row.get("code") or "")
     code = extract_cuda_source(assistant)
     if not (code or "").strip():
         code = str(row.get("code") or "")
-    cot = tagged
-    if not cot.strip():
-        metadata = row.get("metadata")
-        if isinstance(metadata, dict):
-            info = metadata.get("cot")
-            if isinstance(info, dict):
-                cot = str(info.get("text") or "")
-            if not cot.strip():
-                cot = str(metadata.get("cot_text") or "")
     if cot_in_assistant and cot.strip():
         return wrap_cot_assistant(cot, code or assistant)
     return (code or assistant).strip() + ("\n" if (code or assistant).strip() else "")

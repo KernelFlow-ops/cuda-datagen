@@ -20,6 +20,7 @@ class GraphState(TypedDict, total=False):
 
     question_id: int
     question: str
+    kind: str
     dialect: str
     system_prompt: str
     user_prompt: str

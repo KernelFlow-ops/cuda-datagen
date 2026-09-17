@@ -19,7 +19,9 @@ from cuda_sft.dialects.agent import get_dialect_agent
 from cuda_sft.graph import build_graph, recursion_limit, set_print_stream
 from cuda_sft.llm import is_retryable_llm_error
 from cuda_sft.formats import export_training_files
-from cuda_sft.store import init_store, iter_questions, load_done_keys
+from cuda_sft.store import init_store, iter_question_rows, load_done_keys
+from cuda_sft.tasks.kinds import Job, QuestionRow, coerce_job, progress_key
+from cuda_sft.tasks.router import expand_pipeline_jobs
 
 logger = logging.getLogger("cuda_sft")
 
@@ -133,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="single (one dialect) or all (every listed dialect per question)",
     )
     parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="kernel (default, compile gate), knowledge (rubric gate), or auto",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="logging level (default: INFO)",
@@ -240,14 +248,14 @@ def _configure_logging(
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _select_questions(
+def _select_question_rows(
     path: Path,
     *,
     offset: int,
     limit: int | None,
     ids: set[int] | None,
     done: set[int],
-) -> list[tuple[int, str]]:
+) -> list[QuestionRow]:
     """Apply offset, id filter, resume skip, and limit to the question list.
 
     Args:
@@ -257,20 +265,23 @@ def _select_questions(
         ids: If set, only these 1-based ids.
         done: Ids already success/abandoned (skipped unless ``--overwrite``).
     """
-    rows = list(iter_questions(path))
+    rows = [
+        QuestionRow(question_id=qid, question=question, raw=raw)
+        for qid, question, raw in iter_question_rows(path)
+    ]
     if offset:
         rows = rows[offset:]
     if ids is not None:
-        rows = [row for row in rows if row[0] in ids]
+        rows = [row for row in rows if row.question_id in ids]
     if done:
-        rows = [row for row in rows if row[0] not in done]
+        rows = [row for row in rows if row.question_id not in done]
     if limit is not None:
         rows = rows[:limit]
     return rows
 
 
 def _apply_kernel_cli(args: argparse.Namespace) -> None:
-    """Copy ``--dialects`` / ``--kernel-mode`` into env and drop settings cache."""
+    """Copy ``--dialects`` / ``--kernel-mode`` / ``--task`` into env and drop cache."""
     changed = False
     if args.dialects:
         os.environ["KERNEL_DIALECTS"] = args.dialects
@@ -278,8 +289,19 @@ def _apply_kernel_cli(args: argparse.Namespace) -> None:
     if args.kernel_mode:
         os.environ["KERNEL_MODE"] = args.kernel_mode
         changed = True
+    if getattr(args, "task", None):
+        os.environ["TASK_MODE"] = args.task
+        changed = True
     if changed:
         get_settings.cache_clear()
+
+
+def _set_all_print_stream(enabled: bool) -> None:
+    """Toggle token streaming on both kernel and knowledge graphs."""
+    set_print_stream(enabled)
+    from cuda_sft.knowledge.graph import set_print_stream as set_knowledge_print_stream
+
+    set_knowledge_print_stream(enabled)
 
 
 def run_dry_compile() -> int:
@@ -319,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _apply_kernel_cli(args)
     settings = get_settings()
-    set_print_stream(not args.quiet)
+    _set_all_print_stream(not args.quiet)
 
     if args.setup or args.check:
         from cuda_sft.dialects.agent import parse_dialect_list
@@ -373,19 +395,20 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level, log_file, worker_id=0)
     store = init_store(data_dir)
     ids = _parse_ids(args.ids)
-    questions = _select_questions(
+    questions = _select_question_rows(
         questions_path,
         offset=args.offset,
         limit=args.limit,
         ids=ids,
         done=set(),
     )
-    agent = get_dialect_agent()
-    jobs = agent.expand_jobs(questions, settings)
+    all_jobs = expand_pipeline_jobs(questions, settings)
     if not args.overwrite:
         done_keys = load_done_keys(store.progress_path)
-        jobs = [job for job in jobs if (job[0], job[2]) not in done_keys]
-    skipped_done = 0 if args.overwrite else len(agent.expand_jobs(questions, settings)) - len(jobs)
+        jobs = [job for job in all_jobs if progress_key(job) not in done_keys]
+    else:
+        jobs = all_jobs
+    skipped_done = 0 if args.overwrite else len(all_jobs) - len(jobs)
 
     wpp = (
         args.workers_per_provider
@@ -400,16 +423,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     workers = max(1, len(assignments))
     if workers > 1:
-        set_print_stream(False)
+        _set_all_print_stream(False)
 
     nvidia_n = len(settings.nvidia_api_keys()) if "nvidia" in providers else 0
     labels = [slot.label for slot in assignments]
+    dialect_label = "-"
+    if settings.task_mode != "knowledge":
+        try:
+            dialect_label = ",".join(
+                spec.name for spec in get_dialect_agent().resolve(settings)
+            )
+        except RuntimeError:
+            dialect_label = "none"
     print(
         f"providers={','.join(providers)} nvidia_keys={nvidia_n} "
         f"assignments={labels} "
         f"thinking={settings.thinking_level} "
         f"cot={settings.cot_enabled}/{settings.cot_agent_enabled} "
-        f"dialects={','.join(s.name for s in get_dialect_agent().resolve(settings))} "
+        f"task_mode={settings.task_mode} "
+        f"dialects={dialect_label} "
         f"kernel_mode={settings.kernel_mode} "
         f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
         f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
@@ -444,16 +476,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_job_list(
-    jobs: list[tuple[int, str, str]] | list[tuple[int, str]],
+    jobs: list[Job] | list[tuple[int, str, str]] | list[tuple[int, str]],
     *,
     data_dir: Path,
     worker_id: int = 0,
     show_progress: bool = True,
 ) -> tuple[int, int, int]:
-    """Run the LangGraph pipeline on ``jobs`` in this process.
+    """Run the matching LangGraph pipeline on ``jobs`` in this process.
 
     Args:
-        jobs: ``(question_id, question, dialect)`` triples (dialect optional).
+        jobs: :class:`Job` records or legacy ``(id, question[, dialect])`` tuples.
         data_dir: Output directory for jsonl / logs.
         worker_id: Index used in log prefixes.
         show_progress: If True, wrap the loop in tqdm.
@@ -462,8 +494,10 @@ def run_job_list(
         ``(success, abandoned, crashed)`` counts.
     """
     init_store(data_dir)
-    app = build_graph()
-    limit = recursion_limit()
+    kernel_app = None
+    knowledge_app = None
+    kernel_limit = recursion_limit()
+    knowledge_limit = 80
     success = 0
     abandoned = 0
     failed = 0
@@ -472,28 +506,50 @@ def run_job_list(
     if show_progress:
         iterable = tqdm(jobs, desc=f"questions[{prefix}]", file=sys.stderr, unit="q")
 
-    for index, job in enumerate(iterable, start=1):
-        if len(job) == 3:
-            qid, question, dialect = job
+    for index, raw_job in enumerate(iterable, start=1):
+        job = coerce_job(raw_job)
+        qid = job.question_id
+        if job.kind == "knowledge":
+            if knowledge_app is None:
+                from cuda_sft.knowledge.graph import (
+                    build_knowledge_graph,
+                    knowledge_recursion_limit,
+                )
+
+                knowledge_app = build_knowledge_graph()
+                knowledge_limit = knowledge_recursion_limit()
+            app = knowledge_app
+            limit = knowledge_limit
+            init_state: dict[str, Any] = {
+                "question_id": qid,
+                "question": job.question,
+                "kind": "knowledge",
+                "topic": job.topic,
+                "track": job.track,
+                "status": "running",
+            }
+            label = f"kind=knowledge topic={job.topic}"
         else:
-            qid, question = job[0], job[1]
-            dialect = "cuda"
+            if kernel_app is None:
+                kernel_app = build_graph()
+            app = kernel_app
+            limit = kernel_limit
+            init_state = {
+                "question_id": qid,
+                "question": job.question,
+                "dialect": job.track,
+                "kind": "kernel",
+                "status": "running",
+            }
+            label = f"kind=kernel dialect={job.track}"
         print(
-            f"\n===== [{prefix} {index}/{len(jobs)}] question {qid} dialect={dialect} =====",
+            f"\n===== [{prefix} {index}/{len(jobs)}] question {qid} {label} =====",
             flush=True,
         )
         final = None
         for attempt in range(1, 4):
             try:
-                final = app.invoke(
-                    {
-                        "question_id": qid,
-                        "question": question,
-                        "dialect": dialect,
-                        "status": "running",
-                    },
-                    {"recursion_limit": limit},
-                )
+                final = app.invoke(init_state, {"recursion_limit": limit})
                 break
             except KeyboardInterrupt:
                 print("\ninterrupted", file=sys.stderr)
@@ -503,11 +559,11 @@ def run_job_list(
                 if attempt >= 3 or not retryable:
                     log = logger.exception if retryable else logger.error
                     log(
-                        "[%s] question %s dialect=%s crashed after %s attempts "
+                        "[%s] question %s %s crashed after %s attempts "
                         "(retryable=%s): %s",
                         prefix,
                         qid,
-                        dialect,
+                        label,
                         attempt,
                         retryable,
                         exc,
@@ -516,10 +572,10 @@ def run_job_list(
                     break
                 wait = 8 * attempt
                 logger.warning(
-                    "[%s] question %s dialect=%s crashed (attempt %s/3): %s; retrying in %ss",
+                    "[%s] question %s %s crashed (attempt %s/3): %s; retrying in %ss",
                     prefix,
                     qid,
-                    dialect,
+                    label,
                     attempt,
                     exc,
                     wait,
@@ -586,7 +642,7 @@ def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
     _apply_worker_slot(slot if provider else None)
     time.sleep(0.6 * worker_id)
     _configure_logging(log_level, data_dir / "run.log", worker_id=worker_id)
-    set_print_stream(False)
+    _set_all_print_stream(False)
     if provider:
         from cuda_sft.config import get_settings as _gs2
 
@@ -611,7 +667,7 @@ def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_multiprocess(
-    jobs: list[tuple[int, str, str]] | list[tuple[int, str]],
+    jobs: list[Job] | list[tuple[int, str, str]] | list[tuple[int, str]],
     *,
     data_dir: Path,
     workers: int,
@@ -630,7 +686,7 @@ def run_multiprocess(
     Returns:
         Aggregated ``(success, abandoned, crashed)``.
     """
-    shards: list[list[tuple[int, str]]] = [[] for _ in range(workers)]
+    shards: list[list[Any]] = [[] for _ in range(workers)]
     for i, job in enumerate(jobs):
         shards[i % workers].append(job)
     src = str(PROJECT_ROOT / "src")

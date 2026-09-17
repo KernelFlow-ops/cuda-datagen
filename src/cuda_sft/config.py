@@ -211,6 +211,18 @@ class Settings(BaseSettings):
     cot_on_empty: str = Field(default="synthetic")
     cot_on_agent_fail: str = Field(default="raw")
 
+    task_mode: str = Field(default="kernel")
+    knowledge_judge_enabled: bool = Field(default=True)
+    knowledge_min_score: float = Field(default=7.0, ge=1.0, le=10.0)
+    knowledge_factual_min: float = Field(default=6.0, ge=1.0, le=10.0)
+    knowledge_max_candidates: int = Field(default=2, ge=1)
+    knowledge_max_repairs: int = Field(default=2, ge=0)
+    knowledge_min_answer_chars: int = Field(default=400, ge=50)
+    knowledge_require_structure: bool = Field(default=True)
+    knowledge_max_output_tokens: int = Field(default=8192, ge=256)
+    knowledge_thinking_level: str = Field(default="medium")
+    knowledge_on_judge_fail: str = Field(default="retry")
+
     kernel_dialects: str = Field(default="cuda")
     kernel_mode: str = Field(default="single")
     kernel_dialect: str = Field(default="")
@@ -240,7 +252,7 @@ class Settings(BaseSettings):
         """Strip a trailing ``/v1`` so the Anthropic SDK does not double it."""
         return normalize_anthropic_base_url(value)
 
-    @field_validator("thinking_level", "cutlass_thinking_level")
+    @field_validator("thinking_level", "cutlass_thinking_level", "knowledge_thinking_level")
     @classmethod
     def _normalize_thinking(cls, value: str) -> str:
         """Lowercase thinking level (``medium``, ``high``, ``none``, ...)."""
@@ -299,6 +311,45 @@ class Settings(BaseSettings):
         name = aliases.get(name, name)
         if name not in {"single", "all"}:
             raise ValueError("KERNEL_MODE must be 'single' or 'all'")
+        return name
+
+    @field_validator("task_mode")
+    @classmethod
+    def _normalize_task_mode(cls, value: str) -> str:
+        """Map aliases to ``kernel``, ``knowledge``, or ``auto``."""
+        name = (value or "kernel").strip().lower()
+        aliases = {
+            "code": "kernel",
+            "impl": "kernel",
+            "operator": "kernel",
+            "cuda": "kernel",
+            "theory": "knowledge",
+            "explain": "knowledge",
+            "concept": "knowledge",
+            "prose": "knowledge",
+            "mixed": "auto",
+            "detect": "auto",
+        }
+        name = aliases.get(name, name)
+        if name not in {"kernel", "knowledge", "auto"}:
+            raise ValueError("TASK_MODE must be 'kernel', 'knowledge', or 'auto'")
+        return name
+
+    @field_validator("knowledge_on_judge_fail")
+    @classmethod
+    def _normalize_knowledge_judge_fail(cls, value: str) -> str:
+        """Map aliases to ``retry`` or ``abandon``."""
+        name = (value or "retry").strip().lower()
+        aliases = {
+            "again": "retry",
+            "rerun": "retry",
+            "skip": "abandon",
+            "drop": "abandon",
+            "fail": "abandon",
+        }
+        name = aliases.get(name, name)
+        if name not in {"retry", "abandon"}:
+            raise ValueError("KNOWLEDGE_ON_JUDGE_FAIL must be 'retry' or 'abandon'")
         return name
 
     @field_validator("cutlass_cxx_std")

@@ -62,6 +62,7 @@ bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 | `COT_RAW_STORE_MAX_CHARS` | `32768` | `sft.jsonl` metadata 里归档 raw thinking 的上限 |
 | `COT_ON_EMPTY` | `synthetic` | 教师 thinking 为空时：`synthetic`（由终稿代码反写）/ `empty` |
 | `COT_ON_AGENT_FAIL` | `raw` | Agent 失败回退：`raw` / `synthetic` / `empty` |
+| `TASK_MODE` | `kernel` | `kernel` 写算子（默认）；`knowledge` 原理/公式/CuTe 理论；`auto` 按行内 `task` 分流 |
 | `KERNEL_DIALECTS` | `cuda` | 逗号分隔：`cuda`,`cutlass`（CUTLASS **4.x** + CuTe，别名 `cute`）,`triton`,`tilelang` |
 | `KERNEL_MODE` | `single` | `single` 只跑一种；`all` 每题把列出的方言各生成一遍 |
 | `KERNEL_DIALECT` | 空 | `single` 时覆盖列表第一项 |
@@ -216,5 +217,32 @@ prepare → generate → extract → compile
 ```
 
 `KERNEL_MODE=all` 时在 CLI 层按方言展开 job（每题每种语言各跑一张上图），进度键是 `(id, dialect)`。CUTLASS 方言钉 **CUTLASS 4.x + CuTe**（本机 `/usr/local/cutlass-4.3.5`）。
+
+## 知识题（架构 / CuTe 理论 / 公式）
+
+写算子题走编译门闩；CUDA 底层原理、NVIDIA 架构、CuTe layout、公式推导走**独立** knowledge 流水线，不进 `DialectSpec`，也不跑 `nvcc`。默认 `TASK_MODE=kernel`，现有 `question.jsonl` 行为不变。
+
+知识题 jsonl 由你提供（本仓库不生成题目，只答题）。每行至少要有 `question`，建议带 `task` / `topic`：
+
+```bash
+python run.py --task knowledge --input /path/to/knowledge.jsonl --data-dir data/knowledge
+python run.py --task auto --input /path/to/mixed.jsonl
+```
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `TASK_MODE` / `--task` | `kernel` | `kernel` 强制整文件当代码题；`knowledge` 强制知识题；`auto` 看行内 `task` 字段，否则启发式（冲突判 kernel） |
+| `KNOWLEDGE_MIN_SCORE` | `7` | LLM Judge 加权分阈值 |
+| `KNOWLEDGE_MAX_CANDIDATES` / `KNOWLEDGE_MAX_REPAIRS` | `2` / `2` | 知识题候选与返修次数 |
+
+jsonl 可带显式字段（可选）：
+
+```json
+{"question": "Explain CUDA occupancy.", "task": "knowledge", "topic": "formula"}
+```
+
+`topic`：`architecture` `memory` `execution` `formula` `cute` `cutlass` `isa` `api` `general`。这里的 `cute` 是 **CuTe 理论讲解**，与 `KERNEL_DIALECTS=cute`（CUTLASS 4 写代码）不是同一条路径。知识题进度键是 `(id, knowledge:{topic})`，不会被方言展开。
+
+知识题判定：硬门闩（篇幅、结构、公式、不变量事实卡）+ 可选 LLM JSON Judge（factual / completeness / derivation / terminology / structure / grounding）。过线后再走独立 CoT Agent。assistant 是讲解散文，不是 `solution.cu`。
 
 LLM：`LLM_PROVIDER=openrouter` 时走 Anthropic Messages（`POST {OPENROUTER_BASE_URL}/v1/messages`）；`nvidia` 时走 OpenAI Chat Completions 流式（`{NVIDIA_BASE_URL}/chat/completions`）。生成时采集 reasoning/thinking（OpenRouter：`thinking` block / `reasoning` 字段；NVIDIA：`delta.reasoning_content`，必要时再从 `<think>` 标签兜底）。`judge` 与 `cot` 在开关关闭时 no-op。CoT Agent 只整理胜出样本的推理，不改已经通过编译的代码。高质量 CoT 建议保持 `THINKING_LEVEL=medium` 或 `high`，并让 `MAX_OUTPUT_TOKENS` 明显大于思考预算。

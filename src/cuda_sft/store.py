@@ -72,8 +72,8 @@ def load_done_ids(progress_path: Path) -> set[int]:
     return {qid for qid, _dialect in load_done_keys(progress_path)}
 
 
-def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
-    """Yield ``(1-based line id, question text)`` from ``question.jsonl``.
+def iter_question_rows(path: Path) -> Iterable[tuple[int, str, dict[str, Any]]]:
+    """Yield ``(1-based line id, question text, raw object)`` from jsonl.
 
     Args:
         path: Input jsonl with a ``question`` field per line.
@@ -84,10 +84,22 @@ def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
             if not line:
                 continue
             obj = json.loads(line)
+            if not isinstance(obj, dict):
+                continue
             question = obj.get("question")
             if not isinstance(question, str) or not question.strip():
                 continue
-            yield index, question
+            yield index, question, obj
+
+
+def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
+    """Yield ``(1-based line id, question text)`` from ``question.jsonl``.
+
+    Args:
+        path: Input jsonl with a ``question`` field per line.
+    """
+    for index, question, _raw in iter_question_rows(path):
+        yield index, question
 
 
 @dataclass
@@ -114,12 +126,16 @@ class Store:
         self.progress_path = self.data_dir / "progress.jsonl"
 
     def write_success(self, state: GraphState, *, model_name: str) -> None:
-        """Persist a compile-passing sample to archive + training jsonl files.
+        """Persist a passing sample to archive + training jsonl files.
 
         Args:
-            state: Final graph state (must include ``user_prompt`` and ``code``).
+            state: Final graph state (must include ``user_prompt`` and ``code``
+                or, for knowledge jobs, ``answer``).
             model_name: Provider model id stored in metadata.
         """
+        if str(state.get("kind") or "kernel") == "knowledge":
+            self._write_knowledge_success(state, model_name=model_name)
+            return
         settings = get_settings()
         user = state["user_prompt"]
         code = state["code"]
@@ -189,12 +205,119 @@ class Store:
             },
         )
 
+    def _write_knowledge_success(self, state: GraphState, *, model_name: str) -> None:
+        """Persist a rubric-passing knowledge sample (prose assistant)."""
+        settings = get_settings()
+        user = str(state.get("user_prompt") or state.get("question") or "")
+        answer = str(state.get("answer") or "")
+        cot = str(state.get("cot") or "")
+        if settings.cot_enabled and settings.cot_in_assistant and cot.strip():
+            assistant = wrap_cot_assistant(cot, answer)
+        else:
+            assistant = answer
+        system = str(state.get("system_prompt") or "")
+        extra_meta = dict(state.get("metadata") or {})
+        topic = str(state.get("topic") or "general")
+        track = str(state.get("track") or f"knowledge:{topic}")
+        metadata: dict[str, Any] = {
+            "task": "knowledge",
+            "topic": topic,
+            "candidate": state.get("candidate_idx", 1),
+            "repairs": state.get("repair_idx", 0),
+            "arch": state.get("cuda_arch", ""),
+            "gpu_name": state.get("gpu_name", ""),
+            "model": model_name,
+            "system": system,
+            "judge_score": state.get("judge_score", 0),
+            "dialect": track,
+            "language": "prose",
+        }
+        if extra_meta.get("knowledge_judge"):
+            metadata["knowledge_judge"] = extra_meta["knowledge_judge"]
+        if settings.cot_enabled:
+            cot_meta = extra_meta.get("cot")
+            if not isinstance(cot_meta, dict):
+                cot_meta = {}
+            metadata["cot"] = {
+                "source": state.get("cot_source") or cot_meta.get("source") or "empty",
+                "text": cot,
+                "reasoning_source": state.get("reasoning_source")
+                or cot_meta.get("reasoning_source")
+                or "",
+                "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
+                "polished_chars": len(cot),
+                "error": state.get("cot_error") or cot_meta.get("error") or "",
+            }
+            raw = str(state.get("raw_reasoning") or "")
+            limit = settings.cot_raw_store_max_chars
+            if raw:
+                if limit > 0 and len(raw) > limit:
+                    raw = raw[:limit].rstrip() + "\n...[truncated reasoning]..."
+                metadata["raw_reasoning"] = raw
+        sample = {
+            "id": state["question_id"],
+            "messages": [
+                *([{"role": "system", "content": system}] if system.strip() else []),
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": assistant},
+            ],
+            "metadata": metadata,
+        }
+        _append_jsonl(self.sft_path, sample)
+        _append_jsonl(self.swift_path, to_ms_swift(user, assistant, system=system))
+        _append_jsonl(self.openrlhf_path, to_openrlhf(user, assistant, system=system))
+        _append_jsonl(
+            self.progress_path,
+            {
+                "id": state["question_id"],
+                "dialect": track,
+                "task": "knowledge",
+                "topic": topic,
+                "status": "success",
+                "candidate": state.get("candidate_idx", 1),
+                "repairs": state.get("repair_idx", 0),
+            },
+        )
+
     def write_abandoned(self, state: GraphState) -> None:
-        """Record a question where all candidates failed to compile.
+        """Record a question where all candidates failed the quality gate.
 
         Args:
             state: Graph state after the last failed candidate.
         """
+        kind = str(state.get("kind") or "kernel")
+        if kind == "knowledge":
+            topic = str(state.get("topic") or "general")
+            dialect = str(state.get("track") or f"knowledge:{topic}")
+            reason = str(state.get("abandon_reason") or "knowledge_quality")
+            last_error = (
+                state.get("judge_error")
+                or "; ".join(state.get("judge_must_fix") or [])
+                or "; ".join(state.get("gate_reasons") or [])
+                or "; ".join(state.get("judge_issues") or [])
+            )
+            record = {
+                "id": state["question_id"],
+                "dialect": dialect,
+                "task": "knowledge",
+                "topic": topic,
+                "question": state.get("question", ""),
+                "reason": reason,
+                "last_error": last_error,
+                "attempts": state.get("attempts", []),
+            }
+            _append_jsonl(self.abandoned_path, record)
+            _append_jsonl(
+                self.progress_path,
+                {
+                    "id": state["question_id"],
+                    "dialect": dialect,
+                    "task": "knowledge",
+                    "status": "abandoned",
+                    "reason": reason,
+                },
+            )
+            return
         dialect = str(state.get("dialect") or "cuda")
         record = {
             "id": state["question_id"],
