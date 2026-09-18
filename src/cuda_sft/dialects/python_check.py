@@ -30,7 +30,19 @@ def run_python_gate(
     timeout_sec: int,
     dialect: str,
 ) -> CompileResult:
-    """Write ``filename`` and run ``python -m cuda_sft.dialects.python_gate``."""
+    """Write ``filename`` and run ``python -m cuda_sft.dialects.python_gate``.
+
+    Args:
+        kind: ``triton`` or ``tilelang``.
+        source: Full ``solution.py`` text.
+        workdir: Per-attempt directory.
+        filename: Usually ``solution.py``.
+        timeout_sec: Subprocess timeout (import/JIT can be slow).
+        dialect: Recorded on :class:`CompileResult`.
+
+    Returns:
+        Compile-only result; ``ok`` means parse+import succeeded.
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     source_path = workdir / filename
     source_path.write_text(source or "", encoding="utf-8")

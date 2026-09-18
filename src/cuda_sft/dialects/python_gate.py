@@ -20,7 +20,17 @@ def _load_module(path: Path):
 
 
 def check_triton(path: Path) -> str:
-    """Parse + import a Triton file; require at least one ``@triton.jit`` function."""
+    """Parse + import a Triton file; require at least one ``@triton.jit`` function.
+
+    Args:
+        path: ``solution.py`` written by the compile node.
+
+    Returns:
+        One-line success summary.
+
+    Raises:
+        RuntimeError: Missing package, syntax error, or no jit kernel.
+    """
     source = path.read_text(encoding="utf-8")
     ast.parse(source)
     try:
@@ -41,7 +51,14 @@ def check_triton(path: Path) -> str:
 
 
 def check_tilelang(path: Path) -> str:
-    """Parse + import a TileLang file; require a prim_func or jit kernel."""
+    """Parse + import a TileLang file; require a prim_func or jit kernel.
+
+    Args:
+        path: ``solution.py`` written by the compile node.
+
+    Raises:
+        RuntimeError: Missing package or no TileLang kernel marker.
+    """
     source = path.read_text(encoding="utf-8")
     ast.parse(source)
     try:
@@ -65,7 +82,11 @@ def check_tilelang(path: Path) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI: ``python -m cuda_sft.dialects.python_gate triton|tilelang PATH``."""
+    """CLI: ``python -m cuda_sft.dialects.python_gate triton|tilelang PATH``.
+
+    Args:
+        argv: Optional argument list; defaults to ``sys.argv[1:]``.
+    """
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 2:
         print("usage: python -m cuda_sft.dialects.python_gate triton|tilelang PATH", file=sys.stderr)

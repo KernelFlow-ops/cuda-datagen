@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from typing import NamedTuple
 
+from cuda_sft.prompts.selection import candidate_temperature, looks_chinese
 from cuda_sft.tasks.kinds import KNOWN_TOPICS
-
-_CJK_RE = re.compile(r"[\u3400-\u9fff]")
-
-CANDIDATE_TEMPERATURES = (0.2, 0.5, 0.8)
 
 SYSTEM_PROMPTS: tuple[str, ...] = (
     (
@@ -34,21 +30,21 @@ SYSTEM_PROMPTS: tuple[str, ...] = (
 USER_SUFFIXES: tuple[str, ...] = (
     """## 答题要求（知识题，不是写算子）
 
-目标硬件上下文（答题时作为前提写明，不是编译目标）：{gpu_name}，架构 {cuda_arch}，CUDA {cuda_version}。
+本机 GPU {gpu_name} / `{cuda_arch}` / CUDA {cuda_version} 只是示例机，不是普遍前提。题面未指定架构时，写明代际依赖，不要把本机 SM 数字当成不变量。
 主题 topic={topic}。
 
 1. 先给简短结论，再讲机制 / 推导，最后写适用边界（哪些架构/版本不成立）。
 2. 公式写出符号定义、假设、步骤、最终式。
-3. 不要假装代码已经 `nvcc` 通过。不要输出完整 `solution.cu`。
+3. 不要假装代码已经 `nvcc` 通过。不要输出完整 `solution.cu`。完整 kernel+host 是失败答案。
 4. 用 Markdown 小标题组织。匹配题面语言（中文题用中文）。""",
     """## Requirements (knowledge answer, not a kernel)
 
-Ground the answer in this context: {gpu_name}, arch `{cuda_arch}`, CUDA {cuda_version}.
+Detected GPU {gpu_name} / `{cuda_arch}` / CUDA {cuda_version} is an example machine, not a universal premise. If the question is architecture-general, mark which facts are SM-specific.
 Topic: {topic}.
 
 - Lead with the conclusion, then the mechanism or derivation, then caveats.
 - Define symbols before formulas. State when a fact is architecture-specific.
-- Do not ship a compilable `solution.cu`. Pseudocode ≤ 15 lines is OK.
+- Do not ship a compilable `solution.cu`. A full kernel+host dump is a failed knowledge answer. Pseudocode ≤ 15 lines is OK.
 - Match the problem language. Use Markdown headings.""",
 )
 
@@ -106,8 +102,19 @@ If the answer invents compile success, dump a full kernel, or contradicts warp=3
 on NVIDIA CUDA, put that in must_fix.
 """
 
+JUDGE_SYSTEM_FACTUAL = """You are a CUDA/NVIDIA factual grader. Score only hardware/API/CuTe truth.
+Return ONE JSON object: dimensions.factual, terminology, grounding (1-10 each),
+must_fix, issues. Ignore fluency. JSON only."""
+
+JUDGE_SYSTEM_QUALITY = """You are a CUDA/NVIDIA writing grader. Score only completeness, derivation,
+and structure (1-10 each). Do not re-check hardware constants. Return ONE JSON
+object with those dimension keys plus must_fix and issues. JSON only."""
+
 JUDGE_USER = """## Topic
 {topic}
+
+## Machine context (example, not a universal premise)
+{gpu_name} / {cuda_arch} / CUDA {cuda_version}
 
 ## Question
 {question}
@@ -229,6 +236,79 @@ COT_SKELETONS: dict[str, str] = {
 
 DEFAULT_SKELETON = COT_SKELETONS["general"]
 
+COT_SKELETONS_EN: dict[str, str] = {
+    "formula": (
+        "1. Quantity asked\n"
+        "2. Symbols and assumptions (arch / units)\n"
+        "3. Derivation steps\n"
+        "4. Final formula and checks\n"
+        "5. Common pitfalls"
+    ),
+    "architecture": (
+        "1. Hardware level to explain\n"
+        "2. Parts and how they relate\n"
+        "3. Mapping onto the CUDA programming model\n"
+        "4. Generational caveats\n"
+        "5. Common pitfalls"
+    ),
+    "memory": (
+        "1. Data path\n"
+        "2. Hardware constraints (coalescing / banks / cache)\n"
+        "3. Software countermeasures\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "execution": (
+        "1. Definition (occupancy vs utilization)\n"
+        "2. Limiting resource\n"
+        "3. Latency hiding\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "cute": (
+        "1. CuTe concept asked\n"
+        "2. Layout algebra (shape/stride/tiler)\n"
+        "3. Relation to kernel tiling\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "cutlass": (
+        "1. CUTLASS role asked\n"
+        "2. Dataflow / pipeline\n"
+        "3. Relation to the CUDA model\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "isa": (
+        "1. ISA layer (PTX vs SASS)\n"
+        "2. Instructions or state spaces\n"
+        "3. Constraints\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "api": (
+        "1. API layer\n"
+        "2. Calling convention and lifetimes\n"
+        "3. Errors / stream semantics\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+    "worked_example": (
+        "1. Givens\n"
+        "2. Numeric or layout steps\n"
+        "3. Result\n"
+        "4. Why this works\n"
+        "5. Common pitfalls"
+    ),
+    "general": (
+        "1. Question restatement\n"
+        "2. Core mechanism\n"
+        "3. Key constraints\n"
+        "4. Domain of validity\n"
+        "5. Common pitfalls"
+    ),
+}
+
 
 class SelectedPrompts(NamedTuple):
     """System + user prompts for one knowledge candidate."""
@@ -239,24 +319,17 @@ class SelectedPrompts(NamedTuple):
     suffix_index: int
 
 
-def candidate_temperature(candidate_idx: int) -> float:
-    """Temperature for candidate 1/2/3 (0.2 / 0.5 / 0.8)."""
-    if candidate_idx <= 1:
-        return CANDIDATE_TEMPERATURES[0]
-    if candidate_idx >= len(CANDIDATE_TEMPERATURES):
-        return CANDIDATE_TEMPERATURES[-1]
-    return CANDIDATE_TEMPERATURES[candidate_idx - 1]
+def cot_skeleton(topic: str, question: str = "") -> str:
+    """Heading outline for the knowledge CoT editor.
 
-
-def cot_skeleton(topic: str) -> str:
-    """Heading outline for the knowledge CoT editor."""
+    Args:
+        topic: Knowledge topic id.
+        question: Raw problem; CJK selects Chinese headings, else English.
+    """
     name = (topic or "general").strip().lower()
-    return COT_SKELETONS.get(name, DEFAULT_SKELETON)
-
-
-def _looks_chinese(text: str) -> bool:
-    """True when the question is primarily Chinese (CJK ideographs present)."""
-    return bool(_CJK_RE.search(text or ""))
+    if looks_chinese(question):
+        return COT_SKELETONS.get(name, DEFAULT_SKELETON)
+    return COT_SKELETONS_EN.get(name, COT_SKELETONS_EN["general"])
 
 
 def _pick_index(question_id: int, candidate_idx: int, stride: int, n: int) -> int:
@@ -279,16 +352,16 @@ def select_prompts(
 
     System/user language follows the question (CJK → Chinese prompts).
     """
-    chinese = _looks_chinese(question)
+    chinese = looks_chinese(question)
     systems = [
         (i, text)
         for i, text in enumerate(SYSTEM_PROMPTS)
-        if _looks_chinese(text) == chinese
+        if looks_chinese(text) == chinese
     ] or list(enumerate(SYSTEM_PROMPTS))
     suffixes = [
         (i, text)
         for i, text in enumerate(USER_SUFFIXES)
-        if _looks_chinese(text) == chinese
+        if looks_chinese(text) == chinese
     ] or list(enumerate(USER_SUFFIXES))
     sys_index, system = systems[_pick_index(question_id, candidate_idx, 1, len(systems))]
     suf_index, suffix_tmpl = suffixes[_pick_index(question_id, candidate_idx, 3, len(suffixes))]
@@ -334,10 +407,21 @@ def build_repair_prompt(
     ).strip()
 
 
-def build_judge_user(*, question: str, answer: str, topic: str) -> str:
+def build_judge_user(
+    *,
+    question: str,
+    answer: str,
+    topic: str,
+    gpu_name: str = "",
+    cuda_arch: str = "",
+    cuda_version: str = "",
+) -> str:
     """User message for the JSON grader."""
     return JUDGE_USER.format(
         topic=topic or "general",
+        gpu_name=gpu_name or "NVIDIA GPU",
+        cuda_arch=cuda_arch or "sm_86",
+        cuda_version=cuda_version or "unknown",
         question=(question or "").strip() or "(empty)",
         answer=(answer or "").strip() or "(empty)",
     )
@@ -358,7 +442,7 @@ def build_cot_user(
     return COT_USER.format(
         question=(question or "").strip() or "(empty problem)",
         topic=topic or "general",
-        skeleton=cot_skeleton(topic),
+        skeleton=cot_skeleton(topic, question),
         answer=(answer or "").strip() or "(empty)",
         raw_reasoning=(raw_reasoning or "").strip() or "(none)",
         repair_idx=int(repair_idx or 0),

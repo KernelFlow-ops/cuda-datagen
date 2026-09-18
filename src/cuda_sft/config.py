@@ -210,6 +210,11 @@ class Settings(BaseSettings):
     cot_raw_store_max_chars: int = Field(default=32768, ge=0)
     cot_on_empty: str = Field(default="synthetic")
     cot_on_agent_fail: str = Field(default="raw")
+    sft_user_is_raw_question: bool = Field(default=True)
+    kernel_llm_critic: str = Field(default="adaptive")
+    kernel_critic_blocks_save: bool = Field(default=False)
+    knowledge_judge_mode: str = Field(default="capped")
+    difficulty_aware: bool = Field(default=True)
 
     task_mode: str = Field(default="kernel")
     knowledge_judge_enabled: bool = Field(default=True)

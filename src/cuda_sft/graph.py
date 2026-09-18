@@ -1,4 +1,10 @@
-"""LangGraph: generate → extract → compile → repair / judge → cot / save."""
+"""LangGraph: generate → extract → compile → repair / judge → cot / save.
+
+Nodes are thin wrappers around dialect specs and ``cuda_sft.agents``.
+Print-stream and RetryPolicy live in ``pipeline.common`` so the knowledge
+graph does not keep a second copy. Compile must not import the async LLM
+pool; it calls :func:`enqueue_speculative_repair` instead.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +13,29 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from cuda_sft.agents.generate import (
+    assistant_state_update,
+    cancel_speculative,
+    complete_chat,
+    enqueue_speculative_repair,
+)
+from cuda_sft.agents.critic import KernelCritic
+from cuda_sft.agents.difficulty import plan_topology
+from cuda_sft.agents.repairer import (
+    classify_compile_error,
+    repair_system_prompt,
+    wrap_repair_user,
+)
+from cuda_sft.judge import JudgeResult
 from cuda_sft.compile import attempt_workdir, finalize_question_work
 from cuda_sft.config import get_settings
 from cuda_sft.cot import CotAgent
 from cuda_sft.dialects.agent import get_dialect_agent, get_spec
-
-from cuda_sft.llm import LLMCompletion, get_llm_client, is_retryable_llm_error
-from cuda_sft.llm_async import get_async_pool
+from cuda_sft.pipeline.common import (
+    graph_recursion_limit,
+    retry_policy,
+    set_print_stream,
+)
 from cuda_sft.prompt import (
     SYSTEM_PROMPT,
     candidate_temperature,
@@ -25,7 +47,8 @@ from cuda_sft.store import get_store
 
 logger = logging.getLogger(__name__)
 
-PRINT_STREAM = True
+# Re-export so ``from cuda_sft.graph import set_print_stream`` keeps working.
+__all__ = ["build_graph", "recursion_limit", "set_print_stream"]
 
 
 def _dialect_name(state: GraphState) -> str:
@@ -36,29 +59,6 @@ def _dialect_name(state: GraphState) -> str:
 def _spec(state: GraphState):
     """Kernel dialect spec for this state."""
     return get_spec(_dialect_name(state))
-
-
-def set_print_stream(enabled: bool) -> None:
-    """Enable or disable printing streamed model tokens to stdout.
-
-    Args:
-        enabled: False under ``--quiet`` or when ``workers > 1``.
-    """
-    global PRINT_STREAM
-    PRINT_STREAM = enabled
-
-
-def _retry_policy():
-    """RetryPolicy for transient LLM failures on the generate node."""
-    from langgraph.types import RetryPolicy
-
-    return RetryPolicy(
-        max_attempts=5,
-        initial_interval=4.0,
-        backoff_factor=2.0,
-        max_interval=60.0,
-        retry_on=is_retryable_llm_error,
-    )
 
 
 def prepare(state: GraphState) -> dict[str, Any]:
@@ -84,6 +84,7 @@ def prepare(state: GraphState) -> dict[str, Any]:
         cuda_arch=cuda_arch,
         cuda_version=cuda_version,
     )
+    topo = plan_topology(question=state["question"], kind="kernel", settings=settings)
     return {
         "dialect": spec.name,
         "system_prompt": selected.system,
@@ -114,6 +115,13 @@ def prepare(state: GraphState) -> dict[str, Any]:
         "cot": "",
         "cot_source": "empty",
         "cot_error": "",
+        "difficulty": topo.difficulty,
+        "candidate_cap": topo.max_candidates,
+        "use_critic": topo.use_critic,
+        "critic_pass": True,
+        "critic_skipped": True,
+        "critic_must_fix": [],
+        "critic_issues": [],
     }
 
 
@@ -132,66 +140,50 @@ def generate(state: GraphState) -> dict[str, Any]:
     temperature = float(state.get("temperature") or candidate_temperature(cand))
     dialect = _dialect_name(state)
     header = f"[Q{qid} {dialect} candidate={cand} repair={repair} temp={temperature}]"
-
     settings = get_settings()
-    client = get_llm_client()
-
-    # Check if we have a speculative response ready
     request_id = f"q{qid}_{dialect}_c{cand}_r{repair}"
-    completion: LLMCompletion | None = None
-
-    if settings.async_llm_enabled:
-        pool = get_async_pool(settings.async_llm_max_workers)
-        if pool.is_pending(request_id):
-            completion = pool.try_get(request_id, timeout_sec=settings.llm_timeout_sec)
-            if completion is not None:
-                logger.info("%s using speculative LLM response (saved ~10-30s)", header)
-                print(f"\n{header} using cached response...", flush=True)
-
-    if completion is None:
-        logger.info("%s calling model", header)
-        print(f"\n{header} generating...", flush=True)
-        stream_completion = getattr(client, "stream_completion", None)
-        if callable(stream_completion):
-            completion = stream_completion(
-                messages=state["messages"],
-                system=state.get("system_prompt") or SYSTEM_PROMPT,
-                temperature=temperature,
-                print_stream=PRINT_STREAM,
-                **get_dialect_agent().llm_call_options(dialect, settings),
-            )
-        else:
-            text = client.stream_text(
-                messages=state["messages"],
-                system=state.get("system_prompt") or SYSTEM_PROMPT,
-                temperature=temperature,
-                print_stream=PRINT_STREAM,
-            )
-            completion = LLMCompletion(
-                text=text, reasoning="", reasoning_source="empty"
-            )
-
-    text = completion.text
-    reasoning = completion.reasoning if settings.cot_enabled else ""
-    reasoning_source = (
-        completion.reasoning_source if settings.cot_enabled else "empty"
+    result = complete_chat(
+        messages=list(state.get("messages") or []),
+        system=state.get("system_prompt") or SYSTEM_PROMPT,
+        temperature=temperature,
+        request_id=request_id if settings.async_llm_enabled else None,
+        llm_options=get_dialect_agent().llm_call_options(dialect, settings),
+        log_header=header,
     )
-    if reasoning:
-        logger.info(
-            "%s captured reasoning (%s chars, source=%s)",
-            header,
-            len(reasoning),
-            reasoning_source,
-        )
-    assistant_content = text if text.strip() else "(empty response)"
-    messages = list(state.get("messages") or [])
-    messages.append({"role": "assistant", "content": assistant_content})
-    return {
-        "raw_response": text,
-        "messages": messages,
-        "raw_reasoning": reasoning,
-        "reasoning_source": reasoning_source,
-    }
+    return assistant_state_update(state, result, log_header=header)
+
+
+def _repair_turn(
+    state: GraphState,
+    *,
+    next_repair: int,
+    prompt_error: str,
+    code: str,
+) -> tuple[str, str]:
+    """Build the repair user message and Repairer system prompt.
+
+    Used by both the compile prefetch and the repair node so the speculative
+    cache key matches the live generate call.
+    """
+    spec = _spec(state)
+    error_class = classify_compile_error(
+        prompt_error, dialect=spec.name, code=code
+    )
+    inner = spec.build_repair(
+        cuda_arch=state.get("cuda_arch") or get_settings().resolved_cuda_arch,
+        compile_error=prompt_error,
+        previous_code=code,
+        question_id=int(state["question_id"]),
+        candidate_idx=int(state.get("candidate_idx") or 1),
+        repair_idx=next_repair,
+    )
+    user = wrap_repair_user(
+        question=str(state.get("question") or ""),
+        inner=inner,
+        error_class=error_class,
+        dialect=spec.name,
+    )
+    return user, repair_system_prompt(spec.name)
 
 
 def extract(state: GraphState) -> dict[str, Any]:
@@ -273,7 +265,7 @@ def compile_node(state: GraphState) -> dict[str, Any]:
     if not result.ok:
         logger.info("compile error:\n%s", truncate_compile_error(error, 2000))
 
-    # Async LLM: If compile failed and repairs remain, speculatively start next repair
+    # Next repair is prefetched here so generate can reuse it; the pool lives in agents.generate.
     speculative_requests = list(state.get("speculative_requests") or [])
     if not result.ok and settings.async_llm_enabled:
         next_repair = int(state.get("repair_idx") or 0) + 1
@@ -281,36 +273,22 @@ def compile_node(state: GraphState) -> dict[str, Any]:
             qid = state["question_id"]
             cand = state.get("candidate_idx", 1)
             request_id = f"q{qid}_{spec.name}_c{cand}_r{next_repair}"
-
-            repair_prompt = spec.build_repair(
-                cuda_arch=state.get("cuda_arch") or settings.resolved_cuda_arch,
-                compile_error=prompt_error,
-                previous_code=code,
-                question_id=int(qid),
-                candidate_idx=int(cand),
-                repair_idx=next_repair,
+            repair_prompt, repair_system = _repair_turn(
+                state,
+                next_repair=next_repair,
+                prompt_error=prompt_error,
+                code=code,
             )
-
-            # Prepare messages for next repair
             future_messages = list(state.get("messages") or [])
             future_messages.append({"role": "user", "content": repair_prompt})
-
-            # Start async LLM call (must not fail the compile node)
-            try:
-                pool = get_async_pool(settings.async_llm_max_workers)
-                client = get_llm_client()
-                pool.enqueue(
-                    request_id=request_id,
-                    llm_client=client,
-                    messages=future_messages,
-                    system=state.get("system_prompt") or SYSTEM_PROMPT,
-                    temperature=float(state.get("temperature") or candidate_temperature(cand)),
-                    **get_dialect_agent().llm_call_options(spec.name, settings),
-                )
+            if enqueue_speculative_repair(
+                request_id=request_id,
+                messages=future_messages,
+                system=repair_system,
+                temperature=float(state.get("temperature") or candidate_temperature(cand)),
+                llm_options=get_dialect_agent().llm_call_options(spec.name, settings),
+            ):
                 speculative_requests.append(request_id)
-                logger.info("Started speculative repair request: %s", request_id)
-            except Exception:
-                logger.exception("Failed to enqueue speculative repair request: %s", request_id)
 
     return {
         "compile_ok": result.ok,
@@ -331,7 +309,8 @@ def repair(state: GraphState) -> dict[str, Any]:
         Updated state. If another candidate already won, returns minimal update
         with skip_repair=True to signal early termination.
     """
-    # Early winner detection (方案 C): skip if another candidate succeeded
+    # Reserved for a future parallel-candidate graph. The sequential graph never
+    # runs two candidates at once, so this branch does not fire today.
     if state.get("winner_found") and state.get("winner_candidate") != state.get("candidate_idx"):
         logger.info(
             "Q%s skipping candidate %s repair (candidate %s already won)",
@@ -344,16 +323,20 @@ def repair(state: GraphState) -> dict[str, Any]:
     settings = get_settings()
     spec = _spec(state)
     next_repair = int(state.get("repair_idx") or 0) + 1
-    repair_user = spec.build_repair(
-        cuda_arch=state.get("cuda_arch") or settings.resolved_cuda_arch,
-        compile_error=format_nvcc_for_prompt(
+    if state.get("critic_must_fix") and state.get("compile_ok"):
+        prompt_error = "semantic critic must_fix:\n- " + "\n- ".join(
+            str(item) for item in state.get("critic_must_fix") or []
+        )
+    else:
+        prompt_error = format_nvcc_for_prompt(
             state.get("compile_error") or "",
             settings.repair_error_max_chars,
-        ),
-        previous_code=state.get("code") or "",
-        question_id=int(state["question_id"]),
-        candidate_idx=int(state.get("candidate_idx") or 1),
-        repair_idx=next_repair,
+        )
+    repair_user, repair_system = _repair_turn(
+        state,
+        next_repair=next_repair,
+        prompt_error=prompt_error,
+        code=state.get("code") or "",
     )
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": repair_user})
@@ -367,6 +350,7 @@ def repair(state: GraphState) -> dict[str, Any]:
     return {
         "repair_idx": next_repair,
         "messages": messages,
+        "system_prompt": repair_system,
         "raw_response": "",
         "compile_ok": False,
         "skip_repair": False,
@@ -460,14 +444,8 @@ def judge(state: GraphState) -> dict[str, Any]:
     """
     settings = get_settings()
 
-    # Cancel any pending speculative requests since we have a winner
     if settings.async_llm_enabled:
-        speculative_requests = state.get("speculative_requests") or []
-        if speculative_requests:
-            pool = get_async_pool(settings.async_llm_max_workers)
-            for request_id in speculative_requests:
-                pool.cancel(request_id)
-            logger.info("Cancelled %d speculative requests (winner found)", len(speculative_requests))
+        cancel_speculative(list(state.get("speculative_requests") or []))
 
     if not settings.judge_enabled:
         return {
@@ -516,6 +494,46 @@ def judge(state: GraphState) -> dict[str, Any]:
         "winner_found": True,
         "winner_candidate": int(state.get("candidate_idx") or 1),
         "code": code_out,
+    }
+
+
+def critic(state: GraphState) -> dict[str, Any]:
+    """Optional semantic critic after a compile-passing heuristic judge.
+
+    Does not abandon by default. ``must_fix`` with remaining repairs routes
+    back to the Repairer; otherwise the sample still proceeds to CoT.
+    """
+    settings = get_settings()
+    heuristic = JudgeResult(
+        quality_score=int(state.get("judge_score") or 0),
+        issues=list(state.get("judge_issues") or []),
+        suggestions=list(state.get("judge_suggestions") or []),
+    )
+    result = KernelCritic(settings).evaluate(
+        question=str(state.get("question") or ""),
+        code=str(state.get("code") or ""),
+        dialect=_dialect_name(state),
+        heuristic=heuristic,
+        use_critic=bool(state.get("use_critic", True)),
+    )
+    metadata = dict(state.get("metadata") or {})
+    metadata["critic"] = {
+        "passed": result.passed,
+        "skipped": result.skipped,
+        "must_fix": result.must_fix,
+        "issues": result.issues,
+    }
+    print(
+        f"[Q{state['question_id']}] critic: pass={result.passed} "
+        f"skipped={result.skipped} must_fix={len(result.must_fix)}",
+        flush=True,
+    )
+    return {
+        "critic_pass": result.passed,
+        "critic_skipped": result.skipped,
+        "critic_must_fix": result.must_fix,
+        "critic_issues": result.issues,
+        "metadata": metadata,
     }
 
 
@@ -589,13 +607,28 @@ def route_after_compile(
 ) -> Literal["judge", "repair", "next_candidate", "save_abandoned"]:
     """Route after compile: judge (if ok), repair, next candidate, or abandon."""
     settings = get_settings()
+    cap = int(state.get("candidate_cap") or settings.max_candidates)
     if state.get("compile_ok"):
         return "judge"
     if int(state.get("repair_idx") or 0) < settings.max_repairs:
         return "repair"
-    if int(state.get("candidate_idx") or 1) < settings.max_candidates:
+    if int(state.get("candidate_idx") or 1) < cap:
         return "next_candidate"
     return "save_abandoned"
+
+
+def route_after_critic(state: GraphState) -> Literal["cot", "repair"]:
+    """Send compile-passing code back to repair only when critic must_fix remains."""
+    settings = get_settings()
+    if state.get("critic_pass", True):
+        return "cot"
+    if not (state.get("critic_must_fix") or []):
+        return "cot"
+    if int(state.get("repair_idx") or 0) < settings.max_repairs:
+        return "repair"
+    if settings.kernel_critic_blocks_save:
+        return "cot"
+    return "cot"
 
 
 def route_after_repair(state: GraphState) -> Literal["generate", "next_candidate"]:
@@ -609,12 +642,13 @@ def build_graph():
     """Compile the per-question StateGraph."""
     builder = StateGraph(GraphState)
     builder.add_node("prepare", prepare)
-    builder.add_node("generate", generate, retry_policy=_retry_policy())
+    builder.add_node("generate", generate, retry_policy=retry_policy())
     builder.add_node("extract", extract)
     builder.add_node("compile", compile_node)
     builder.add_node("repair", repair)
     builder.add_node("next_candidate", next_candidate)
     builder.add_node("judge", judge)
+    builder.add_node("critic", critic)
     builder.add_node("cot", cot)
     builder.add_node("save_success", save_success)
     builder.add_node("save_abandoned", save_abandoned)
@@ -642,7 +676,15 @@ def build_graph():
         },
     )
     builder.add_edge("next_candidate", "generate")
-    builder.add_edge("judge", "cot")
+    builder.add_edge("judge", "critic")
+    builder.add_conditional_edges(
+        "critic",
+        route_after_critic,
+        {
+            "cot": "cot",
+            "repair": "repair",
+        },
+    )
     builder.add_edge("cot", "save_success")
     builder.add_edge("save_success", END)
     builder.add_edge("save_abandoned", END)
@@ -652,6 +694,8 @@ def build_graph():
 def recursion_limit() -> int:
     """LangGraph superstep cap covering 3 candidates x (1 gen + 3 repairs)."""
     settings = get_settings()
-    # prepare + per attempt (generate/extract/compile) + repair/next + judge + cot + save
-    per_candidate = (settings.max_repairs + 1) * 3 + settings.max_repairs + 5
-    return max(80, 10 + settings.max_candidates * per_candidate)
+    return graph_recursion_limit(
+        max_candidates=settings.max_candidates,
+        max_repairs=settings.max_repairs,
+        extra_per_candidate=6,
+    )

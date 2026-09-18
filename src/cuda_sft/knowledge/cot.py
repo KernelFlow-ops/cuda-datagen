@@ -11,6 +11,7 @@ from cuda_sft.knowledge.parse import (
     clean_raw_reasoning,
     sanitize_knowledge_cot,
 )
+from cuda_sft.parse import has_numbered_headings
 from cuda_sft.knowledge.prompt import COT_SYSTEM, build_cot_user
 from cuda_sft.knowledge.state import KnowledgeGraphState
 from cuda_sft.llm import LLMClient, LLMError, get_llm_client, is_retryable_llm_error
@@ -31,6 +32,12 @@ class KnowledgeCotResult:
 
 
 def _clip(text: str, max_chars: int) -> str:
+    """Hard-truncate ``text`` when ``max_chars`` is positive.
+
+    Args:
+        text: CoT body.
+        max_chars: ``<=0`` disables truncation.
+    """
     if max_chars > 0 and len(text) > max_chars:
         return text[:max_chars].rstrip()
     return text
@@ -75,11 +82,19 @@ class KnowledgeCotAgent:
             )
 
         cleaned = sanitize_knowledge_cot(polished, settings.cot_max_chars)
-        if len(cleaned) < MIN_COT_CHARS:
+        if len(cleaned) < MIN_COT_CHARS or not has_numbered_headings(cleaned, 5):
+            try:
+                polished = self._run_agent(state, raw_reasoning=raw)
+                retry = sanitize_knowledge_cot(polished, settings.cot_max_chars)
+            except Exception as exc:
+                logger.warning("knowledge CoT heading retry failed: %s", exc)
+                retry = ""
+            if len(retry) >= MIN_COT_CHARS and has_numbered_headings(retry, 5):
+                return KnowledgeCotResult(cot=retry, source="agent", raw_reasoning=raw)
             return self._fallback(
                 state,
                 raw,
-                error="agent output too short",
+                error="agent output too short or missing numbered headings",
                 mode=settings.cot_on_agent_fail,
             )
         return KnowledgeCotResult(cot=cleaned, source="agent", raw_reasoning=raw)
@@ -156,8 +171,9 @@ class KnowledgeCotAgent:
                 if callable(stream_completion):
                     completion = stream_completion(
                         **base,
+                        thinking_level="none",
                         max_output_tokens=min(
-                            settings.cot_max_chars,
+                            max(256, settings.cot_max_chars),
                             settings.knowledge_max_output_tokens,
                         ),
                     )

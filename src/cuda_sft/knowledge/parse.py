@@ -12,11 +12,16 @@ from cuda_sft.parse import (
     strip_thinking,
 )
 
-MIN_COT_CHARS = 40
+MIN_COT_CHARS = 120
 
 
 def clean_raw_reasoning(text: str, max_chars: int) -> str:
-    """Normalize teacher thinking before storing or sending to the CoT editor."""
+    """Normalize teacher thinking before storing or sending to the CoT editor.
+
+    Args:
+        text: Raw API reasoning, possibly tagged.
+        max_chars: Truncate to this many characters; ``<=0`` disables.
+    """
     raw = text or ""
     tagged = extract_thinking(raw)
     body = tagged if tagged.strip() else raw
@@ -37,13 +42,21 @@ STEP_RE = re.compile(
 
 
 def extract_answer(text: str) -> str:
-    """Visible assistant text with think tags removed. Keeps formulas and fences."""
+    """Visible assistant text with think tags removed. Keeps formulas and fences.
+
+    Args:
+        text: Raw model reply.
+    """
     visible, _thinking = split_visible_and_thinking(text or "")
     return collapse_blank_lines(visible)
 
 
 def fence_char_ratio(text: str) -> float:
-    """Fraction of characters that live inside markdown fences."""
+    """Fraction of characters that live inside markdown fences.
+
+    Args:
+        text: Knowledge answer; high ratios fail the hard gate on theory topics.
+    """
     raw = text or ""
     if not raw:
         return 0.0

@@ -51,4 +51,11 @@ class GraphState(TypedDict, total=False):
     cot: str
     cot_source: str
     cot_error: str
+    difficulty: str
+    candidate_cap: int
+    use_critic: bool
+    critic_pass: bool
+    critic_skipped: bool
+    critic_must_fix: list[str]
+    critic_issues: list[str]
 

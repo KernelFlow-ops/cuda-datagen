@@ -10,14 +10,21 @@ from cuda_sft.llm import LLMClient, LLMError, get_llm_client, is_retryable_llm_e
 from cuda_sft.parse import (
     collapse_blank_lines,
     extract_thinking,
+    has_numbered_headings,
     strip_code_from_cot,
 )
-from cuda_sft.prompt import COT_SYSTEM_PROMPT, build_cot_user_prompt
+from cuda_sft.prompt import (
+    COT_SKELETON_PY_ZH,
+    COT_SKELETON_ZH,
+    build_cot_user_prompt,
+    cot_system_for,
+)
+from cuda_sft.prompts.selection import looks_chinese
 from cuda_sft.state import GraphState
 
 logger = logging.getLogger(__name__)
 
-MIN_COT_CHARS = 40
+MIN_COT_CHARS = 120
 AGENT_ATTEMPTS = 3
 
 
@@ -127,11 +134,19 @@ class CotAgent:
             )
 
         cleaned = sanitize_cot_output(polished, settings.cot_max_chars)
-        if len(cleaned) < MIN_COT_CHARS:
+        if len(cleaned) < MIN_COT_CHARS or not has_numbered_headings(cleaned, 6):
+            try:
+                polished = self._run_agent(state, raw_reasoning=raw)
+                retry = sanitize_cot_output(polished, settings.cot_max_chars)
+            except Exception as exc:
+                logger.warning("CoT heading retry failed: %s", exc)
+                retry = ""
+            if len(retry) >= MIN_COT_CHARS and has_numbered_headings(retry, 6):
+                return CotResult(cot=retry, source="agent", raw_reasoning=raw)
             return self._fallback(
                 state,
                 raw,
-                error="agent output too short or code-only",
+                error="agent output too short, code-only, or missing numbered headings",
                 mode=settings.cot_on_agent_fail,
             )
         return CotResult(cot=cleaned, source="agent", raw_reasoning=raw)
@@ -187,6 +202,8 @@ class CotAgent:
             skeleton = get_spec(dialect).cot_skeleton()
         except Exception:
             skeleton = ""
+        if looks_chinese(str(state.get("question") or "")):
+            skeleton = COT_SKELETON_PY_ZH if language == "python" else COT_SKELETON_ZH
         user = build_cot_user_prompt(
             question=str(state.get("question") or ""),
             code=str(state.get("code") or ""),
@@ -209,14 +226,15 @@ class CotAgent:
                 if callable(stream_completion):
                     completion = stream_completion(
                         messages=[{"role": "user", "content": user}],
-                        system=COT_SYSTEM_PROMPT,
+                        system=cot_system_for(dialect=dialect),
                         temperature=float(settings.cot_temperature),
                         print_stream=False,
+                        thinking_level="none",
                     )
                     return completion.text or ""
                 return client.stream_text(
                     messages=[{"role": "user", "content": user}],
-                    system=COT_SYSTEM_PROMPT,
+                    system=cot_system_for(dialect=dialect),
                     temperature=float(settings.cot_temperature),
                     print_stream=False,
                 )

@@ -9,11 +9,8 @@ from cuda_sft.compile import CompileResult, compile_cuda_source
 from cuda_sft.config import Settings
 from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source, looks_like_cuda
-from cuda_sft.prompt import (
-    SelectedPrompts,
-    _stable_index,
-    format_nvcc_for_prompt,
-)
+from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
+from cuda_sft.prompts.selection import language_matched_index, stable_index
 
 CUTLASS_MAJOR_RE = re.compile(r"#define\s+CUTLASS_MAJOR\s+(\d+)")
 
@@ -117,14 +114,22 @@ COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry, success
 
 
 def looks_like_cutlass(source: str) -> bool:
-    """True if source looks like CUDA or CUTLASS/CuTe C++."""
+    """True if source looks like CUDA or CUTLASS/CuTe C++.
+
+    Args:
+        source: Extracted translation unit.
+    """
     if looks_like_cuda(source):
         return True
     return any(tok in source for tok in ("cute::", "cutlass::", "make_tensor", "make_layout"))
 
 
 def read_cutlass_major(home: Path) -> int | None:
-    """Parse ``CUTLASS_MAJOR`` from ``include/cutlass/version.h``."""
+    """Parse ``CUTLASS_MAJOR`` from ``include/cutlass/version.h``.
+
+    Args:
+        home: CUTLASS root. ``available()`` requires major == 4.
+    """
     header = home / "include" / "cutlass" / "version.h"
     if not header.is_file():
         return None
@@ -188,7 +193,12 @@ def cutlass_include_dirs(settings: Settings) -> list[str]:
 
 
 class CutlassDialect:
-    """CUTLASS 4.x + CuTe C++ compiled with nvcc -c."""
+    """CUTLASS 4.x + CuTe C++ compiled with ``nvcc -c``.
+
+    Implements :class:`~cuda_sft.dialects.base.DialectSpec`. Hopper-only
+    APIs are rejected by the heuristic judge; ``available()`` requires
+    ``CUTLASS_MAJOR==4`` and a CuTe include tree.
+    """
 
     name = "cutlass"
     language = "cuda-cpp"
@@ -228,8 +238,12 @@ class CutlassDialect:
         cuda_arch: str,
         cuda_version: str,
     ) -> SelectedPrompts:
-        sys_i = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
-        suf_i = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+        sys_i = language_matched_index(
+            SYSTEM_PROMPTS, question, question_id, candidate_idx, salt=0
+        )
+        suf_i = language_matched_index(
+            USER_SUFFIXES, question, question_id, candidate_idx, salt=7
+        )
         suffix = USER_SUFFIXES[suf_i].format(
             gpu_name=gpu_name, cuda_arch=cuda_arch, cuda_version=cuda_version
         ).strip()
@@ -251,7 +265,7 @@ class CutlassDialect:
         candidate_idx: int,
         repair_idx: int,
     ) -> str:
-        idx = _stable_index(
+        idx = stable_index(
             len(REPAIR_PROMPTS), question_id, candidate_idx, salt=13 + int(repair_idx)
         )
         return REPAIR_PROMPTS[idx].format(

@@ -105,7 +105,15 @@ FACT_CARDS: tuple[FactCard, ...] = (
 
 
 def fact_violations(text: str) -> list[str]:
-    """Return human-readable reasons for invariant contradictions."""
+    """Return human-readable reasons for invariant contradictions.
+
+    Args:
+        text: Knowledge answer body. Arch-specific numbers are not checked.
+
+    Returns:
+        One string per matching :data:`FACT_CARDS` hit; empty means no
+        deterministic contradiction.
+    """
     hits: list[str] = []
     for card in FACT_CARDS:
         reason = card.check(text)

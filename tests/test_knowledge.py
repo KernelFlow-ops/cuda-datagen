@@ -284,6 +284,44 @@ class JudgeJsonTests(unittest.TestCase):
         self.assertGreaterEqual(result.overall, 7)
         self.assertEqual(result.issues, ["nit"])
 
+    def test_split_mode_merges_factual_and_quality(self) -> None:
+        class _Split:
+            def stream_completion(self, **kwargs: object) -> LLMCompletion:
+                system = str(kwargs.get("system") or "")
+                if "factual grader" in system:
+                    payload = {
+                        "dimensions": {"factual": 4, "terminology": 8, "grounding": 8},
+                        "must_fix": ["wrong warp size"],
+                        "issues": [],
+                    }
+                else:
+                    payload = {
+                        "dimensions": {
+                            "completeness": 9,
+                            "derivation": 9,
+                            "structure": 9,
+                        },
+                        "must_fix": [],
+                        "issues": ["long"],
+                    }
+                return LLMCompletion(
+                    text=json.dumps(payload), reasoning="", reasoning_source="empty"
+                )
+
+        judge = KnowledgeJudge(
+            settings=_settings(knowledge_judge_mode="split"),
+            llm_client=_Split(),  # type: ignore[arg-type]
+        )
+        result = judge.judge(
+            question="Explain warps",
+            answer=_long(STRUCTURED),
+            topic="architecture",
+        )
+        self.assertFalse(result.passed)
+        self.assertIn("wrong warp size", result.must_fix)
+        self.assertEqual(result.dimensions["factual"], 4.0)
+        self.assertEqual(result.overall, 4.0)
+
     def test_llm_disabled_hard_gate_only(self) -> None:
         judge = KnowledgeJudge(settings=_settings(knowledge_judge_enabled=False))
         result = judge.judge(

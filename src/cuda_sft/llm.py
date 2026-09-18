@@ -26,6 +26,10 @@ UPSTREAM_RETRY_HINTS = (
     "timeout",
     "try again",
     "capacity",
+    "incomplete chunked",
+    "peer closed",
+    "connection reset",
+    "broken pipe",
 )
 _AFFORD_TOKENS_RE = re.compile(r"can only afford (\d+)", re.IGNORECASE)
 # OpenRouter reserves max_tokens against remaining credits; 100k often 402s.

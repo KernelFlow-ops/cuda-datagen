@@ -9,7 +9,8 @@ from cuda_sft.config import Settings
 from cuda_sft.dialects.python_check import run_python_gate
 from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source
-from cuda_sft.prompt import SelectedPrompts, _stable_index, format_nvcc_for_prompt
+from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
+from cuda_sft.prompts.selection import language_matched_index, stable_index
 
 SYSTEM_PROMPTS = (
     (
@@ -66,7 +67,8 @@ def elementwise_add(N, block=256, dtype="float32"):
         with T.Kernel(T.ceildiv(N, block), threads=block) as bx:
             for i in T.Parallel(block):
                 gi = bx * block + i
-                C[gi] = A[gi] + B[gi]
+                if gi < N:
+                    C[gi] = A[gi] + B[gi]
 
     return main
 '''
@@ -127,8 +129,12 @@ class TileLangDialect:
         cuda_arch: str,
         cuda_version: str,
     ) -> SelectedPrompts:
-        sys_i = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
-        suf_i = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+        sys_i = language_matched_index(
+            SYSTEM_PROMPTS, question, question_id, candidate_idx, salt=0
+        )
+        suf_i = language_matched_index(
+            USER_SUFFIXES, question, question_id, candidate_idx, salt=7
+        )
         suffix = USER_SUFFIXES[suf_i].format(
             gpu_name=gpu_name, cuda_arch=cuda_arch, cuda_version=cuda_version
         ).strip()
@@ -149,7 +155,7 @@ class TileLangDialect:
         candidate_idx: int,
         repair_idx: int,
     ) -> str:
-        idx = _stable_index(
+        idx = stable_index(
             len(REPAIR_PROMPTS), question_id, candidate_idx, salt=13 + int(repair_idx)
         )
         return REPAIR_PROMPTS[idx].format(

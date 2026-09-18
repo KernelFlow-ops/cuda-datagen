@@ -23,7 +23,11 @@ COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry, success
 
 
 class CudaDialect:
-    """Raw CUDA C++ (``solution.cu``, ``nvcc -c``)."""
+    """Raw CUDA C++ (``solution.cu``, ``nvcc -c``).
+
+    Implements :class:`~cuda_sft.dialects.base.DialectSpec`. Always
+    ``available()``; the compile gate is ``nvcc -c`` plus empty header stubs.
+    """
 
     name = "cuda"
     language = "cuda-cpp"
@@ -31,12 +35,29 @@ class CudaDialect:
     fence_langs = ("cuda", "cu", "cpp", "c++", "cc", "cxx", "c", "hpp")
 
     def available(self, settings: Settings) -> tuple[bool, str]:
+        """CUDA C++ needs only ``nvcc``, which the pipeline already requires.
+
+        Args:
+            settings: Unused; accepted to match the dialect protocol.
+        """
         return True, ""
 
     def extract(self, text: str) -> str:
+        """Pull a ``cuda`` (or C++) fence from the model reply.
+
+        Args:
+            text: Raw assistant text, possibly with thinking tags.
+        """
         return extract_cuda_source(text)
 
     def compile(self, code: str, workdir: Path, settings: Settings) -> CompileResult:
+        """``nvcc -c`` the translation unit (optional ``-rdc=true`` retry).
+
+        Args:
+            code: Extracted ``solution.cu``.
+            workdir: Per-attempt directory.
+            settings: Arch, nvcc path, timeouts.
+        """
         return compile_cuda_source(code, workdir, settings=settings, dialect="cuda")
 
     def select_prompts(
@@ -49,6 +70,16 @@ class CudaDialect:
         cuda_arch: str,
         cuda_version: str,
     ) -> SelectedPrompts:
+        """Language-matched CUDA generator prompts plus a tiny few-shot.
+
+        Args:
+            question: Raw problem text.
+            question_id: Resume-stable variant key.
+            candidate_idx: 1-based candidate (changes temperature and variant).
+            gpu_name: Inserted into the user suffix.
+            cuda_arch: e.g. ``sm_86``.
+            cuda_version: e.g. ``12.6``.
+        """
         return select_prompts(
             question,
             question_id=question_id,
@@ -68,6 +99,16 @@ class CudaDialect:
         candidate_idx: int,
         repair_idx: int,
     ) -> str:
+        """Dialect-specific repair body (question wrap happens in Repairer).
+
+        Args:
+            cuda_arch: Target SM.
+            compile_error: Already-trimmed nvcc log.
+            previous_code: Last extracted source.
+            question_id: Variant key.
+            candidate_idx: Variant key.
+            repair_idx: Changes wording in the repair pool.
+        """
         return build_repair_prompt(
             cuda_arch=cuda_arch,
             compile_error=compile_error,
@@ -78,10 +119,22 @@ class CudaDialect:
         )
 
     def judge(self, code: str) -> JudgeResult:
+        """Heuristic quality score; does not block save.
+
+        Args:
+            code: Compile-passing source.
+        """
         return CudaCodeJudge().judge(code)
 
     def smoke(self, settings: Settings, workdir: Path) -> CompileResult:
+        """Built-in ``nvcc -c`` smoke for ``--dry-compile``.
+
+        Args:
+            settings: Toolkit paths and arch.
+            workdir: Scratch directory.
+        """
         return smoke_compile(settings, workdir)
 
     def cot_skeleton(self) -> str:
+        """Six English headings; Chinese problems swap in ``COT_SKELETON_ZH``."""
         return COT_SKELETON

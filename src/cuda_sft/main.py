@@ -16,9 +16,10 @@ from tqdm import tqdm
 
 from cuda_sft.config import PROJECT_ROOT, WorkerSlot, get_settings
 from cuda_sft.dialects.agent import get_dialect_agent
-from cuda_sft.graph import build_graph, recursion_limit, set_print_stream
+from cuda_sft.graph import build_graph, recursion_limit
 from cuda_sft.llm import is_retryable_llm_error
 from cuda_sft.formats import export_training_files
+from cuda_sft.pipeline.common import set_print_stream
 from cuda_sft.store import init_store, iter_question_rows, load_done_keys
 from cuda_sft.tasks.kinds import Job, QuestionRow, coerce_job, progress_key
 from cuda_sft.tasks.router import expand_pipeline_jobs
@@ -297,11 +298,8 @@ def _apply_kernel_cli(args: argparse.Namespace) -> None:
 
 
 def _set_all_print_stream(enabled: bool) -> None:
-    """Toggle token streaming on both kernel and knowledge graphs."""
+    """Toggle token streaming for kernel and knowledge generate nodes."""
     set_print_stream(enabled)
-    from cuda_sft.knowledge.graph import set_print_stream as set_knowledge_print_stream
-
-    set_knowledge_print_stream(enabled)
 
 
 def run_dry_compile() -> int:

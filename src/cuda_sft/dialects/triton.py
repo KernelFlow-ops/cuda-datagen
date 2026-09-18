@@ -9,7 +9,8 @@ from cuda_sft.config import Settings
 from cuda_sft.dialects.python_check import run_python_gate
 from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source
-from cuda_sft.prompt import SelectedPrompts, _stable_index, format_nvcc_for_prompt
+from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
+from cuda_sft.prompts.selection import language_matched_index, stable_index
 
 SYSTEM_PROMPTS = (
     (
@@ -95,7 +96,11 @@ def looks_like_triton(source: str) -> bool:
 
 
 class TritonDialect:
-    """Python Triton kernels gated by parse + import."""
+    """Python Triton kernels gated by parse + import (no numeric tests).
+
+    Implements :class:`~cuda_sft.dialects.base.DialectSpec`. ``available()``
+    is False when the ``triton`` package is missing.
+    """
 
     name = "triton"
     language = "python"
@@ -103,6 +108,11 @@ class TritonDialect:
     fence_langs = ("python", "py", "triton")
 
     def available(self, settings: Settings) -> tuple[bool, str]:
+        """Return whether the Triton package can be imported.
+
+        Args:
+            settings: Unused; protocol compatibility.
+        """
         try:
             import triton  # noqa: F401
         except ImportError:
@@ -110,11 +120,23 @@ class TritonDialect:
         return True, ""
 
     def extract(self, text: str) -> str:
+        """Pull a Python/Triton fence from the model reply.
+
+        Args:
+            text: Raw assistant text.
+        """
         return extract_fenced_source(
             text, fence_langs=self.fence_langs, looks_like=looks_like_triton
         )
 
     def compile(self, code: str, workdir: Path, settings: Settings) -> CompileResult:
+        """Parse + import gate in a subprocess (no numeric tests).
+
+        Args:
+            code: Extracted ``solution.py``.
+            workdir: Per-attempt directory.
+            settings: ``triton_timeout_sec``.
+        """
         return run_python_gate(
             "triton",
             code,
@@ -134,8 +156,12 @@ class TritonDialect:
         cuda_arch: str,
         cuda_version: str,
     ) -> SelectedPrompts:
-        sys_i = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
-        suf_i = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+        sys_i = language_matched_index(
+            SYSTEM_PROMPTS, question, question_id, candidate_idx, salt=0
+        )
+        suf_i = language_matched_index(
+            USER_SUFFIXES, question, question_id, candidate_idx, salt=7
+        )
         suffix = USER_SUFFIXES[suf_i].format(
             gpu_name=gpu_name, cuda_arch=cuda_arch, cuda_version=cuda_version
         ).strip()
@@ -156,7 +182,7 @@ class TritonDialect:
         candidate_idx: int,
         repair_idx: int,
     ) -> str:
-        idx = _stable_index(
+        idx = stable_index(
             len(REPAIR_PROMPTS), question_id, candidate_idx, salt=13 + int(repair_idx)
         )
         return REPAIR_PROMPTS[idx].format(
@@ -166,6 +192,11 @@ class TritonDialect:
         )
 
     def judge(self, code: str) -> JudgeResult:
+        """Heuristic Triton checks (jit kernel, program_id, no CUDA leak).
+
+        Args:
+            code: Compile-passing Python source.
+        """
         source = code or ""
         issues: list[str] = []
         suggestions: list[str] = []

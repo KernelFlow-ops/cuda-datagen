@@ -26,7 +26,11 @@ DERIVATION_TOPICS = {"formula"}
 
 
 def weights_for(topic: str) -> dict[str, float]:
-    """Zero the derivation axis for non-formula topics, then renormalize."""
+    """Zero the derivation axis for non-formula topics, then renormalize.
+
+    Args:
+        topic: Knowledge topic id (``formula`` keeps the derivation weight).
+    """
     weights = dict(DEFAULT_WEIGHTS)
     if (topic or "").strip().lower() not in DERIVATION_TOPICS:
         weights["derivation"] = 0.0

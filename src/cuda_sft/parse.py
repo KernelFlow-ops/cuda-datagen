@@ -117,6 +117,22 @@ def unwrap_cot_assistant(assistant: str) -> tuple[str, str]:
     return cot, code
 
 
+_NUMBERED_HEADING_RE = re.compile(r"(?m)^\s*(\d+)\.\s+\S")
+
+
+def has_numbered_headings(text: str, count: int) -> bool:
+    """Return True when headings ``1.`` .. ``count.`` all appear.
+
+    Used to reject truncated CoT checklists (models often stop mid heading 6).
+
+    Args:
+        text: Polished CoT body.
+        count: Required last heading number (6 for kernels, 5 for knowledge).
+    """
+    found = {int(match.group(1)) for match in _NUMBERED_HEADING_RE.finditer(text or "")}
+    return all(index in found for index in range(1, int(count) + 1))
+
+
 def collapse_blank_lines(text: str) -> str:
     """Collapse runs of blank lines and strip edges."""
     return re.sub(r"\n{3,}", "\n\n", (text or "").strip())

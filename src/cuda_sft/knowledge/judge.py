@@ -16,7 +16,12 @@ from cuda_sft.knowledge.parse import (
     has_equation,
     looks_structured,
 )
-from cuda_sft.knowledge.prompt import JUDGE_SYSTEM, build_judge_user
+from cuda_sft.knowledge.prompt import (
+    JUDGE_SYSTEM,
+    JUDGE_SYSTEM_FACTUAL,
+    JUDGE_SYSTEM_QUALITY,
+    build_judge_user,
+)
 from cuda_sft.knowledge.rubrics import (
     DIMENSIONS,
     clamp_score,
@@ -223,10 +228,8 @@ def _dimensions_from_payload(payload: dict[str, Any]) -> dict[str, float] | None
                 value = lowered[alias]
                 break
         if value is None:
-            if key == "derivation":
-                out[key] = 10.0
-                continue
-            return None
+            out[key] = 1.0
+            continue
         out[key] = clamp_score(value)
     return out
 
@@ -292,29 +295,35 @@ class KnowledgeJudge:
         attempts = 2 if settings.knowledge_on_judge_fail == "retry" else 1
         last_error = "judge returned no JSON"
         payload: dict[str, Any] | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                text = self._run_llm(question=question, answer=answer, topic=topic)
-            except Exception as exc:
-                last_error = str(exc)
-                logger.warning("knowledge judge LLM attempt %s/%s: %s", attempt, attempts, exc)
-                retry = attempt < attempts and (
-                    isinstance(exc, LLMError) or is_retryable_llm_error(exc)
-                )
-                if retry:
-                    continue
-                break
-            payload = parse_judge_json(text)
-            if payload is not None:
-                break
-            snippet = (text or "").replace("\n", " ")[:400]
-            last_error = "judge output was not valid JSON with dimensions"
-            logger.warning(
-                "knowledge judge JSON parse failed (attempt %s/%s) snippet=%r",
-                attempt,
-                attempts,
-                snippet,
+        mode = (settings.knowledge_judge_mode or "capped").strip().lower()
+        if mode == "split":
+            payload, last_error = self._run_split(
+                question=question, answer=answer, topic=topic, attempts=attempts
             )
+        else:
+            for attempt in range(1, attempts + 1):
+                try:
+                    text = self._run_llm(question=question, answer=answer, topic=topic)
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.warning("knowledge judge LLM attempt %s/%s: %s", attempt, attempts, exc)
+                    retry = attempt < attempts and (
+                        isinstance(exc, LLMError) or is_retryable_llm_error(exc)
+                    )
+                    if retry:
+                        continue
+                    break
+                payload = parse_judge_json(text)
+                if payload is not None:
+                    break
+                snippet = (text or "").replace("\n", " ")[:400]
+                last_error = "judge output was not valid JSON with dimensions"
+                logger.warning(
+                    "knowledge judge JSON parse failed (attempt %s/%s) snippet=%r",
+                    attempt,
+                    attempts,
+                    snippet,
+                )
 
         if payload is None:
             return KnowledgeJudgeResult(
@@ -334,6 +343,10 @@ class KnowledgeJudge:
         must_fix = _string_list(payload.get("must_fix"))
         issues = _string_list(payload.get("issues"))
         overall = overall_score(dimensions, topic)
+        if mode in {"capped", "split"}:
+            factual = clamp_score(dimensions.get("factual", 1))
+            completeness = clamp_score(dimensions.get("completeness", 1))
+            overall = min(overall, factual, completeness)
         passed = passes_threshold(
             overall=overall,
             dimensions=dimensions,
@@ -349,14 +362,103 @@ class KnowledgeJudge:
             issues=issues,
         )
 
-    def _run_llm(self, *, question: str, answer: str, topic: str) -> str:
+    def _run_split(
+        self,
+        *,
+        question: str,
+        answer: str,
+        topic: str,
+        attempts: int,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """MA-CF split: factual critic then quality critic, then merge JSON.
+
+        Args:
+            question: Raw problem.
+            answer: Draft prose.
+            topic: Knowledge topic.
+            attempts: JSON retries per arm.
+        """
+        factual, err_a = self._run_llm_json(
+            question=question,
+            answer=answer,
+            topic=topic,
+            system=JUDGE_SYSTEM_FACTUAL,
+            attempts=attempts,
+        )
+        quality, err_b = self._run_llm_json(
+            question=question,
+            answer=answer,
+            topic=topic,
+            system=JUDGE_SYSTEM_QUALITY,
+            attempts=attempts,
+        )
+        if factual is None or quality is None:
+            return None, err_a if factual is None else err_b
+        dims: dict[str, Any] = {}
+        for payload in (factual, quality):
+            block = payload.get("dimensions") or payload.get("scores") or {}
+            if isinstance(block, dict):
+                dims.update(block)
+        merged = {
+            "dimensions": dims,
+            "must_fix": _string_list(factual.get("must_fix"))
+            + _string_list(quality.get("must_fix")),
+            "issues": _string_list(factual.get("issues"))
+            + _string_list(quality.get("issues")),
+        }
+        return merged, ""
+
+    def _run_llm_json(
+        self,
+        *,
+        question: str,
+        answer: str,
+        topic: str,
+        system: str,
+        attempts: int,
+    ) -> tuple[dict[str, Any] | None, str]:
+        last_error = "judge returned no JSON"
+        for attempt in range(1, attempts + 1):
+            try:
+                text = self._run_llm(
+                    question=question, answer=answer, topic=topic, system=system
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                retry = attempt < attempts and (
+                    isinstance(exc, LLMError) or is_retryable_llm_error(exc)
+                )
+                if retry:
+                    continue
+                break
+            payload = parse_judge_json(text)
+            if payload is not None:
+                return payload, ""
+            last_error = "judge output was not valid JSON with dimensions"
+        return None, last_error
+
+    def _run_llm(
+        self,
+        *,
+        question: str,
+        answer: str,
+        topic: str,
+        system: str | None = None,
+    ) -> str:
         client = self._client_or_default()
-        user = build_judge_user(question=question, answer=answer, topic=topic)
+        user = build_judge_user(
+            question=question,
+            answer=answer,
+            topic=topic,
+            gpu_name=self.settings.resolved_gpu_name,
+            cuda_arch=self.settings.resolved_cuda_arch,
+            cuda_version=self.settings.resolved_cuda_version,
+        )
         stream_completion = getattr(client, "stream_completion", None)
         base = {
             "messages": [{"role": "user", "content": user}],
-            "system": JUDGE_SYSTEM,
-            "temperature": 0.2,
+            "system": system or JUDGE_SYSTEM,
+            "temperature": 0.0,
             "print_stream": False,
         }
         if callable(stream_completion):

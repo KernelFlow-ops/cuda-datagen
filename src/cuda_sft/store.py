@@ -92,6 +92,23 @@ def iter_question_rows(path: Path) -> Iterable[tuple[int, str, dict[str, Any]]]:
             yield index, question, obj
 
 
+def _training_user(state: GraphState, settings: Any) -> str:
+    """User text written into SFT jsonl.
+
+    When ``SFT_USER_IS_RAW_QUESTION`` is true (default), the student sees the
+    original problem rather than the datagen protocol suffix.
+
+    Args:
+        state: Graph state with ``question`` and ``user_prompt``.
+        settings: Pipeline settings.
+    """
+    raw = str(state.get("question") or "").strip()
+    generated = str(state.get("user_prompt") or "").strip()
+    if getattr(settings, "sft_user_is_raw_question", True) and raw:
+        return raw
+    return generated or raw
+
+
 def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
     """Yield ``(1-based line id, question text)`` from ``question.jsonl``.
 
@@ -137,7 +154,7 @@ class Store:
             self._write_knowledge_success(state, model_name=model_name)
             return
         settings = get_settings()
-        user = state["user_prompt"]
+        user = _training_user(state, settings)
         code = state["code"]
         cot = str(state.get("cot") or "")
         if settings.cot_enabled and settings.cot_in_assistant and cot.strip():
@@ -159,9 +176,15 @@ class Store:
             "judge_score": state.get("judge_score", 0),
             "dialect": dialect,
             "language": language,
+            "generation_user_prompt": str(state.get("user_prompt") or ""),
         }
         if extra_meta.get("judge"):
             metadata["judge"] = extra_meta["judge"]
+        if extra_meta.get("critic"):
+            metadata["critic"] = extra_meta["critic"]
+        if state.get("difficulty"):
+            metadata["difficulty"] = state.get("difficulty")
+            metadata["candidate_cap"] = state.get("candidate_cap")
         if settings.cot_enabled:
             cot_meta = extra_meta.get("cot")
             if not isinstance(cot_meta, dict):
@@ -208,7 +231,7 @@ class Store:
     def _write_knowledge_success(self, state: GraphState, *, model_name: str) -> None:
         """Persist a rubric-passing knowledge sample (prose assistant)."""
         settings = get_settings()
-        user = str(state.get("user_prompt") or state.get("question") or "")
+        user = _training_user(state, settings)
         answer = str(state.get("answer") or "")
         cot = str(state.get("cot") or "")
         if settings.cot_enabled and settings.cot_in_assistant and cot.strip():
@@ -231,9 +254,13 @@ class Store:
             "judge_score": state.get("judge_score", 0),
             "dialect": track,
             "language": "prose",
+            "generation_user_prompt": str(state.get("user_prompt") or ""),
         }
         if extra_meta.get("knowledge_judge"):
             metadata["knowledge_judge"] = extra_meta["knowledge_judge"]
+        if state.get("difficulty"):
+            metadata["difficulty"] = state.get("difficulty")
+            metadata["candidate_cap"] = state.get("candidate_cap")
         if settings.cot_enabled:
             cot_meta = extra_meta.get("cot")
             if not isinstance(cot_meta, dict):

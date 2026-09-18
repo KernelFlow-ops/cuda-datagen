@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-import re
 from typing import NamedTuple
 
-# Fallback / first variant. Kept as SYSTEM_PROMPT for older imports.
+from cuda_sft.prompts.nvcc_log import format_nvcc_for_prompt, truncate_compile_error
+from cuda_sft.prompts.selection import (
+    CANDIDATE_TEMPERATURES,
+    candidate_temperature,
+    language_matched_index,
+    stable_index as _stable_index,
+)
+
+# Generator system pool: compile-first role, mixed EN/ZH. Selection matches
+# question CJK-ness via language_matched_index (not random).
 SYSTEM_PROMPTS: tuple[str, ...] = (
     (
         "You are a senior CUDA kernel engineer. "
@@ -217,7 +225,20 @@ nvcc 输出（过长则已去重摘要）：
 仅输出一个 ```cuda 代码块。""",
 )
 
-CANDIDATE_TEMPERATURES = (0.2, 0.5, 0.8)
+# Short compile-first example. Kept tiny so it does not dominate the real problem.
+FEW_SHOT_CUDA = """## Tiny valid-shape example (not the solution)
+```cuda
+#include <cuda_runtime.h>
+__global__ void scale_kernel(float* x, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] *= s;
+}
+void launch_scale(float* x, float s, int n) {
+  int t = 256;
+  scale_kernel<<<(n + t - 1) / t, t>>>(x, s, n);
+}
+```
+Invalid: `#include "include/helpers.h"` (that file is absent). Invalid: a `main()` test harness."""
 
 COT_SYSTEM_PROMPT = """你是 CUDA SFT 思维链编辑器，不是写代码的人。最终 solution.cu 已经通过编译；你只整理可学习的推理。
 You are the CUDA SFT Chain-of-Thought editor.
@@ -251,6 +272,44 @@ Required CoT skeleton (use these headings, keep them short):
 6. Implementation checklist — 4–8 bullets that map onto the actual code
    (includes, kernel name, host launcher, key locals).
 """
+
+COT_SYSTEM_PYTHON = """You are the SFT Chain-of-Thought editor for Triton/TileLang kernels.
+A compilable solution.py already exists. Rewrite teacher thinking into a
+pedagogical CoT. Faithful to the FINAL Python source only. Do not emit
+source, fences, or mention this editor. Match the problem language.
+Headings come from the user message (program_id / T.Kernel, not CUDA C++).
+"""
+
+COT_SKELETON_ZH = (
+    "1. 题意与张量/入口\n"
+    "2. 算法\n"
+    "3. 线程与 block 映射\n"
+    "4. 存储与同步\n"
+    "5. 边界与异常\n"
+    "6. 实现清单"
+)
+COT_SKELETON_PY_ZH = (
+    "1. 题意与张量/入口\n"
+    "2. 算法\n"
+    "3. program_id / T.Kernel 映射\n"
+    "4. 存储与 mask\n"
+    "5. 边界\n"
+    "6. 实现清单"
+)
+
+
+def cot_system_for(*, dialect: str) -> str:
+    """CoT-editor system prompt for a kernel dialect.
+
+    Args:
+        dialect: ``cuda`` / ``cutlass`` use the CUDA-C++ editor; Python
+            dialects use :data:`COT_SYSTEM_PYTHON`.
+    """
+    name = (dialect or "cuda").strip().lower()
+    if name in {"triton", "tilelang"}:
+        return COT_SYSTEM_PYTHON
+    return COT_SYSTEM_PROMPT
+
 
 COT_USER_TEMPLATE = """## Problem
 {question}
@@ -349,33 +408,6 @@ class SelectedPrompts(NamedTuple):
     suffix_index: int
 
 
-def candidate_temperature(candidate_idx: int) -> float:
-    """Temperature for candidate 1/2/3 (0.2 / 0.5 / 0.8).
-
-    Args:
-        candidate_idx: 1-based candidate number.
-    """
-    if candidate_idx <= 1:
-        return CANDIDATE_TEMPERATURES[0]
-    if candidate_idx >= len(CANDIDATE_TEMPERATURES):
-        return CANDIDATE_TEMPERATURES[-1]
-    return CANDIDATE_TEMPERATURES[candidate_idx - 1]
-
-
-def _stable_index(n: int, question_id: int, candidate_idx: int, salt: int) -> int:
-    """Deterministic index in ``[0, n)`` (no randomness; resume-stable).
-
-    Args:
-        n: Pool size.
-        question_id: 1-based jsonl line id.
-        candidate_idx: 1-based candidate number.
-        salt: Distinguishes system vs suffix vs repair pools.
-    """
-    if n <= 0:
-        raise ValueError("empty prompt pool")
-    return (int(question_id) * 31 + int(candidate_idx) * 17 + salt) % n
-
-
 def select_system_prompt(question_id: int, candidate_idx: int = 1) -> str:
     """Pick a system prompt from :data:`SYSTEM_PROMPTS`.
 
@@ -406,13 +438,15 @@ def build_user_prompt(
         question_id: Used to pick the suffix variant.
         candidate_idx: Later candidates use a different suffix.
     """
-    idx = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+    idx = language_matched_index(
+        USER_SUFFIXES, question, question_id, candidate_idx, salt=7
+    )
     suffix = USER_SUFFIXES[idx].format(
         gpu_name=gpu_name,
         cuda_arch=cuda_arch,
         cuda_version=cuda_version,
     ).strip()
-    return f"{question.rstrip()}\n\n{suffix}\n"
+    return f"{question.rstrip()}\n\n{suffix}\n\n{FEW_SHOT_CUDA}\n"
 
 
 def select_prompts(
@@ -434,14 +468,18 @@ def select_prompts(
         cuda_arch: Inserted into the user suffix.
         cuda_version: Inserted into the user suffix.
     """
-    system_idx = _stable_index(len(SYSTEM_PROMPTS), question_id, candidate_idx, salt=0)
-    suffix_idx = _stable_index(len(USER_SUFFIXES), question_id, candidate_idx, salt=7)
+    system_idx = language_matched_index(
+        SYSTEM_PROMPTS, question, question_id, candidate_idx, salt=0
+    )
+    suffix_idx = language_matched_index(
+        USER_SUFFIXES, question, question_id, candidate_idx, salt=7
+    )
     suffix = USER_SUFFIXES[suffix_idx].format(
         gpu_name=gpu_name,
         cuda_arch=cuda_arch,
         cuda_version=cuda_version,
     ).strip()
-    user = f"{question.rstrip()}\n\n{suffix}\n"
+    user = f"{question.rstrip()}\n\n{suffix}\n\n{FEW_SHOT_CUDA}\n"
     return SelectedPrompts(
         system=SYSTEM_PROMPTS[system_idx],
         user=user,
@@ -481,166 +519,20 @@ def build_repair_prompt(
     )
 
 
-_NVCC_DIAG_RE = re.compile(
-    r"^(?P<loc>\S.*?)\((?P<line>\d+)\):\s+"
-    r"(?P<kind>error|warning|fatal error)\b"
-    r"(?:\s+#\S+)?:\s+(?P<msg>.*)$",
-    re.IGNORECASE,
-)
-# Host-compiler / cudafe stub lines: ``file:line:col: error: ...``
-_GCC_DIAG_RE = re.compile(
-    r"^(?P<loc>\S.*?):(?P<line>\d+)(?::(?P<col>\d+))?:\s+"
-    r"(?P<kind>error|warning|fatal error)\s*:\s+(?P<msg>.*)$",
-    re.IGNORECASE,
-)
-_NVCC_FATAL_RE = re.compile(
-    r"^(?:(?P<loc>\S.*?):\s+)?fatal error:\s+(?P<msg>.*)$",
-    re.IGNORECASE,
-)
-_TEMPLATE_CHUNK_RE = re.compile(r"<[^>]{24,}>")
-_CARET_LINE_RE = re.compile(r"^[\s^~]+$")
-_NOISE_SNIPPETS = (
-    "the warnings can be suppressed",
-    "remark: the warnings can be suppressed",
-)
-
-
-def _is_noise_line(line: str) -> bool:
-    """Return True for caret pointers, empty lines, and nvcc remark boilerplate."""
-    stripped = line.strip()
-    if not stripped:
-        return True
-    if _CARET_LINE_RE.match(stripped):
-        return True
-    lowered = stripped.lower()
-    return any(snippet in lowered for snippet in _NOISE_SNIPPETS)
-
-
-def _normalize_diag_message(message: str) -> str:
-    """Collapse whitespace and long template argument lists for dedup keys."""
-    collapsed = _TEMPLATE_CHUNK_RE.sub("<>", message)
-    return re.sub(r"\s+", " ", collapsed).strip().lower()
-
-
-def format_nvcc_for_prompt(output: str, max_chars: int = 6000) -> str:
-    """Prepare nvcc output for the repair prompt.
-
-    If ``output`` is at most ``max_chars``, return it unchanged. Otherwise build
-    a deduplicated summary of error/fatal lines (warnings only if space remains).
-
-    Args:
-        output: Full compiler stdout/stderr.
-        max_chars: Threshold from ``REPAIR_ERROR_MAX_CHARS``.
-
-    Returns:
-        Full log or a summary that fits in ``max_chars``.
-    """
-    text = (output or "").strip()
-    if not text:
-        return "(empty compiler output)"
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-
-    errors: list[str] = []
-    warnings: list[str] = []
-    seen_error: set[str] = set()
-    seen_warning: set[str] = set()
-    error_count = 0
-    warning_count = 0
-
-    for raw in text.splitlines():
-        if _is_noise_line(raw):
-            continue
-        match = _NVCC_DIAG_RE.match(raw.strip())
-        kind = ""
-        msg = ""
-        loc = ""
-        line_no = ""
-        if match:
-            kind = match.group("kind").lower()
-            msg = match.group("msg")
-            loc = match.group("loc")
-            line_no = match.group("line")
-        else:
-            gcc = _GCC_DIAG_RE.match(raw.strip())
-            if gcc:
-                kind = gcc.group("kind").lower()
-                msg = gcc.group("msg")
-                loc = gcc.group("loc")
-                line_no = gcc.group("line")
-            else:
-                fatal = _NVCC_FATAL_RE.match(raw.strip())
-                if fatal:
-                    kind = "fatal error"
-                    msg = fatal.group("msg")
-                    loc = fatal.group("loc") or ""
-        if not kind:
-            continue
-        key = f"{kind}|{_normalize_diag_message(msg)}"
-        display = raw.strip()
-        if loc and line_no and loc not in display:
-            display = f"{loc}({line_no}): {kind}: {msg.strip()}"
-        if kind in {"error", "fatal error"}:
-            error_count += 1
-            if key not in seen_error:
-                seen_error.add(key)
-                errors.append(display)
-        else:
-            warning_count += 1
-            if key not in seen_warning:
-                seen_warning.add(key)
-                warnings.append(display)
-
-    header = (
-        f"{error_count} errors ({len(errors)} unique), "
-        f"{warning_count} warnings ({len(warnings)} unique); "
-        f"log truncated from {len(text)} chars"
-    )
-    if error_count == 0 and warning_count == 0:
-        # Python/TVM dumps and cudafe stub text often lack nvcc ``file(line): error:``
-        # markers; keep a tail so repairs are not fed an empty summary.
-        if len(text) <= max_chars:
-            return text
-        keep = max(256, max_chars - 40)
-        return f"...[truncated {len(text) - keep} chars]...\n{text[-keep:]}"
-    parts = [header, ""]
-    if errors:
-        parts.append("errors:")
-        parts.extend(errors)
-        parts.append("")
-    if warnings:
-        parts.append("warnings:")
-        parts.extend(warnings)
-
-    summary = "\n".join(parts).strip()
-    if len(summary) <= max_chars:
-        return summary
-
-    # Prefer unique errors over warnings if still too long.
-    kept: list[str] = [header, "", "errors:"]
-    used = len("\n".join(kept))
-    for item in errors:
-        extra = len(item) + 1
-        if used + extra > max_chars:
-            break
-        kept.append(item)
-        used += extra
-    if used < max_chars - 20 and warnings:
-        kept.append("")
-        kept.append("warnings:")
-        used = len("\n".join(kept))
-        for item in warnings:
-            extra = len(item) + 1
-            if used + extra > max_chars:
-                break
-            kept.append(item)
-            used += extra
-    result = "\n".join(kept).strip()
-    if len(result) > max_chars:
-        return result[:max_chars]
-    return result
-
-
-def truncate_compile_error(error: str, max_chars: int = 6000) -> str:
-    """Backward-compatible alias of :func:`format_nvcc_for_prompt`."""
-    return format_nvcc_for_prompt(error, max_chars=max_chars)
+__all__ = [
+    "CANDIDATE_TEMPERATURES",
+    "COT_SYSTEM_PROMPT",
+    "REPAIR_PROMPTS",
+    "SYSTEM_PROMPT",
+    "SYSTEM_PROMPTS",
+    "SelectedPrompts",
+    "USER_SUFFIXES",
+    "build_cot_user_prompt",
+    "build_repair_prompt",
+    "build_user_prompt",
+    "candidate_temperature",
+    "format_nvcc_for_prompt",
+    "select_prompts",
+    "select_system_prompt",
+    "truncate_compile_error",
+]

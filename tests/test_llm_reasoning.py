@@ -7,6 +7,7 @@ import unittest
 from cuda_sft.llm import (
     assemble_completion,
     affordable_max_tokens,
+    is_retryable_llm_error,
     reasoning_from_openrouter_message,
     _thinking_from_content_blocks,
 )
@@ -91,6 +92,13 @@ class OpenRouterMessageTests(unittest.TestCase):
             {"type": "text", "text": "code"},
         ]
         self.assertEqual(_thinking_from_content_blocks(blocks), "bounds first")
+
+    def test_incomplete_chunked_read_is_retryable(self) -> None:
+        exc = RuntimeError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+        self.assertTrue(is_retryable_llm_error(exc))
 
 
 if __name__ == "__main__":

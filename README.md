@@ -51,8 +51,13 @@ bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 | `MAX_CANDIDATES` | `3` | 每题最多候选数 |
 | `MAX_REPAIRS` | `3` | 每个候选最多修正次数 |
 | `WORKERS` | `1` | `WORKERS_PER_PROVIDER=0` 时的总进程数；nvidia worker 在多个 key 间轮询 |
-| `JUDGE_ENABLED` | `true` | 启用 Judge Agent 代码质量评估 |
-| `USE_JUDGE_OPTIMIZATION` | `false` | 是否应用 Judge 的轻量优化建议（需重新编译验证） |
+| `JUDGE_ENABLED` | `true` | 启用启发式代码质量评估（不过编译门闩） |
+| `USE_JUDGE_OPTIMIZATION` | `false` | 预留：启发式 judge 当前不改写源码 |
+| `KERNEL_LLM_CRITIC` | `adaptive` | `off` / `adaptive` / `always`。adaptive：启发式分 < 8 或有 issues 才打语义 critic |
+| `KERNEL_CRITIC_BLOCKS_SAVE` | `false` | true 时 critic must_fix 可放弃该候选；默认只再修一轮仍保存已编译样本 |
+| `DIFFICULTY_AWARE` | `true` | 简单题最多 1 候选且跳过 critic；难题用满候选 |
+| `SFT_USER_IS_RAW_QUESTION` | `true` | 训练 jsonl 的 user 用原题，生成协议后缀只进 metadata |
+| `KNOWLEDGE_JUDGE_MODE` | `capped` | `single` 原加权；`capped` 令 overall ≤ min(factual, completeness)；`split` 预留 |
 | `COT_ENABLED` | `true` | 采集 API reasoning/thinking，并走 CoT 节点 |
 | `COT_AGENT_ENABLED` | `true` | 用 CoT Agent 把原始 thinking 整理成教学型 CoT（额外一次 LLM 调用） |
 | `COT_IN_ASSISTANT` | `true` | 训练标签是否包 `<think>…</think>` + 源码 |
@@ -152,8 +157,8 @@ python run.py --dialects cuda,cutlass,triton --kernel-mode all --limit 3
 | `data/sft_openrlhf.jsonl` | **OpenRLHF SFT** 的 `input`/`output` 对话格式 |
 | `data/abandoned.jsonl` | 3 个候选都失败的题目和最后编译错误 |
 | `data/progress.jsonl` | 断点续跑 |
-| `data/run.log` | 当次运行日志（每次启动会清空旧的 `run*.log`，多进程共用这一份） |
-| `work/` | `WORK_KEEP=simple` 时每题只留最后 `solution.cu`；`detailed` 时为 `q{id}/c{c}/r{r}/` |
+| `data/run.log` | 当次运行日志（已有内容则追加 session 横幅，不覆盖历史编译诊断；多进程共用） |
+| `work/` | kernel：`solution.cu` 或 `solution.py`；knowledge：`knowledge/{topic}/answer.md`。`simple` 只留最后一份，`detailed` 保留 `c*/r*` |
 
 默认 SFT assistant 是「整理后的 CoT + 抽取后的 CUDA 源码」：
 
@@ -208,15 +213,102 @@ deepspeed --module openrlhf.cli.train_sft \
 
 ## 图结构
 
+一句话摘要（kernel）：
+
 ```
 prepare → generate → extract → compile
-                         ├ compile ok → judge → cot → save_success
-                         ├ repair < 3 → repair → generate
-                         ├ candidate < 3 → next_candidate → generate
+                         ├ compile ok → heuristic judge → critic? → cot → save_success
+                         ├ repair < N → Repairer（题面回灌 + 错误类）→ generate
+                         ├ candidate < cap → next_candidate → generate
                          └ else → save_abandoned
 ```
 
-`KERNEL_MODE=all` 时在 CLI 层按方言展开 job（每题每种语言各跑一张上图），进度键是 `(id, dialect)`。CUTLASS 方言钉 **CUTLASS 4.x + CuTe**（本机 `/usr/local/cutlass-4.3.5`）。
+`KERNEL_MODE=all` 时在 CLI 层按方言展开 job（每题每种语言各跑一张 kernel 图），进度键是 `(id, dialect)`。知识题进度键是 `(id, knowledge:{topic})`，不会被方言展开。CUTLASS 方言钉 **CUTLASS 4.x + CuTe**。
+
+固定 10 题回归：`python scripts/benchmark.py --module <name> --run-id <id> --pipeline cuda --pipeline knowledge`（kernel ID `1,5,8,20,26,27,38,42,75,90`，knowledge `1–10`）。
+
+### 总览：从 jsonl 到 SFT
+
+```mermaid
+flowchart TB
+  subgraph CLI["入口 run.py"]
+    A["加载 question.jsonl / knowledge jsonl 与 .env"] --> B["classify_row<br/>TASK_MODE=kernel|knowledge|auto"]
+    B --> C["expand_pipeline_jobs"]
+    C --> D["workers × provider 槽位<br/>nvidia 每 key 一槽 + 可选 openrouter"]
+    D --> E["progress.jsonl 跳过已完成 (id, track)<br/>除非 --overwrite"]
+  end
+
+  E --> KER
+  E --> KNOW
+
+  subgraph KER["Kernel StateGraph 每题每方言"]
+    K0["prepare<br/>选 system/suffix（按题面中英）+ difficulty 拓扑"] --> K1["generate<br/>LLM / 领取投机 repair 缓存"]
+    K1 --> K2["extract DialectSpec.extract"]
+    K2 --> K3["compile: nvcc -c / python import-JIT 门闩"]
+    K3 -->|fail 且 repair 未满| K4["Repairer<br/>原题 + error_class + 独立 system"]
+    K4 --> K1
+    K3 -->|fail 且候选未满 cap| K5["next_candidate<br/>换 prompt 变体与温度 0.2/0.5/0.8"]
+    K5 --> K1
+    K3 -->|fail 用尽| KX["save_abandoned"]
+    K3 -->|ok| K6["heuristic judge<br/>不过编译门闩"]
+    K6 --> K7["Semantic Critic<br/>adaptive：低分或 issues 才调用"]
+    K7 -->|must_fix 且有 repair 额度| K4
+    K7 -->|否则| K8["CotAgent thinking=none<br/>方言/中英 heading"]
+    K8 --> K9["save_success"]
+  end
+
+  subgraph KNOW["Knowledge StateGraph 每题每 topic"]
+    N0["prepare + difficulty"] --> N1["generate"]
+    N1 --> N2["extract 散文"]
+    N2 --> N3["hard_gate 篇幅/结构/公式/事实卡"]
+    N3 -->|fail| N4["Repairer 整篇重写 + 原题回灌"]
+    N4 --> N1
+    N3 -->|ok| N5["LLM Judge T=0<br/>capped: overall≤min(factual,completeness)"]
+    N5 -->|fail| N4
+    N5 -->|JSON 不可用| NX["save_abandoned judge_unavailable"]
+    N5 -->|pass| N6["KnowledgeCotAgent"]
+    N6 --> N7["save_success 讲解散文"]
+  end
+
+  K9 --> OUT
+  N7 --> OUT
+
+  subgraph OUT["落盘 data_dir"]
+    O1["sft.jsonl 归档 messages+metadata"]
+    O2["sft_ms_swift.jsonl / sft_openrlhf.jsonl"]
+    O3["progress.jsonl / abandoned.jsonl / run.log"]
+    O4["work/q{id}/solution.cu|.py 或 knowledge/{topic}/answer.md"]
+  end
+```
+
+### Kernel 节点细节
+
+```mermaid
+flowchart LR
+  subgraph gen["generate"]
+    G1["request_id = q{id}_{dialect}_c{c}_r{r}"] --> G2{"async pool 命中?"}
+    G2 -->|yes| G3["用投机响应"]
+    G2 -->|no| G4["stream_completion"]
+  end
+  subgraph cmp["compile 失败时"]
+    C1["enqueue_speculative_repair<br/>与正式 repair 同一 user+system"] --> C2["compile 节点不直接碰 AsyncLLMPool"]
+  end
+  subgraph rpr["Repairer"]
+    R1["classify: empty_source / missing_header / undeclared / syntax / template / dialect_violation / import_time"] --> R2["wrap 原题 + 契约 + 方言 repair 正文"]
+  end
+```
+
+投机 repair 在 `nvcc` 期间预拉下一轮 LLM，generate 命中则省 10–30s。`DIFFICULTY_AWARE=true` 时简单 elementwise 题 `candidate_cap=1` 且跳过 critic。
+
+训练 jsonl 默认 **user = 原题**（`SFT_USER_IS_RAW_QUESTION`）；生成协议后缀（`nvcc -c`、fence 契约）写在 `metadata.generation_user_prompt`，避免学生模型学会数据管线口令。
+
+### Knowledge 门闩细节
+
+硬门闩（无 LLM）：最短篇幅、标题结构、formula 题要有公式、推导题要有步骤、事实卡（NVIDIA warp=32、block 线程上限 1024）。
+
+LLM Judge 默认 `capped`：加权 overall 不得超过 factual 与 completeness 的最小值，must_fix 一票否决。JSON 解析失败记 `judge_unavailable` 并放弃该题（不把坏 JSON 当及格）。
+
+`python -m cuda_sft` 与 `run.py` 等价（后者会先确保 `src/` 在 `sys.path`）。
 
 ## 知识题（架构 / CuTe 理论 / 公式）
 
@@ -233,7 +325,8 @@ python run.py --task auto --input /path/to/mixed.jsonl
 |---|---|---|
 | `TASK_MODE` / `--task` | `kernel` | `kernel` 强制整文件当代码题；`knowledge` 强制知识题；`auto` 看行内 `task` 字段，否则启发式（冲突判 kernel） |
 | `KNOWLEDGE_MIN_SCORE` | `7` | LLM Judge 加权分阈值 |
-| `KNOWLEDGE_MAX_CANDIDATES` / `KNOWLEDGE_MAX_REPAIRS` | `2` / `2` | 知识题候选与返修次数 |
+| `KNOWLEDGE_JUDGE_MODE` | `capped` | overall 不得超过 factual 与 completeness 的最小值 |
+| `KNOWLEDGE_MAX_CANDIDATES` / `KNOWLEDGE_MAX_REPAIRS` | `2` / `2` | 知识题候选与返修次数（再被 difficulty cap 收紧） |
 
 jsonl 可带显式字段（可选）：
 

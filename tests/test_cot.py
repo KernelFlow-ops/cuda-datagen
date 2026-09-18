@@ -6,6 +6,7 @@ import unittest
 
 from cuda_sft.config import Settings
 from cuda_sft.cot import CotAgent, sanitize_cot_output
+from cuda_sft.parse import has_numbered_headings
 from cuda_sft.llm import LLMCompletion
 
 
@@ -71,6 +72,34 @@ class CotAgentTests(unittest.TestCase):
         self.assertEqual(result.source, "agent")
         self.assertIn("Elementwise", result.cot)
         self.assertEqual(client.calls, 1)
+        self.assertTrue(has_numbered_headings(result.cot, 6))
+
+    def test_truncated_headings_retry_then_fallback(self) -> None:
+        class _TruncThenRaw:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def stream_completion(self, **_kwargs: object) -> LLMCompletion:
+                self.calls += 1
+                return LLMCompletion(
+                    text="1. Problem restatement\nToo short and no more headings.",
+                    reasoning="",
+                    reasoning_source="empty",
+                )
+
+        agent = CotAgent(
+            settings=_settings(cot_on_agent_fail="raw"),
+            llm_client=_TruncThenRaw(),  # type: ignore[arg-type]
+        )
+        result = agent.refine(
+            {
+                "question": "vector add",
+                "code": "__global__ void add_kernel() {}\n",
+                "raw_reasoning": "Use one thread per element and guard i < n.",
+            }
+        )
+        self.assertEqual(result.source, "raw")
+        self.assertGreaterEqual(result.raw_reasoning.count("thread"), 1)
 
     def test_agent_disabled_uses_raw(self) -> None:
         agent = CotAgent(

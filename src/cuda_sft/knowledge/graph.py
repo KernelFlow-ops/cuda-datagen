@@ -1,4 +1,7 @@
-"""LangGraph: generate → extract → hard gate / judge → repair → cot / save."""
+"""LangGraph: generate → extract → hard gate / judge → repair → cot / save.
+
+Shares generate-node LLM calls and print-stream state with the kernel graph.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +10,9 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from cuda_sft.agents.difficulty import plan_topology
+from cuda_sft.agents.generate import assistant_state_update, complete_chat
+from cuda_sft.agents.repairer import repair_system_prompt, wrap_repair_user
 from cuda_sft.config import get_settings
 from cuda_sft.knowledge.agent import get_knowledge_agent
 from cuda_sft.knowledge.cot import KnowledgeCotAgent
@@ -19,40 +25,33 @@ from cuda_sft.knowledge.prompt import (
     select_prompts,
 )
 from cuda_sft.knowledge.state import KnowledgeGraphState
-from cuda_sft.llm import LLMCompletion, get_llm_client, is_retryable_llm_error
+from cuda_sft.pipeline.common import (
+    graph_recursion_limit,
+    retry_policy,
+    set_print_stream,
+)
 from cuda_sft.store import get_store
 from cuda_sft.tasks.kinds import knowledge_track
 
 logger = logging.getLogger(__name__)
 
-PRINT_STREAM = True
-
-
-def set_print_stream(enabled: bool) -> None:
-    """Enable or disable printing streamed model tokens to stdout."""
-    global PRINT_STREAM
-    PRINT_STREAM = enabled
-
-
-def _retry_policy():
-    """RetryPolicy for transient LLM failures on the generate node."""
-    from langgraph.types import RetryPolicy
-
-    return RetryPolicy(
-        max_attempts=5,
-        initial_interval=4.0,
-        backoff_factor=2.0,
-        max_interval=60.0,
-        retry_on=is_retryable_llm_error,
-    )
-
 
 def _topic(state: KnowledgeGraphState) -> str:
+    """Return the knowledge topic id stored on this job.
+
+    Args:
+        state: Graph state; missing topic becomes ``general``.
+    """
     return str(state.get("topic") or "general")
 
 
 def _write_attempt(state: KnowledgeGraphState, answer: str) -> None:
-    """Persist the current draft under work/q{id}/knowledge/{topic}/."""
+    """Persist the current draft under work/q{id}/knowledge/{topic}/.
+
+    Args:
+        state: Job identifiers plus candidate/repair indices.
+        answer: Extracted prose (may be empty).
+    """
     settings = get_settings()
     qid = int(state["question_id"])
     topic = _topic(state)
@@ -97,6 +96,12 @@ def prepare(state: KnowledgeGraphState) -> dict[str, Any]:
         cuda_arch=settings.resolved_cuda_arch,
         cuda_version=settings.resolved_cuda_version,
     )
+    topo = plan_topology(
+        question=state["question"],
+        kind="knowledge",
+        topic=topic,
+        settings=settings,
+    )
     return {
         "kind": "knowledge",
         "topic": topic,
@@ -131,6 +136,8 @@ def prepare(state: KnowledgeGraphState) -> dict[str, Any]:
         "cot": "",
         "cot_source": "empty",
         "cot_error": "",
+        "difficulty": topo.difficulty,
+        "candidate_cap": topo.max_candidates,
     }
 
 
@@ -142,43 +149,15 @@ def generate(state: KnowledgeGraphState) -> dict[str, Any]:
     temperature = float(state.get("temperature") or candidate_temperature(cand))
     topic = _topic(state)
     header = f"[Q{qid} knowledge/{topic} candidate={cand} repair={repair} temp={temperature}]"
-
     settings = get_settings()
-    client = get_llm_client()
-    logger.info("%s calling model", header)
-    print(f"\n{header} generating...", flush=True)
-
-    options = get_knowledge_agent().llm_call_options(settings)
-    stream_completion = getattr(client, "stream_completion", None)
-    if callable(stream_completion):
-        completion = stream_completion(
-            messages=state["messages"],
-            system=state.get("system_prompt") or SYSTEM_PROMPTS[0],
-            temperature=temperature,
-            print_stream=PRINT_STREAM,
-            **options,
-        )
-    else:
-        text = client.stream_text(
-            messages=state["messages"],
-            system=state.get("system_prompt") or SYSTEM_PROMPTS[0],
-            temperature=temperature,
-            print_stream=PRINT_STREAM,
-        )
-        completion = LLMCompletion(text=text, reasoning="", reasoning_source="empty")
-
-    text = completion.text
-    reasoning = completion.reasoning if settings.cot_enabled else ""
-    reasoning_source = completion.reasoning_source if settings.cot_enabled else "empty"
-    assistant_content = text if text.strip() else "(empty response)"
-    messages = list(state.get("messages") or [])
-    messages.append({"role": "assistant", "content": assistant_content})
-    return {
-        "raw_response": text,
-        "messages": messages,
-        "raw_reasoning": reasoning,
-        "reasoning_source": reasoning_source,
-    }
+    result = complete_chat(
+        messages=list(state.get("messages") or []),
+        system=state.get("system_prompt") or SYSTEM_PROMPTS[0],
+        temperature=temperature,
+        llm_options=get_knowledge_agent().llm_call_options(settings),
+        log_header=header,
+    )
+    return assistant_state_update(state, result, log_header=header)
 
 
 def extract(state: KnowledgeGraphState) -> dict[str, Any]:
@@ -292,12 +271,18 @@ def repair(state: KnowledgeGraphState) -> dict[str, Any]:
     """Append a critique-and-rewrite user message and bump repair_idx."""
     settings = get_settings()
     next_repair = int(state.get("repair_idx") or 0) + 1
-    repair_user = build_repair_prompt(
+    inner = build_repair_prompt(
         topic=_topic(state),
         answer=str(state.get("answer") or ""),
         gate_reasons=list(state.get("gate_reasons") or []),
         must_fix=list(state.get("judge_must_fix") or []),
         issues=list(state.get("judge_issues") or []),
+    )
+    repair_user = wrap_repair_user(
+        question=str(state.get("question") or ""),
+        inner=inner,
+        error_class="knowledge_quality",
+        dialect="knowledge",
     )
     messages = list(state.get("messages") or [])
     messages.append({"role": "user", "content": repair_user})
@@ -311,6 +296,7 @@ def repair(state: KnowledgeGraphState) -> dict[str, Any]:
     return {
         "repair_idx": next_repair,
         "messages": messages,
+        "system_prompt": repair_system_prompt("knowledge"),
         "raw_response": "",
         "gate_ok": False,
         "judge_pass": False,
@@ -441,11 +427,12 @@ def route_after_gate(
 ) -> Literal["judge", "repair", "next_candidate", "save_abandoned"]:
     """Route after the hard gate."""
     settings = get_settings()
+    cap = int(state.get("candidate_cap") or settings.knowledge_max_candidates)
     if state.get("gate_ok"):
         return "judge"
     if int(state.get("repair_idx") or 0) < settings.knowledge_max_repairs:
         return "repair"
-    if int(state.get("candidate_idx") or 1) < settings.knowledge_max_candidates:
+    if int(state.get("candidate_idx") or 1) < cap:
         return "next_candidate"
     return "save_abandoned"
 
@@ -455,13 +442,14 @@ def route_after_judge(
 ) -> Literal["cot", "repair", "next_candidate", "save_abandoned"]:
     """Route after the LLM judge. JSON failure abandons rather than saving."""
     settings = get_settings()
+    cap = int(state.get("candidate_cap") or settings.knowledge_max_candidates)
     if state.get("judge_unavailable"):
         return "save_abandoned"
     if state.get("judge_pass"):
         return "cot"
     if int(state.get("repair_idx") or 0) < settings.knowledge_max_repairs:
         return "repair"
-    if int(state.get("candidate_idx") or 1) < settings.knowledge_max_candidates:
+    if int(state.get("candidate_idx") or 1) < cap:
         return "next_candidate"
     return "save_abandoned"
 
@@ -470,7 +458,7 @@ def build_knowledge_graph():
     """Compile the per-question knowledge StateGraph."""
     builder = StateGraph(KnowledgeGraphState)
     builder.add_node("prepare", prepare)
-    builder.add_node("generate", generate, retry_policy=_retry_policy())
+    builder.add_node("generate", generate, retry_policy=retry_policy())
     builder.add_node("extract", extract)
     builder.add_node("gate", gate)
     builder.add_node("repair", repair)
@@ -515,5 +503,8 @@ def build_knowledge_graph():
 def knowledge_recursion_limit() -> int:
     """LangGraph superstep cap for knowledge candidates × repairs."""
     settings = get_settings()
-    per_candidate = (settings.knowledge_max_repairs + 1) * 3 + settings.knowledge_max_repairs + 6
-    return max(80, 10 + settings.knowledge_max_candidates * per_candidate)
+    return graph_recursion_limit(
+        max_candidates=settings.knowledge_max_candidates,
+        max_repairs=settings.knowledge_max_repairs,
+        extra_per_candidate=6,
+    )
