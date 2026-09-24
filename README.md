@@ -1,8 +1,8 @@
 # CUDA 算子 SFT 数据生成
 
-用 OpenRouter 上的大模型，为 `question.jsonl` 生成可 `nvcc -c` 编译的 CUDA 算子代码，写出 SFT jsonl。流程用 LangGraph 描述：生成 → 编译 → 失败则修正（每候选最多 3 次）→ 换候选（最多 3 个）→ 仍失败则放弃该题。
+用配置的 NVIDIA/OpenRouter 大模型，为 `question.jsonl` 生成可 `nvcc -c` 编译的 CUDA 算子代码，写出 SFT jsonl。流程用 LangGraph 描述：生成 → 编译/数值验证 → 失败则按难度修正（simple/medium/hard 为 1/2/3 次）→ 候选池收集（2/3/4 个）→ strict gate 后择优保存。
 
-判定只看编译是否通过，不跑测试、不比对数值。
+判定分三段：`nvcc -c` / import-JIT 编译门闩 → CPU reference 随机/对抗数值验证（`refval`）→ heuristic judge + 可选 semantic critic。题面宣称的 `include/solution_header.h` 在本仓库不存在，编译用空 stub，所以每个 kernel 的 host ABI 都是模型自己发明的——验证是「LLM 抽取 ABI + 生成参考实现 → 确定性 runner 执行 → 数值比对」，没有写死的 C++ harness 签名。
 
 ## 准备
 
@@ -31,6 +31,11 @@ bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 5. 没有 `g++` 时尝试 conda-forge `cxx-compiler`
 6. 对各方言做一次 smoke compile（可用 `--no-smoke` 跳过）
 
+TileLang 使用 `tilelang==0.1.14`（可兼容的较新版本也可），检查会同时验证
+`apache-tvm-ffi`、`torch-c-dlpack-ext`、`z3-solver` 等传递依赖、Torch CUDA 设备，
+并实际把 canonical `T.prim_func` lowering 到 CUDA。仅能 import 包不算通过；依赖、GPU
+或 lowering 不可用时会标记 `unavailable`，严格发布流程将样本留在 quarantine，不伪造 pass。
+
 **不会**自动安装 GPU 驱动；没有 `nvidia-smi` 时 Triton JIT 可能不可用。conda/pip 装不上 `nvcc` 时请自行安装 CUDA Toolkit。
 
 在 `.env` 填入对应 provider 的 key。可改的项：
@@ -48,7 +53,7 @@ bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 | `MAX_OUTPUT_TOKENS` | `50000` | 输出 token 上限，对应 API 的 `max_tokens` |
 | `MAX_TOKENS` | `50000` | 兼容别名；若未设 `MAX_OUTPUT_TOKENS` 则用它 |
 | `TOP_P` | `0.95` | NVIDIA Chat Completions 的 top_p |
-| `MAX_CANDIDATES` | `3` | 每题最多候选数 |
+| `MAX_CANDIDATES` | `3` | 每题最多候选数；`DIFFICULTY_AWARE` 可能按题目难度收紧 candidate pool |
 | `MAX_REPAIRS` | `3` | 每个候选最多修正次数 |
 | `WORKERS` | `1` | `WORKERS_PER_PROVIDER=0` 时的总进程数；nvidia worker 在多个 key 间轮询 |
 | `JUDGE_ENABLED` | `true` | 启用启发式代码质量评估（不过编译门闩） |
@@ -81,6 +86,12 @@ bash scripts/setup_env.sh --dialects cuda,cutlass,triton
 | `WORKERS_PER_PROVIDER` | `0` | 每个槽位的并发数；NVIDIA 每个 key 各算一个槽位。例如 3 个 NVIDIA key + openrouter、值为 2 → 6 个 nvidia + 2 个 openrouter |
 | `REPAIR_ERROR_MAX_CHARS` | `6000` | 修复轮 nvcc 日志上限；超过则去重摘要，不超过则全文 |
 | `WORK_KEEP` | `simple` | `simple`：每题 `work/q{id}/` 只留最后一份 `solution.cu`；`detailed`：保留全部 `c*/r*` 尝试 |
+| `REFVAL_ENABLED` | `true` | 编译通过后跑 CPU reference + GPU 数值比对；缺 nvcc/torch 则 skip，不阻塞保存 |
+| `REFVAL_TIMEOUT_SEC` | `45` | 单题验证硬限（含 GPU 锁等待）；超时走 repair |
+| `REFVAL_CASES` | `standard` | `smoke` / `standard` / `full` 对抗用例套件 |
+| `REFVAL_STRICT` | `true` | 严格训练发布要求 refval `pass`；设为 `false` 才允许 compile-only 探索 |
+| `REFVAL_MAX_ELEMENTS` | `4000000` | 大尺寸用例元素上限（3060 上毫秒级） |
+| `REFVAL_CACHE` | `true` | 按 question+code 缓存 ABI/reference 抽取 |
 | `CUDA_ARCH` | 空则自动探测 | 如 `sm_86` |
 | `GPU_NAME` | 空则自动探测 | 写入 prompt |
 
@@ -142,22 +153,74 @@ python run.py --workers 6 --limit 12 --quiet   # 并发试跑
 python run.py --dialects cutlass --limit 3
 ```
 
-每题同时写 CUDA + CUTLASS 4 + Triton（TileLang 未安装会自动跳过）：
+每题同时写 CUDA + CUTLASS 4 + Triton + TileLang（TileLang 工具链 unavailable 时会记录证据并跳过）：
 
 ```bash
 python run.py --dialects cuda,cutlass,triton --kernel-mode all --limit 3
 ```
 
+### 只做 compile-only 门闩
+
+默认 kernel 流程先执行 `nvcc -c`（或 Triton/TileLang 的 import-JIT 门闩），通过后才进入 `refval`。如果只想验证编译而不调用 reference runner，可关闭数值验证：
+
+```bash
+REFVAL_ENABLED=false REFVAL_STRICT=false python run.py --limit 3
+```
+
+`REFVAL_STRICT=true` 会把 ABI/reference 抽取错误、缺少工具链和数值验证 skip 都当作未发布样本：它们进入 quarantine/abandoned 记录，不会写入主 `sft.jsonl`。只有显式设为 `false` 才允许 compile-only 探索；此时 `metadata.refval.status` 仍会保留 `skip` 或 `reference_error`。`MAX_CANDIDATES` 是每题 candidate pool 的上限，`DIFFICULTY_AWARE=true` 会按 simple/medium/hard 使用 2/3/4 个候选。
+
+### 真实 provider live smoke
+
+真实 API 评测是独立、显式的命令，导入脚本或运行普通 pytest 不会发起调用。它读取当前 `.env` 的 `LLM_PROVIDER` 与 key，默认固定取 `question.jsonl` 前 10 题、每题最多 2 个候选、最多 20 次调用；输出只包含计数、响应长度、编译状态和脱敏错误类别：
+
+```bash
+python scripts/live_agent_eval.py --report data/live_agent_eval.json
+```
+
+先做最小连通性检查（1 题、1 次调用）：
+
+```bash
+python scripts/live_agent_eval.py --smoke --skip-compile
+```
+
+完整组件 smoke（仍受 `--max-calls` 硬上限约束）可调用 repair、semantic critic 与 CoT Agent；固定矩阵会把没有独立 oracle 的 refval 标为 `not_evaluated`，不会伪造通过：
+
+```bash
+python scripts/live_agent_eval.py --full --candidate-pool 1 --max-calls 20 --report data/live_agent_eval.json
+```
+
+真正的 GPU 数值验证仍由 `run.py` 的 refval runner 完成；live 脚本只在显式传入独立 manifest 时运行 refval。
+
+`--strict` 会在生成错误或 compile-only 失败时返回非零；`--skip-compile` 只统计 API 生成。不要把 `.env` 或 API 响应提交到仓库；可提交的评测摘要路径是 `data/live_agent_eval.json`（由 `--report` 显式写入）。
+
+### 跨方言 GPU 数值 Oracle
+
+跨方言验证使用同一 semantic contract、reference 和 `cases_hash`，分别在 CUDA、CUTLASS、Triton、TileLang 后端真实执行。它不会把 import/JIT 通过当作数值正确，也不会把缺少后端当作 pass：缺失或 lowering 失败会记录为 `unavailable`/quarantine。
+
+当前 canonical benchmark 支持 `elementwise_add`、`scale`、`row_sum`，并包含 good implementation 与 deliberate mutation（错误公式）对照。连续 tensor 的 smoke suite 已在本机 RTX 3060 上真实运行 CUDA、CUTLASS、Triton、TileLang；strided/broadcast 仍按 contract 的适用性单独计数：
+
+```bash
+python scripts/setup_env.py --check --dialects cuda,cutlass,triton,tilelang --no-smoke
+PYTHONPATH=src python scripts/cross_dialect_oracle.py \
+  --tasks elementwise_add \
+  --dialects cuda,cutlass,triton,tilelang \
+  --cases smoke --mutants \
+  --report data/cross_dialect_oracle.json
+```
+
+真实 RTX 3060 smoke 结果应满足：CUDA/CUTLASS/Triton/TileLang 的 add 正例通过，错误 mutation 被判定为 `numeric_mismatch`；每个后端共享同一 good `cases_hash`。TileLang 需要真实 CUDA lowering、launch 和 `torch.cuda.synchronize()`，仅安装包或源码 marker 不算验证通过。
+
 ## 输出
 
 | 文件 | 内容 |
 |---|---|
-| `data/sft.jsonl` | 生成归档（`messages` + `id`/`metadata`；`metadata.raw_reasoning` 为原始 thinking，`metadata.cot` 为整理结果） |
+| `data/sft.jsonl` | 生成归档（`messages` + `id`/`metadata`；包含 `task_spec`、`oracle_spec`、`quality_status`、候选池和 refval evidence；`metadata.raw_reasoning` 为原始 thinking，`metadata.cot` 为整理结果） |
 | `data/sft_ms_swift.jsonl` | **ms-swift SFT** 标准 `messages` 格式 |
 | `data/sft_openrlhf.jsonl` | **OpenRLHF SFT** 的 `input`/`output` 对话格式 |
-| `data/abandoned.jsonl` | 3 个候选都失败的题目和最后编译错误 |
+| `data/abandoned.jsonl` | 按难度候选池耗尽、strict refval 未通过或 agent 验证失败的题目与证据 |
 | `data/progress.jsonl` | 断点续跑 |
 | `data/run.log` | 当次运行日志（已有内容则追加 session 横幅，不覆盖历史编译诊断；多进程共用） |
+| `data/live_agent_eval.json` | 可选的 live-agent 脱敏统计（仅在 `scripts/live_agent_eval.py --report ...` 时写入） |
 | `work/` | kernel：`solution.cu` 或 `solution.py`；knowledge：`knowledge/{topic}/answer.md`。`simple` 只留最后一份，`detailed` 保留 `c*/r*` |
 
 默认 SFT assistant 是「整理后的 CoT + 抽取后的 CUDA 源码」：
@@ -217,11 +280,25 @@ deepspeed --module openrlhf.cli.train_sft \
 
 ```
 prepare → generate → extract → compile
-                         ├ compile ok → heuristic judge → critic? → cot → save_success
-                         ├ repair < N → Repairer（题面回灌 + 错误类）→ generate
+                         ├ compile ok → validate (ABI+CPU ref+GPU compare)
+                         │                 ├ pass/skip/reference_error → heuristic judge (+1 if pass) → critic? → cot → save
+                         │                 └ fail → repair / next_candidate / abandon（与编译失败同一梯子）
+                         ├ repair < N → Repairer（题面回灌 + error_class + 压缩证据）→ generate
                          ├ candidate < cap → next_candidate → generate
                          └ else → save_abandoned
 ```
+
+`extract` 期间用现有 `enqueue_speculative_repair` 异步池预取 ABI/reference（request id `q{id}_{dialect}_c{c}_r{r}_refval`），validate 命中则 0 额外等待。`WORKERS>1` 时 GPU 跑 harness 走 `work/.refval_gpu.lock`。产物：`work/q{id}/{dialect}/test/{harness.cu,manifest.json,cases.jsonl,refval.log}`；`metadata.refval` 写入 `data/sft.jsonl`。
+
+离线批量（现有 kernel，真跑 GPU）：
+
+```bash
+python run.py --refval-offline --refval-limit 20
+# 或
+python -m cuda_sft.refval --limit 20
+```
+
+计时 A/B：同一批题 `REFVAL_ENABLED=false` vs `true`，增量目标 +20%、上限 50%。固定 10 题：`python scripts/benchmark.py --run-id refval_v1 --pipeline cuda`。
 
 `KERNEL_MODE=all` 时在 CLI 层按方言展开 job（每题每种语言各跑一张 kernel 图），进度键是 `(id, dialect)`。知识题进度键是 `(id, knowledge:{topic})`，不会被方言展开。CUTLASS 方言钉 **CUTLASS 4.x + CuTe**。
 
@@ -250,10 +327,16 @@ flowchart TB
     K3 -->|fail 且候选未满 cap| K5["next_candidate<br/>换 prompt 变体与温度 0.2/0.5/0.8"]
     K5 --> K1
     K3 -->|fail 用尽| KX["save_abandoned"]
-    K3 -->|ok| K6["heuristic judge<br/>不过编译门闩"]
-    K6 --> K7["Semantic Critic<br/>adaptive：低分或 issues 才调用"]
+    K3 -->|ok| KV["validate: LLM ABI+CPU ref<br/>对抗用例 GPU 比对"]
+    KV -->|numeric fail| K4
+    KV -->|pass / compile-only| K6["heuristic judge<br/>verify 通过 +1 分"]
+    K6 --> K7["Semantic Critic<br/>GPU 结论当证据，不重复数值判断"]
     K7 -->|must_fix 且有 repair 额度| K4
-    K7 -->|否则| K8["CotAgent thinking=none<br/>方言/中英 heading"]
+    K7 -->|通过或未启用| KC["collect_candidate<br/>记录 compile/refval/critic/边界证据"]
+    KC -->|候选未满| K5
+    KC -->|候选已满| KS["select_best<br/>hard gate + soft rank"]
+    KS -->|winner| K8["CotAgent thinking=none<br/>方言/中英 heading"]
+    KS -->|无 strict winner| KX["quarantine / save_abandoned"]
     K8 --> K9["save_success"]
   end
 

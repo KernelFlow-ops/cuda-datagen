@@ -26,6 +26,7 @@ SAFE_ENV_KEYS = (
     "MAX_CANDIDATES", "MAX_REPAIRS", "COT_ENABLED", "COT_AGENT_ENABLED",
     "KNOWLEDGE_MAX_CANDIDATES", "KNOWLEDGE_MAX_REPAIRS",
     "JUDGE_ENABLED", "KNOWLEDGE_JUDGE_ENABLED", "KNOWLEDGE_MIN_SCORE",
+    "REFVAL_ENABLED", "REFVAL_TIMEOUT_SEC", "REFVAL_CASES", "REFVAL_STRICT",
     "KNOWLEDGE_FACTUAL_MIN", "LLM_TIMEOUT_SEC", "MAX_INPUT_TOKENS",
     "MAX_OUTPUT_TOKENS", "MAX_TOKENS", "NVCC_TIMEOUT_SEC", "KERNEL_DIALECT",
     "KERNEL_DIALECTS", "KERNEL_MODE", "TASK_MODE",
@@ -140,6 +141,86 @@ def _sanitize(value: Any, secrets: Sequence[str]) -> Any:
     if isinstance(value, list):
         return [_sanitize(item, secrets) for item in value]
     return value
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce an artifact value into JSON primitives for report fields."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _quality_fields(metadata: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
+    """Extract serializable judge/critic quality evidence from an artifact."""
+    judge = metadata.get("judge") or metadata.get("knowledge_judge")
+    critic = metadata.get("critic")
+    refval = metadata.get("refval")
+    if not isinstance(judge, dict):
+        judge = {}
+    if not isinstance(critic, dict):
+        critic = {}
+    if not isinstance(refval, dict):
+        refval = {}
+    score = judge.get("quality_score", metadata.get("judge_score"))
+    # Critic status was added after the original store schema. Infer it for
+    # old rows so reports remain comparable across benchmark runs.
+    critic_status = critic.get("status")
+    if not critic_status:
+        if critic.get("skipped"):
+            critic_status = "skipped"
+        elif any(str(item).startswith(("critic_error:", "critic_invalid_response"))
+                 for item in critic.get("issues") or []):
+            critic_status = "unverified"
+        elif critic:
+            critic_status = "verified" if critic.get("passed") else "failed"
+    return _json_safe({
+        "judge_score": score,
+        "judge": judge,
+        "critic": critic,
+        "critic_status": critic_status,
+        "refval": refval,
+        "verified": critic_status not in {"unverified"},
+        "source": "sft_metadata" if metadata else "progress_or_abandoned",
+    })
+
+
+def _failure_fields(
+    *,
+    status: str,
+    error_category: str | None,
+    error: Any,
+    quality: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return a structured failure record while retaining the raw message."""
+    critic_status = quality.get("critic_status")
+    refval = quality.get("refval") if isinstance(quality.get("refval"), dict) else {}
+    refval_status = str(refval.get("status") or "").lower()
+    if critic_status == "unverified":
+        return {
+            "kind": "critic_unverified",
+            "category": "quality_gate",
+            "message": "semantic critic did not return a verifiable result",
+        }
+    if critic_status == "failed":
+        return {
+            "kind": "critic_rejected",
+            "category": "quality_gate",
+            "message": "semantic critic reported blocking issues",
+        }
+    if refval_status in {"fail", "reference_error"}:
+        return {
+            "kind": "refval_" + refval_status,
+            "category": "quality_gate",
+            "message": str(refval.get("reason") or refval.get("evidence") or ""),
+        }
+    if status in {"abandoned", "crashed", "incomplete"} or error_category:
+        return {
+            "kind": error_category or status,
+            "category": error_category or status,
+            "message": str(error or ""),
+        }
+    return None
 
 
 def pipeline_dir(module: str, pipeline: str, run_id: str) -> Path:
@@ -316,6 +397,8 @@ def collect_pipeline(module: str, pipeline: str, run_id: str) -> dict[str, Any]:
             status = "incomplete"
         detail = abandoned_by_id.get(qid, {}) if status == "abandoned" else sample_by_id.get(qid, {})
         sample_meta = detail.get("metadata") or {}
+        if not isinstance(sample_meta, dict):
+            sample_meta = {}
         error = detail.get("last_error") or detail.get("reason")
         if isinstance(error, str):
             error = _redact(error, secrets)
@@ -329,6 +412,13 @@ def collect_pipeline(module: str, pipeline: str, run_id: str) -> dict[str, Any]:
         else:
             error_category = ("process_crash" if status == "crashed" else
                               "missing_terminal_artifact" if status == "incomplete" else None)
+        quality = _quality_fields(sample_meta, detail)
+        failure = _failure_fields(
+            status=status,
+            error_category=error_category,
+            error=error,
+            quality=quality,
+        )
         jobs.append({
             "id": qid, "status": status,
             "candidate": (row or {}).get("candidate", sample_meta.get("candidate")),
@@ -337,6 +427,10 @@ def collect_pipeline(module: str, pipeline: str, run_id: str) -> dict[str, Any]:
             "error_category": error_category,
             "judge_score": sample_meta.get("judge_score"),
             "judge": sample_meta.get("knowledge_judge") or sample_meta.get("judge"),
+            # Keep the legacy flat judge fields above and add structured,
+            # JSON-safe quality/failure records for downstream analysis.
+            "quality": quality,
+            "failure": failure,
             "model": sample_meta.get("model"),
             "provider": sample_meta.get("provider") or log_metrics.get(qid, {}).get("provider"),
             "provider_unavailable_reason": None if log_metrics.get(qid, {}).get("provider") else

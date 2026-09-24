@@ -51,6 +51,19 @@ class ExtractTests(unittest.TestCase):
         self.assertTrue(looks_like_cutlass("cute::Tensor t; __global__ void k() {}"))
 
 
+class RefvalSpecTests(unittest.TestCase):
+    def test_every_dialect_exposes_refval_spec(self) -> None:
+        from cuda_sft.config import Settings
+        from cuda_sft.dialects.agent import KernelDialectAgent
+
+        settings = Settings(async_llm_enabled=False)
+        agent = KernelDialectAgent()
+        for name in ("cuda", "cutlass", "triton", "tilelang"):
+            spec = agent.spec(name).refval_spec(settings)
+            self.assertEqual(spec.dialect, name)
+            self.assertIn(spec.runner, {"nvcc_link", "python_import"})
+
+
 class AgentExpandTests(unittest.TestCase):
     def test_all_mode_expands(self) -> None:
         agent = KernelDialectAgent()

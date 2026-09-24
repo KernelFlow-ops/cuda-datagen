@@ -8,8 +8,12 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
 
-import anthropic
-from anthropic import Anthropic
+try:
+    import anthropic
+    from anthropic import Anthropic
+except ImportError:  # OpenAI/NVIDIA-only installs must still import this module.
+    anthropic = None  # type: ignore[assignment]
+    Anthropic = None  # type: ignore[assignment,misc]
 
 from cuda_sft.config import Settings, get_settings
 from cuda_sft.parse import extract_thinking, strip_thinking
@@ -120,6 +124,18 @@ def _openai_retryable_types() -> tuple[type[BaseException], ...]:
     return tuple(types)
 
 
+def _anthropic_error_types(*names: str) -> tuple[type[BaseException], ...]:
+    """Return Anthropic SDK exception classes when the optional SDK is installed."""
+    if anthropic is None:
+        return ()
+    types: list[type[BaseException]] = []
+    for name in names:
+        cls = getattr(anthropic, name, None)
+        if isinstance(cls, type):
+            types.append(cls)
+    return tuple(types)
+
+
 def affordable_max_tokens(exc: BaseException, current: int) -> int | None:
     """Return a smaller ``max_tokens`` when OpenRouter 402 blames the budget.
 
@@ -159,17 +175,18 @@ def is_retryable_llm_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, LLMError):
         return True
-    if isinstance(
+    if _anthropic_error_types(
+        "APIConnectionError", "APITimeoutError", "RateLimitError", "InternalServerError"
+    ) and isinstance(
         exc,
-        (
-            anthropic.APIConnectionError,
-            anthropic.APITimeoutError,
-            anthropic.RateLimitError,
-            anthropic.InternalServerError,
+        _anthropic_error_types(
+            "APIConnectionError", "APITimeoutError", "RateLimitError", "InternalServerError"
         ),
     ):
         return True
-    if isinstance(exc, anthropic.APIStatusError):
+    if _anthropic_error_types("APIStatusError") and isinstance(
+        exc, _anthropic_error_types("APIStatusError")
+    ):
         status = getattr(exc, "status_code", None)
         if status in RETRYABLE_STATUS:
             return True
@@ -443,6 +460,11 @@ class AnthropicOpenRouterClient:
             raise LLMError(
                 "OPENROUTER_API_KEY is empty. Put the key in .env before generating."
             )
+        if Anthropic is None:
+            raise LLMError(
+                "anthropic package is required for LLM_PROVIDER=openrouter; "
+                "install requirements.txt or use LLM_PROVIDER=nvidia"
+            )
         self._client = Anthropic(
             api_key=self.settings.openrouter_api_key,
             base_url=self.settings.openrouter_base_url,
@@ -546,10 +568,8 @@ class AnthropicOpenRouterClient:
                             if print_stream:
                                 print(chunk, end="", file=sys.stdout, flush=True)
                     final = stream.get_final_message()
-            except (
-                anthropic.APIStatusError,
-                anthropic.APIConnectionError,
-                anthropic.APITimeoutError,
+            except _anthropic_error_types(
+                "APIStatusError", "APIConnectionError", "APITimeoutError"
             ) as exc:
                 last_exc = exc
                 nxt = affordable_max_tokens(exc, max_tokens)

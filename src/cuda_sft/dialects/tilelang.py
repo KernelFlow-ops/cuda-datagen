@@ -11,6 +11,7 @@ from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source
 from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
 from cuda_sft.prompts.selection import language_matched_index, stable_index
+from cuda_sft.refval.spec import DialectRefvalSpec
 
 SYSTEM_PROMPTS = (
     (
@@ -102,7 +103,21 @@ class TileLangDialect:
             import tilelang  # noqa: F401
         except ImportError:
             return False, "tilelang package is not installed"
-        return True, ""
+        missing = []
+        for dep in ("tvm_ffi", "torch_c_dlpack_ext", "z3"):
+            try:
+                __import__(dep)
+            except ImportError:
+                missing.append(dep)
+        if missing:
+            return False, "tilelang transitive dependencies missing: " + ", ".join(missing)
+        try:
+            import torch
+        except ImportError:
+            return False, "unavailable: torch is not installed"
+        if not torch.cuda.is_available():
+            return False, "unavailable: torch.cuda.is_available() is false"
+        return True, f"tilelang {getattr(tilelang, '__version__', '?')} + CUDA device"
 
     def extract(self, text: str) -> str:
         return extract_fenced_source(
@@ -185,3 +200,22 @@ class TileLangDialect:
 
     def cot_skeleton(self) -> str:
         return COT_SKELETON
+
+    def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
+        """Import ``solution.py``; factory(N) then kernel(tensors) is allowed."""
+        return DialectRefvalSpec(
+            dialect="tilelang",
+            language="python",
+            runner="python_import",
+            source_filename=self.source_filename,
+            needs_nvcc=False,
+            needs_torch=True,
+            timeout_sec=int(getattr(settings, "tilelang_timeout_sec", 180) or 180),
+            host_entry_hint=(
+                "TileLang host entry call_style is one of eager, lazy, or "
+                "primfunc_factory: eager JIT accepts torch CUDA tensors; lazy and "
+                "PrimFunc factories accept sizes, then return/invoke a compiled "
+                "kernel. Driver must launch with Torch CUDA tensors and call "
+                "torch.cuda.synchronize(). No import-time run."
+            ),
+        )

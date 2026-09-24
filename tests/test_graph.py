@@ -8,7 +8,13 @@ from unittest.mock import patch
 from cuda_sft.agents.contracts import GenerateResult
 from cuda_sft.agents.generate import assistant_state_update, complete_chat
 from cuda_sft.config import Settings
-from cuda_sft.graph import route_after_compile, route_after_repair
+from cuda_sft.graph import (
+    route_after_collect,
+    route_after_compile,
+    route_after_repair,
+    route_after_validate,
+    select_best,
+)
 from cuda_sft.knowledge.graph import route_after_gate, route_after_judge
 from cuda_sft.llm import LLMCompletion
 from cuda_sft.pipeline.common import graph_recursion_limit, print_stream_enabled, set_print_stream
@@ -29,10 +35,57 @@ def _settings(**kwargs: object) -> Settings:
 
 
 class KernelRouteTests(unittest.TestCase):
-    def test_compile_ok_goes_to_judge(self) -> None:
+    def test_candidate_pool_continues_until_cap(self) -> None:
+        with patch("cuda_sft.graph.get_settings", return_value=_settings()):
+            self.assertEqual(
+                route_after_collect({"candidate_idx": 1, "candidate_cap": 3}),
+                "next_candidate",
+            )
+            self.assertEqual(
+                route_after_collect({"candidate_idx": 3, "candidate_cap": 3}),
+                "select_best",
+            )
+
+    def test_selector_prefers_numeric_pass_and_preserves_code(self) -> None:
+        with patch("cuda_sft.graph.get_settings", return_value=_settings(refval_strict=True)):
+            result = select_best(
+                {
+                    "candidate_reports": [
+                        {
+                            "candidate": 1,
+                            "code": "bad-but-compiled",
+                            "compile_ok": True,
+                            "refval_ok": True,
+                            "refval": "skip",
+                            "judge_score": 10,
+                        },
+                        {
+                            "candidate": 2,
+                            "code": "validated-source",
+                            "compile_ok": True,
+                            "refval_ok": True,
+                            "refval": "pass",
+                            "judge_score": 8,
+                        },
+                    ],
+                    "quality_status": {},
+                    "metadata": {},
+                }
+            )
+        self.assertTrue(result["winner_found"])
+        self.assertEqual(result["candidate_idx"], 2)
+        self.assertEqual(result["code"], "validated-source")
+    def test_compile_ok_goes_to_validate(self) -> None:
         with patch("cuda_sft.graph.get_settings", return_value=_settings()):
             self.assertEqual(
                 route_after_compile({"compile_ok": True, "repair_idx": 0, "candidate_idx": 1}),
+                "validate",
+            )
+
+    def test_validate_ok_goes_to_judge(self) -> None:
+        with patch("cuda_sft.graph.get_settings", return_value=_settings()):
+            self.assertEqual(
+                route_after_validate({"refval_ok": True, "repair_idx": 0, "candidate_idx": 1}),
                 "judge",
             )
 

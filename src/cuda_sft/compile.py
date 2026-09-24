@@ -361,6 +361,8 @@ def finalize_question_work(
         (qdir / out_name).write_text(code, encoding="utf-8")
     for child in list(qdir.iterdir()):
         name = child.name
+        if child.is_dir() and name == "test":
+            continue
         if child.is_dir() and (name.startswith("c") or name == "include"):
             shutil.rmtree(child, ignore_errors=True)
         elif name in {"helpers.h", "solution_header.h", "solution.o"}:

@@ -239,6 +239,15 @@ class Settings(BaseSettings):
     triton_timeout_sec: int = Field(default=90, ge=5)
     tilelang_timeout_sec: int = Field(default=180, ge=10)
 
+    refval_enabled: bool = Field(default=True)
+    refval_timeout_sec: int = Field(default=45, ge=5)
+    refval_cases: str = Field(default="standard")
+    # A training release must have executable numeric evidence.  Set
+    # REFVAL_STRICT=false explicitly for compile-only exploration.
+    refval_strict: bool = Field(default=True)
+    refval_max_elements: int = Field(default=4_000_000, ge=1024)
+    refval_cache: bool = Field(default=True)
+
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
     cuda_home: str = Field(default="")
@@ -355,6 +364,22 @@ class Settings(BaseSettings):
         name = aliases.get(name, name)
         if name not in {"retry", "abandon"}:
             raise ValueError("KNOWLEDGE_ON_JUDGE_FAIL must be 'retry' or 'abandon'")
+        return name
+
+    @field_validator("refval_cases")
+    @classmethod
+    def _normalize_refval_cases(cls, value: str) -> str:
+        """Map aliases to ``smoke`` / ``standard`` / ``full``."""
+        name = (value or "standard").strip().lower()
+        aliases = {
+            "fast": "smoke",
+            "quick": "smoke",
+            "default": "standard",
+            "all": "full",
+        }
+        name = aliases.get(name, name)
+        if name not in {"smoke", "standard", "full"}:
+            raise ValueError("REFVAL_CASES must be 'smoke', 'standard', or 'full'")
         return name
 
     @field_validator("cutlass_cxx_std")

@@ -11,6 +11,7 @@ from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source
 from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
 from cuda_sft.prompts.selection import language_matched_index, stable_index
+from cuda_sft.refval.spec import DialectRefvalSpec
 
 SYSTEM_PROMPTS = (
     (
@@ -96,10 +97,12 @@ def looks_like_triton(source: str) -> bool:
 
 
 class TritonDialect:
-    """Python Triton kernels gated by parse + import (no numeric tests).
+    """Python Triton kernels gated by parse + import and strict CUDA refval.
 
     Implements :class:`~cuda_sft.dialects.base.DialectSpec`. ``available()``
-    is False when the ``triton`` package is missing.
+    is False when the ``triton`` package is missing. Numeric validation is
+    performed by the shared Python driver with CUDA tensors and an explicit
+    frozen ABI call style; import-time launches remain forbidden.
     """
 
     name = "triton"
@@ -220,3 +223,22 @@ class TritonDialect:
 
     def cot_skeleton(self) -> str:
         return COT_SKELETON
+
+    def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
+        """Import ``solution.py`` and call the host launcher with torch CUDA tensors."""
+        return DialectRefvalSpec(
+            dialect="triton",
+            language="python",
+            runner="python_import",
+            source_filename=self.source_filename,
+            needs_nvcc=False,
+            needs_torch=True,
+            timeout_sec=int(getattr(settings, "triton_timeout_sec", 90) or 90),
+            host_entry_hint=(
+                "Python host launcher with the frozen ABI parameter order and "
+                "call_style (positional or kwargs). Every tensor argument must "
+                "be a torch CUDA tensor with the manifest dtype/shape/stride; "
+                "outputs are preallocated and mutated in place. Do not launch "
+                "at import time or guess a factory call after TypeError."
+            ),
+        )

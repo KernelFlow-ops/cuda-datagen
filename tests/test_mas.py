@@ -37,14 +37,14 @@ class DifficultyTests(unittest.TestCase):
     def test_gemm_is_hard(self) -> None:
         self.assertEqual(kernel_difficulty("Write a tiled GEMM kernel"), "hard")
 
-    def test_simple_skips_critic_but_keeps_candidate_budget(self) -> None:
+    def test_simple_skips_critic_and_uses_small_candidate_budget(self) -> None:
         plan = plan_topology(
             question="elementwise relu",
             kind="kernel",
             settings=_settings(),
         )
         self.assertEqual(plan.difficulty, "simple")
-        self.assertEqual(plan.max_candidates, 3)
+        self.assertEqual(plan.max_candidates, 2)
         self.assertFalse(plan.use_critic)
 
     def test_flag_off_keeps_full_budget(self) -> None:
@@ -72,11 +72,11 @@ class CriticTriggerTests(unittest.TestCase):
 
 
 class CriticRouteTests(unittest.TestCase):
-    def test_pass_goes_to_cot(self) -> None:
+    def test_pass_goes_to_candidate_pool(self) -> None:
         with patch("cuda_sft.graph.get_settings", return_value=_settings()):
             self.assertEqual(
                 route_after_critic({"critic_pass": True, "critic_must_fix": [], "repair_idx": 0}),
-                "cot",
+                "collect_candidate",
             )
 
     def test_must_fix_repairs_when_budget_left(self) -> None:

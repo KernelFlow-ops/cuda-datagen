@@ -11,6 +11,7 @@ from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source, looks_like_cuda
 from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
 from cuda_sft.prompts.selection import language_matched_index, stable_index
+from cuda_sft.refval.spec import DialectRefvalSpec
 
 CUTLASS_MAJOR_RE = re.compile(r"#define\s+CUTLASS_MAJOR\s+(\d+)")
 
@@ -305,3 +306,22 @@ class CutlassDialect:
 
     def cot_skeleton(self) -> str:
         return COT_SKELETON
+
+    def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
+        """CUTLASS 4.x uses the CUDA nvcc-link path plus extra include dirs."""
+        includes = tuple(cutlass_include_dirs(settings))
+        return DialectRefvalSpec(
+            dialect="cutlass",
+            language="cuda-cpp",
+            runner="nvcc_link",
+            source_filename=self.source_filename,
+            extra_includes=includes,
+            cxx_std=settings.cutlass_cxx_std or "c++17",
+            needs_nvcc=True,
+            needs_torch=False,
+            timeout_sec=int(getattr(settings, "refval_timeout_sec", 45) or 45),
+            host_entry_hint=(
+                "CUTLASS/CuTe host launcher; Ampere only. Device pointers unless "
+                "the function allocates. Do not emit main()."
+            ),
+        )

@@ -13,6 +13,7 @@ from cuda_sft.prompt import (
     build_repair_prompt,
     select_prompts,
 )
+from cuda_sft.refval.spec import DialectRefvalSpec
 
 COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry, success criteria.
 2. Algorithm — formula, reduction/scan/gemm pattern, numerical notes.
@@ -138,3 +139,22 @@ class CudaDialect:
     def cot_skeleton(self) -> str:
         """Six English headings; Chinese problems swap in ``COT_SKELETON_ZH``."""
         return COT_SKELETON
+
+    def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
+        """nvcc-link harness: ``#include solution.cu`` + generated ``main``."""
+        return DialectRefvalSpec(
+            dialect="cuda",
+            language="cuda-cpp",
+            runner="nvcc_link",
+            source_filename=self.source_filename,
+            extra_includes=(),
+            cxx_std="c++17",
+            needs_nvcc=True,
+            needs_torch=False,
+            timeout_sec=int(getattr(settings, "refval_timeout_sec", 45) or 45),
+            host_entry_hint=(
+                "Host launcher typically takes device pointers already allocated "
+                "by the caller (cudaMalloc). Do not emit main(). Pointer params "
+                "are memory=device unless the function cudaMallocs internally."
+            ),
+        )

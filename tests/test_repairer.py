@@ -46,6 +46,17 @@ class WrapRepairTests(unittest.TestCase):
         self.assertIn("error_class: undeclared", text)
         self.assertIn("nvcc failed", text)
 
+    def test_wrap_includes_evidence(self) -> None:
+        text = wrap_repair_user(
+            question="Write vector add",
+            inner="nvcc failed",
+            error_class="numeric_mismatch",
+            dialect="cuda",
+            evidence="case=odd_7 max_abs=1.0",
+        )
+        self.assertIn("case=odd_7", text)
+        self.assertIn("error_class: numeric_mismatch", text)
+
 
 class LanguageMatchTests(unittest.TestCase):
     def test_chinese_question_gets_chinese_system(self) -> None:
@@ -95,6 +106,7 @@ class StoreUserTests(unittest.TestCase):
                 cot_enabled=False,
                 sft_user_is_raw_question=True,
                 async_llm_enabled=False,
+                refval_strict=False,
             )
             with patch("cuda_sft.store.get_settings", return_value=settings):
                 store.write_success(state, model_name="m")  # type: ignore[arg-type]
@@ -127,6 +139,7 @@ class StoreUserTests(unittest.TestCase):
                 cot_enabled=False,
                 sft_user_is_raw_question=True,
                 async_llm_enabled=False,
+                refval_strict=False,
             )
             with patch("cuda_sft.store.get_settings", return_value=settings):
                 store.write_success(state, model_name="m")  # type: ignore[arg-type]
@@ -134,6 +147,43 @@ class StoreUserTests(unittest.TestCase):
             self.assertTrue(row["metadata"]["critic"]["skipped"])
             self.assertEqual(row["metadata"]["difficulty"], "simple")
             self.assertEqual(row["metadata"]["candidate_cap"], 1)
+
+    def test_refval_metadata_is_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            state = {
+                "kind": "kernel",
+                "question_id": 3,
+                "question": "add",
+                "user_prompt": "add\n\nnvcc -c",
+                "code": "__global__ void k() {}\n",
+                "system_prompt": "sys",
+                "candidate_idx": 1,
+                "repair_idx": 0,
+                "dialect": "cuda",
+                "metadata": {
+                    "refval": {
+                        "status": "pass",
+                        "dialect": "cuda",
+                        "cases_run": 4,
+                        "failed_case": "",
+                        "tolerances": {"f32": {"atol": 1e-4, "rtol": 1e-3}},
+                        "manifest_summary": {"entry": "launch_add"},
+                        "seed": 1,
+                    }
+                },
+            }
+            settings = Settings(
+                cot_enabled=False,
+                sft_user_is_raw_question=True,
+                async_llm_enabled=False,
+                refval_strict=False,
+            )
+            with patch("cuda_sft.store.get_settings", return_value=settings):
+                store.write_success(state, model_name="m")  # type: ignore[arg-type]
+            row = json.loads(store.sft_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["metadata"]["refval"]["status"], "pass")
+            self.assertEqual(row["metadata"]["refval"]["cases_run"], 4)
 
 
 if __name__ == "__main__":

@@ -142,6 +142,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="kernel (default, compile gate), knowledge (rubric gate), or auto",
     )
     parser.add_argument(
+        "--no-refval",
+        action="store_true",
+        help="disable CPU-reference GPU numeric validation (compile gate only)",
+    )
+    parser.add_argument(
+        "--refval-offline",
+        action="store_true",
+        help="batch-validate existing work/**/solution.cu|.py (no generation)",
+    )
+    parser.add_argument(
+        "--refval-limit",
+        type=int,
+        default=None,
+        help="with --refval-offline: max kernels to validate",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="logging level (default: INFO)",
@@ -293,6 +309,9 @@ def _apply_kernel_cli(args: argparse.Namespace) -> None:
     if getattr(args, "task", None):
         os.environ["TASK_MODE"] = args.task
         changed = True
+    if getattr(args, "no_refval", False):
+        os.environ["REFVAL_ENABLED"] = "false"
+        changed = True
     if changed:
         get_settings.cache_clear()
 
@@ -356,6 +375,40 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_compile:
         _configure_logging(args.log_level)
         return run_dry_compile()
+
+    if getattr(args, "refval_offline", False):
+        from cuda_sft.refval.runner import run_offline
+        from cuda_sft.store import iter_questions
+
+        _configure_logging(args.log_level)
+        questions_path = Path(args.input) if args.input else Path(settings.questions_path)
+        if not questions_path.is_absolute():
+            questions_path = PROJECT_ROOT / questions_path
+        qmap = {}
+        if questions_path.exists():
+            qmap = {qid: text for qid, text in iter_questions(questions_path)}
+        reports = run_offline(
+            work_root=settings.work_path,
+            settings=settings,
+            limit=getattr(args, "refval_limit", None),
+            questions=qmap,
+        )
+        n = len(reports)
+        n_pass = sum(1 for r in reports if r.status == "pass")
+        n_fail = sum(1 for r in reports if r.status == "fail")
+        n_skip = sum(1 for r in reports if r.status == "skip")
+        n_ref = sum(1 for r in reports if r.status == "reference_error")
+        n_sig = sum(1 for r in reports if r.error_class == "signature_mismatch")
+        print(
+            f"refval-offline n={n} pass={n_pass} fail={n_fail} skip={n_skip} "
+            f"reference_error={n_ref} signature_mismatch={n_sig}"
+        )
+        if n and (n_ref + n_sig) / n > 0.20:
+            print(
+                "WARNING: reference_error+signature_mismatch > 20%; retune extract prompt",
+                file=sys.stderr,
+            )
+        return 0 if n_fail == 0 else 1
 
     if args.export_sft:
         _configure_logging(args.log_level)
@@ -441,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         f"task_mode={settings.task_mode} "
         f"dialects={dialect_label} "
         f"kernel_mode={settings.kernel_mode} "
+        f"refval={settings.refval_enabled}/{settings.refval_cases} "
         f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
         f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
     )
@@ -507,6 +561,25 @@ def run_job_list(
     for index, raw_job in enumerate(iterable, start=1):
         job = coerce_job(raw_job)
         qid = job.question_id
+        # Preserve the dialect group context even though LangGraph executes
+        # one backend job at a time.  The cross-dialect oracle and downstream
+        # reports use these fields to distinguish an unavailable backend from
+        # a backend that was never requested.
+        settings_for_group = get_settings()
+        requested_dialects = get_dialect_agent().requested_names(settings_for_group)
+        available_dialects: list[str] = []
+        for requested in requested_dialects:
+            try:
+                ok, _reason = get_dialect_agent().spec(requested).available(settings_for_group)
+            except Exception:
+                ok = False
+            if ok:
+                available_dialects.append(requested)
+        group_metadata = {
+            "requested_dialects": requested_dialects,
+            "available_dialects": available_dialects,
+            "group_id": f"q{qid}:{job.question_id}",
+        }
         if job.kind == "knowledge":
             if knowledge_app is None:
                 from cuda_sft.knowledge.graph import (
@@ -524,6 +597,8 @@ def run_job_list(
                 "kind": "knowledge",
                 "topic": job.topic,
                 "track": job.track,
+                "input_metadata": {**dict(job.extras), **group_metadata},
+                "source": job.source,
                 "status": "running",
             }
             label = f"kind=knowledge topic={job.topic}"
@@ -537,6 +612,8 @@ def run_job_list(
                 "question": job.question,
                 "dialect": job.track,
                 "kind": "kernel",
+                "input_metadata": {**dict(job.extras), **group_metadata},
+                "source": job.source,
                 "status": "running",
             }
             label = f"kind=kernel dialect={job.track}"

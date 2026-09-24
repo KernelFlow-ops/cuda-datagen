@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -172,32 +174,65 @@ def resolve_export_assistant(row: dict[str, Any], *, cot_in_assistant: bool) -> 
     return (code or assistant).strip() + ("\n" if (code or assistant).strip() else "")
 
 
-def export_training_files(src: Path, data_dir: Path) -> tuple[int, Path, Path]:
-    """Rewrite framework-specific jsonl from the generation archive."""
+def export_training_files(
+    src: Path,
+    data_dir: Path,
+    *,
+    cot_in_assistant: bool | None = None,
+) -> tuple[int, Path, Path]:
+    """Atomically rebuild framework exports from canonical ``sft.jsonl``.
+
+    The archive is the source of truth. Both derived files are written to
+    temporary files, flushed, and replaced only after the full archive was
+    converted. A crash can therefore leave an older complete export, never a
+    partially rewritten JSONL file; the next store commit rebuilds it again.
+    """
     data_dir.mkdir(parents=True, exist_ok=True)
     swift_path = data_dir / "sft_ms_swift.jsonl"
     openrlhf_path = data_dir / "sft_openrlhf.jsonl"
-    cot_in_assistant = bool(get_settings().cot_in_assistant)
+    if cot_in_assistant is None:
+        cot_in_assistant = bool(get_settings().cot_in_assistant)
     count = 0
-    with swift_path.open("w", encoding="utf-8") as swift_f, openrlhf_path.open(
-        "w", encoding="utf-8"
-    ) as orl_f:
-        for row in iter_sft_rows(src):
-            pair = split_user_assistant(row)
-            if pair is None:
-                continue
-            user, _assistant = pair
-            assistant = resolve_export_assistant(row, cot_in_assistant=cot_in_assistant)
-            if not assistant.strip():
-                continue
-            system = extract_system(row)
-            swift_f.write(
-                json.dumps(to_ms_swift(user, assistant, system=system), ensure_ascii=False)
-                + "\n"
-            )
-            orl_f.write(
-                json.dumps(to_openrlhf(user, assistant, system=system), ensure_ascii=False)
-                + "\n"
-            )
-            count += 1
+    swift_tmp = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=data_dir, prefix=".sft_ms_swift.",
+        suffix=".tmp", delete=False,
+    )
+    orl_tmp = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=data_dir, prefix=".sft_openrlhf.",
+        suffix=".tmp", delete=False,
+    )
+    try:
+        with swift_tmp as swift_f, orl_tmp as orl_f:
+            for row in iter_sft_rows(src):
+                pair = split_user_assistant(row)
+                if pair is None:
+                    continue
+                user, _assistant = pair
+                assistant = resolve_export_assistant(
+                    row, cot_in_assistant=bool(cot_in_assistant)
+                )
+                if not assistant.strip():
+                    continue
+                system = extract_system(row)
+                swift_f.write(
+                    json.dumps(to_ms_swift(user, assistant, system=system), ensure_ascii=False)
+                    + "\n"
+                )
+                orl_f.write(
+                    json.dumps(to_openrlhf(user, assistant, system=system), ensure_ascii=False)
+                    + "\n"
+                )
+                count += 1
+            swift_f.flush()
+            orl_f.flush()
+            os.fsync(swift_f.fileno())
+            os.fsync(orl_f.fileno())
+        os.replace(swift_tmp.name, swift_path)
+        os.replace(orl_tmp.name, openrlhf_path)
+    finally:
+        for temporary in (Path(swift_tmp.name), Path(orl_tmp.name)):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     return count, swift_path, openrlhf_path

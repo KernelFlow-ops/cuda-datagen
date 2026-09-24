@@ -8,6 +8,7 @@ from cuda_sft.compile import CompileResult
 from cuda_sft.config import Settings
 from cuda_sft.judge import JudgeResult
 from cuda_sft.prompt import SelectedPrompts
+from cuda_sft.refval.spec import DialectRefvalSpec
 
 DIALECT_ALIASES = {
     "cu": "cuda",
@@ -105,4 +106,8 @@ class DialectSpec(Protocol):
 
     def cot_skeleton(self) -> str:
         """Six-heading CoT outline for the editor agent."""
+        ...
+
+    def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
+        """Numeric-validation recipe (CUDA link vs Python import)."""
         ...

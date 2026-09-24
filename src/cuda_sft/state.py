@@ -27,6 +27,7 @@ class GraphState(TypedDict, total=False):
     messages: list[dict[str, str]]
     candidate_idx: int
     repair_idx: int
+    repair_cap: int
     temperature: float
     raw_response: str
     code: str
@@ -58,4 +59,16 @@ class GraphState(TypedDict, total=False):
     critic_skipped: bool
     critic_must_fix: list[str]
     critic_issues: list[str]
-
+    # Stable task/oracle contracts and audit fields.  ``total=False`` keeps
+    # these optional for legacy graph states loaded from older progress files.
+    task_spec: dict[str, Any]
+    oracle_spec: dict[str, Any]
+    quality_status: dict[str, Any]
+    provenance: dict[str, Any]
+    candidate_reports: list[dict[str, Any]]
+    input_metadata: dict[str, Any]
+    source: str
+    refval_ok: bool
+    refval_status: str
+    refval_error: str
+    refval_error_class: str

@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -372,20 +373,50 @@ def check_triton() -> CheckRow:
 
 
 def check_tilelang() -> CheckRow:
-    """Python TileLang package."""
+    """TileLang package, transitive dependencies, and a real CUDA lowering."""
     spec = importlib.util.find_spec("tilelang")
     if spec is None:
         return CheckRow("tilelang", False, "package not installed", "pip")
     try:
         import tilelang
         import tilelang.language as T
+        import torch
 
         ver = getattr(tilelang, "__version__", "?")
         if not hasattr(T, "prim_func"):
-            return CheckRow("tilelang", False, f"{ver} missing T.prim_func", "pip")
-        return CheckRow("tilelang", True, f"tilelang {ver}", "ok")
-    except ImportError as exc:
-        return CheckRow("tilelang", False, str(exc), "pip")
+            return CheckRow("tilelang", False, f"{ver} missing T.prim_func", "unavailable")
+        missing = [
+            name for name in ("tvm_ffi", "torch_c_dlpack_ext", "z3")
+            if importlib.util.find_spec(name) is None
+        ]
+        if missing:
+            return CheckRow(
+                "tilelang", False,
+                f"tilelang {ver} missing transitive dependencies: {', '.join(missing)}",
+                "pip",
+            )
+        if not torch.cuda.is_available():
+            return CheckRow(
+                "tilelang", False,
+                f"tilelang {ver} imported; unavailable: torch CUDA device is not available",
+                "unavailable",
+            )
+        # Exercise the same subprocess gate used by generated candidates.  A
+        # package import alone is insufficient evidence of CUDA lowering.
+        from cuda_sft.dialects.tilelang import SMOKE_SOURCE
+        with tempfile.TemporaryDirectory(prefix="tilelang-check-") as tmp:
+            path = Path(tmp) / "solution.py"
+            path.write_text(SMOKE_SOURCE, encoding="utf-8")
+            code, out = _run(
+                [sys.executable, "-m", "cuda_sft.dialects.python_gate", "tilelang", str(path)],
+                timeout=180,
+            )
+        if code != 0:
+            tail = (out or "CUDA lowering failed").strip().splitlines()[-1]
+            return CheckRow("tilelang", False, f"tilelang {ver}; unavailable: {tail[:180]}", "unavailable")
+        return CheckRow("tilelang", True, f"tilelang {ver}; transitive deps + CUDA lowering PASS", "ok")
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        return CheckRow("tilelang", False, f"unavailable: {exc}", "unavailable")
 
 
 def _wanted_checks(dialects: list[str], *, skip_cuda: bool = False) -> list[CheckRow]:
@@ -588,7 +619,7 @@ def _apply_install(row: CheckRow) -> None:
         if not ok:
             print(detail, flush=True)
         return
-    if row.name == "tilelang":
+    if row.name == "tilelang" and row.action == "pip":
         ok, detail = _pip_install("tilelang>=0.1.14")
         print(f"pip tilelang: {'OK' if ok else 'FAIL'}", flush=True)
         if not ok:

@@ -16,6 +16,9 @@ from cuda_sft.agents.generate import (
 )
 from cuda_sft.agents.repairer import (
     classify_compile_error,
+    classify_refval_error,
+    repair_budget,
+    repair_budget_for_difficulty,
     repair_system_prompt,
     wrap_repair_user,
 )
@@ -29,6 +32,9 @@ __all__ = [
     "assistant_state_update",
     "cancel_speculative",
     "classify_compile_error",
+    "classify_refval_error",
+    "repair_budget",
+    "repair_budget_for_difficulty",
     "complete_chat",
     "enqueue_speculative_repair",
     "repair_system_prompt",
