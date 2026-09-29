@@ -15,11 +15,15 @@ from cuda_sft.config import Settings, get_settings
 _HARD_KERNEL = re.compile(
     r"gemm|matmul|conv(?:olution)?|softmax|attention|scan|reduc(?:e|tion)|"
     r"transpose|sort|fft|wmma|tensor[ -]?core|cute|cutlass|histogram|"
-    r"prefix|warp.?shuffle",
+    r"prefix|warp.?shuffle|矩阵乘(?:法|积)?|矩阵相乘|卷积|注意力|softmax|"
+    r"扫描|前缀和|归约|规约|转置|排序|快速傅里叶|直方图|线程束洗牌",
     re.IGNORECASE,
 )
 _SIMPLE_KERNEL = re.compile(
-    r"\b(add|scale|relu|copy|fill|axpy|element[- ]?wise|vector add|saxpy)\b",
+    r"\b(add|scale|relu|copy|fill|axpy|element[- ]?wise|vector add|saxpy)\b|"
+    r"向量加(?:法)?|逐元素(?:加法|相加|计算)?|元素级(?:加法|相加|计算)?|"
+    r"(?:逐个|每个)元素(?:相加|加法)|缩放(?:向量)?|填充(?:数组|向量)?|"
+    r"复制(?:数组|向量)?|激活函数",
     re.IGNORECASE,
 )
 _HARD_TOPICS = {"formula", "cute", "cutlass", "isa"}

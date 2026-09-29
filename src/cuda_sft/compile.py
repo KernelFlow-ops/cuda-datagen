@@ -318,14 +318,13 @@ def attempt_workdir(
 ) -> Path:
     """Return the directory used to compile one attempt.
 
-    ``WORK_KEEP=simple`` overwrites ``work/q{id}/`` (or ``.../{dialect}/``).
-    ``WORK_KEEP=detailed`` uses ``c{c}/r{r}/`` under that root.
+    Every candidate and repair writes to a separate directory. In simple
+    mode, :func:`finalize_question_work` copies the final result to the root
+    and removes these scratch directories after selection has completed.
     """
     base = settings.work_path / f"q{question_id}"
     if nest_dialect:
         base = base / (dialect or "cuda")
-    if settings.work_keep == "simple":
-        return base
     return base / f"c{candidate_idx}" / f"r{repair_idx}"
 
 
@@ -338,6 +337,8 @@ def finalize_question_work(
     dialect: str = "cuda",
     filename: str = "solution.cu",
     nest_dialect: bool = False,
+    candidate_idx: int | None = None,
+    repair_idx: int | None = None,
 ) -> None:
     """In simple mode, keep only the last source file (and compile log if failed).
 
@@ -359,6 +360,12 @@ def finalize_question_work(
     out_name = filename or "solution.cu"
     if (code or "").strip():
         (qdir / out_name).write_text(code, encoding="utf-8")
+    if not success and candidate_idx is not None and repair_idx is not None:
+        attempt = qdir / f"c{candidate_idx}" / f"r{repair_idx}"
+        log_name = "nvcc.log" if dialect == "cuda" else "compile.log"
+        log = attempt / log_name
+        if log.is_file():
+            shutil.copyfile(log, qdir / log_name)
     for child in list(qdir.iterdir()):
         name = child.name
         if child.is_dir() and name == "test":

@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from cuda_sft.config import Settings, get_settings
 from cuda_sft.knowledge.facts import fact_violations
 from cuda_sft.knowledge.parse import (
+    answer_integrity_issues,
     fence_char_ratio,
     has_derivation_steps,
     has_equation,
@@ -30,6 +34,7 @@ from cuda_sft.knowledge.rubrics import (
 )
 from cuda_sft.llm import LLMClient, LLMError, get_llm_client, is_retryable_llm_error
 from cuda_sft.parse import extract_thinking, strip_thinking
+from cuda_sft.runtime.meta import CallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +104,66 @@ def hard_gate(
         reasons.append("missing headings or listed structure")
     if topic_name == "formula" and text.strip() and not has_equation(text):
         reasons.append("formula topic requires at least one equation")
-    derivation_asked = topic_name == "formula" or bool(
-        re.search(r"推导|derive|why does|为什么", question or "", re.IGNORECASE)
+    derivation_asked = bool(
+        re.search(
+            r"推导|证明|逐步计算|计算过程|\bderive\b|\bderivation\b|\bprove\b|"
+            r"\bcalculate\b|\bstep[- ]by[- ]step\b|\bshow (?:your |the )?work\b|"
+            r"\bwhy does\b|为什么",
+            question or "",
+            re.IGNORECASE,
+        )
     )
     if derivation_asked and text.strip() and not has_derivation_steps(text):
         reasons.append("derivation/why question lacks step-by-step reasoning")
     reasons.extend(fact_violations(text))
+    reasons.extend(answer_integrity_issues(text))
     return reasons
+
+
+def accepted_knowledge_answer(state: Mapping[str, Any], settings: Settings) -> bool:
+    """Verify that the saved answer is the one a live rubric review accepted."""
+    answer = str(state.get("answer") or "")
+    metadata = state.get("metadata")
+    evidence = metadata.get("knowledge_judge") if isinstance(metadata, dict) else None
+    if not isinstance(evidence, dict):
+        return False
+    if not (
+        state.get("gate_ok") is True
+        and state.get("judge_pass") is True
+        and state.get("judge_unavailable") is False
+        and state.get("judge_skipped_llm") is False
+        and evidence.get("pass") is True
+        and evidence.get("unavailable") is False
+        and evidence.get("skipped_llm") is False
+        and evidence.get("hard_gate_failed") is False
+    ):
+        return False
+    digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    if evidence.get("answer_sha256") != digest:
+        return False
+    dimensions = evidence.get("dimensions")
+    must_fix = evidence.get("must_fix")
+    try:
+        overall = float(evidence.get("overall"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(overall) or not isinstance(dimensions, dict) or not isinstance(must_fix, list):
+        return False
+    if not passes_threshold(
+        overall=overall,
+        dimensions=dimensions,
+        must_fix=must_fix,
+        min_score=settings.knowledge_min_score,
+        factual_min=settings.knowledge_factual_min,
+    ):
+        return False
+    return not hard_gate(
+        answer,
+        topic=str(state.get("topic") or "general"),
+        question=str(state.get("question") or ""),
+        min_chars=settings.knowledge_min_answer_chars,
+        require_structure=settings.knowledge_require_structure,
+    )
 
 
 def _strip_trailing_commas(text: str) -> str:
@@ -256,7 +314,7 @@ class KnowledgeJudge:
         self._client = llm_client
 
     def _client_or_default(self) -> LLMClient:
-        return self._client or get_llm_client(self.settings)
+        return self._client or get_llm_client(self.settings, role="knowledge_judge")
 
     def judge(
         self,
@@ -264,6 +322,7 @@ class KnowledgeJudge:
         question: str,
         answer: str,
         topic: str,
+        meta: CallMeta | None = None,
     ) -> KnowledgeJudgeResult:
         """Run gates then the LLM judge. Never raises on LLM failure."""
         settings = self.settings
@@ -298,12 +357,12 @@ class KnowledgeJudge:
         mode = (settings.knowledge_judge_mode or "capped").strip().lower()
         if mode == "split":
             payload, last_error = self._run_split(
-                question=question, answer=answer, topic=topic, attempts=attempts
+                question=question, answer=answer, topic=topic, attempts=attempts, meta=meta
             )
         else:
             for attempt in range(1, attempts + 1):
                 try:
-                    text = self._run_llm(question=question, answer=answer, topic=topic)
+                    text = self._run_llm(question=question, answer=answer, topic=topic, meta=meta)
                 except Exception as exc:
                     last_error = str(exc)
                     logger.warning("knowledge judge LLM attempt %s/%s: %s", attempt, attempts, exc)
@@ -369,6 +428,7 @@ class KnowledgeJudge:
         answer: str,
         topic: str,
         attempts: int,
+        meta: CallMeta | None = None,
     ) -> tuple[dict[str, Any] | None, str]:
         """MA-CF split: factual critic then quality critic, then merge JSON.
 
@@ -384,6 +444,7 @@ class KnowledgeJudge:
             topic=topic,
             system=JUDGE_SYSTEM_FACTUAL,
             attempts=attempts,
+            meta=replace(meta, purpose="split_factual") if meta else None,
         )
         quality, err_b = self._run_llm_json(
             question=question,
@@ -391,6 +452,7 @@ class KnowledgeJudge:
             topic=topic,
             system=JUDGE_SYSTEM_QUALITY,
             attempts=attempts,
+            meta=replace(meta, purpose="split_quality") if meta else None,
         )
         if factual is None or quality is None:
             return None, err_a if factual is None else err_b
@@ -416,12 +478,13 @@ class KnowledgeJudge:
         topic: str,
         system: str,
         attempts: int,
+        meta: CallMeta | None = None,
     ) -> tuple[dict[str, Any] | None, str]:
         last_error = "judge returned no JSON"
         for attempt in range(1, attempts + 1):
             try:
                 text = self._run_llm(
-                    question=question, answer=answer, topic=topic, system=system
+                    question=question, answer=answer, topic=topic, system=system, meta=meta
                 )
             except Exception as exc:
                 last_error = str(exc)
@@ -444,6 +507,7 @@ class KnowledgeJudge:
         answer: str,
         topic: str,
         system: str | None = None,
+        meta: CallMeta | None = None,
     ) -> str:
         client = self._client_or_default()
         user = build_judge_user(
@@ -469,6 +533,7 @@ class KnowledgeJudge:
                     int(self.settings.knowledge_max_output_tokens),
                 ),
                 thinking_level="none",
+                meta=meta,
             )
             visible = completion.text or ""
             reasoning = completion.reasoning or ""
@@ -477,4 +542,4 @@ class KnowledgeJudge:
             if parse_judge_json(reasoning) is not None:
                 return reasoning
             return "\n".join(part for part in (visible, reasoning) if part.strip())
-        return client.stream_text(**base)
+        return client.stream_text(**base, meta=meta)

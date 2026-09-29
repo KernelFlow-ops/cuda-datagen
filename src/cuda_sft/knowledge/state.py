@@ -10,11 +10,15 @@ class KnowledgeGraphState(TypedDict, total=False):
 
     question_id: int
     question: str
+    input_metadata: dict[str, Any]
     kind: str
     topic: str
     track: str
     system_prompt: str
     user_prompt: str
+    gen_system: str
+    gen_user: str
+    gen_prompt_variant: dict[str, Any]
     messages: list[dict[str, str]]
     candidate_idx: int
     repair_idx: int
@@ -38,8 +42,10 @@ class KnowledgeGraphState(TypedDict, total=False):
     cuda_arch: str
     cuda_version: str
     metadata: dict[str, Any]
+    provenance: dict[str, Any]
     raw_reasoning: str
     reasoning_source: str
+    origin: str
     cot: str
     cot_source: str
     cot_error: str

@@ -30,11 +30,20 @@ from cuda_sft.refval.spec import (
 )
 
 _MAIN_RE = re.compile(r"\bint\s+main\s*\(", re.MULTILINE)
+_CUDA_LIBRARY_CALLS = (
+    (re.compile(r"\bcufft[A-Za-z0-9_]*\s*\("), "-lcufft"),
+    (re.compile(r"\bcurand[A-Za-z0-9_]*\s*\("), "-lcurand"),
+    (re.compile(r"\bcublas[A-Za-z0-9_]*\s*\("), "-lcublas"),
+)
 
 
 def has_main(source: str) -> bool:
     """True when the translation unit already defines ``main``."""
     return bool(_MAIN_RE.search(source or ""))
+
+
+def _cuda_link_libraries(source: str) -> list[str]:
+    return [flag for pattern, flag in _CUDA_LIBRARY_CALLS if pattern.search(source)]
 
 
 def _c_ident(name: str) -> str:
@@ -147,6 +156,8 @@ def _call_args(abi: KernelABI, plan: CasePlan, alias: Mapping[str, str]) -> str:
                 ident = _c_ident(src)
             ptr = f"d_{ident}" if param.memory != "host" else f"h_{ident}.data()"
             args.append(ptr)
+        elif param.dtype in {"cublas_handle", "cufft_handle"}:
+            args.append(f"refval_{ident}")
         else:
             dtype = param.dtype if param.kind != "size" else (param.dtype or "i32")
             value = plan.scalars.get(param.name, 0)
@@ -199,12 +210,33 @@ def _emit_case(abi: KernelABI, plan: CasePlan) -> str:
                     f"    if (case_ok && storage_nb_{ident}) CUDA_DIE(cudaMemcpy(d_{ident}, h_{ident}.data(), "
                     f"storage_nb_{ident}, cudaMemcpyHostToDevice), case_name);"
                 )
+    handles = [p for p in abi.scalar_params() if p.dtype in {"cublas_handle", "cufft_handle"}]
+    for param in handles:
+        ident = _c_ident(param.name)
+        if param.dtype == "cublas_handle":
+            lines.append(f"    cublasHandle_t refval_{ident} = nullptr;")
+            lines.append(
+                f'    if (case_ok && cublasCreate(&refval_{ident}) != CUBLAS_STATUS_SUCCESS) '
+                f'{{ case_ok = false; emit_case(case_name, false, "cublasCreate failed"); }}'
+            )
+        else:
+            complex_input = next(p for p in abi.input_params() if p.dtype == "c64" and p.rank == 2)
+            rows, cols = plan.shapes[complex_input.name]
+            lines.append(f"    cufftHandle refval_{ident} = 0;")
+            lines.append(
+                f'    if (case_ok && {rows} > 0 && {cols} > 0 && '
+                f'cufftPlan2d(&refval_{ident}, {rows}, {cols}, CUFFT_C2C) != CUFFT_SUCCESS) '
+                f'{{ case_ok = false; emit_case(case_name, false, "cufftPlan2d failed"); }}'
+            )
     call_args = _call_args(abi, plan, alias)
     ret_void = not abi.returns or abi.returns == "void"
     # Zero-sized tensors are a legal contract case.  The default strategy is
     # to skip the launch and validate the initialized empty output; manifests
     # may opt into ``zero_size_strategy=call`` for kernels that require it.
-    zero_expr = " || ".join(f"(ne_{_c_ident(p.name)} == 0)" for p in abi.tensor_params()) or "false"
+    zero_expr = " || ".join(
+        f"(ne_{_c_ident(alias.get(p.name) or p.alias_of or p.name)} == 0)"
+        for p in abi.tensor_params()
+    ) or "false"
     should_call = "case_ok" if getattr(abi, "zero_size_strategy", "skip") == "call" else f"(case_ok && !({zero_expr}))"
     if ret_void:
         lines.append(f"    if ({should_call}) {abi.entry}({call_args});")
@@ -245,6 +277,10 @@ def _emit_case(abi: KernelABI, plan: CasePlan) -> str:
             f'    if (case_ok && !write_bin("out/{plan.name}/__return__.bin", &refval_ret, sizeof(refval_ret))) '
             f'{{ case_ok = false; emit_case(case_name, false, "write __return__"); }}'
         )
+    for param in handles:
+        ident = _c_ident(param.name)
+        destroy = "cublasDestroy" if param.dtype == "cublas_handle" else "cufftDestroy"
+        lines.append(f"    if (refval_{ident}) {destroy}(refval_{ident});")
     for ident in allocated:
         lines.append(f"    if (d_{ident}) cudaFree(d_{ident});")
     lines.append("    if (case_ok) emit_case(case_name, true, \"\");")
@@ -300,6 +336,8 @@ def render_cuda_harness(abi: KernelABI, plans: list[CasePlan]) -> str:
     if _needs_half(abi):
         headers.append("#include <cuda_fp16.h>")
         headers.append("#include <cuda_bf16.h>")
+    if any(p.dtype in {"c64", "cufft_handle"} for p in abi.params):
+        headers.append("#include <cufft.h>")
     headers.append('#include "solution.cu"')
     prelude = r'''
 static bool g_ok = true;
@@ -424,14 +462,16 @@ import torch
 SPEC = json.loads({blob!r})
 DTYPES = {{
     "f32": torch.float32, "f64": torch.float64, "f16": torch.float16,
+    "c64": torch.complex64,
     "bf16": torch.bfloat16, "i32": torch.int32, "i64": torch.int64,
-    "i8": torch.int8, "u8": torch.uint8, "u32": torch.uint32,
+    "i8": torch.int8, "u8": torch.uint8, "u16": torch.uint16, "u32": torch.uint32,
     "bool": torch.bool,
 }}
 NP_DTYPES = {{
     "f32": "float32", "f64": "float64", "f16": "float16",
+    "c64": "complex64",
     "bf16": "float32", "i32": "int32", "i64": "int64",
-    "i8": "int8", "u8": "uint8", "u32": "uint32", "bool": "bool",
+    "i8": "int8", "u8": "uint8", "u16": "uint16", "u32": "uint32", "bool": "bool",
 }}
 
 class ContractError(RuntimeError):
@@ -723,6 +763,11 @@ def compile_cuda_harness(
         path = str(include).strip()
         if path:
             cmd.append(f"-I{path}")
+    solution = testdir / "solution.cu"
+    link_source = source.read_text(encoding="utf-8") if source.is_file() else ""
+    if solution.is_file():
+        link_source += solution.read_text(encoding="utf-8")
+    cmd.extend(_cuda_link_libraries(link_source))
     if used_rdc:
         cmd.extend(["-rdc=true", "-lcudadevrt"])
     try:
@@ -820,6 +865,7 @@ def prepare_testdir(
     abi: KernelABI,
     plans: list[CasePlan],
     dialect_spec: DialectRefvalSpec,
+    arrays_by_case: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     """Write source, stubs, harness/driver, and case input bins."""
     testdir = Path(testdir).resolve()
@@ -831,7 +877,7 @@ def prepare_testdir(
     (testdir / filename).write_text(source, encoding="utf-8")
     from cuda_sft.refval.cases import write_cases
 
-    write_cases(testdir, abi, plans)
+    write_cases(testdir, abi, plans, arrays_by_case)
     if dialect_spec.runner == "python_import":
         driver = render_python_driver(abi, plans, filename, dialect=dialect_spec.dialect)
         (testdir / "driver.py").write_text(driver, encoding="utf-8")

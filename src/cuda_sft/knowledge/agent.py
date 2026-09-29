@@ -47,11 +47,14 @@ class KnowledgeAgent:
         _ = cfg  # settings reserved for future per-topic filters
         return jobs
 
-    def llm_call_options(self, settings: Settings | None = None) -> dict:
+    def llm_call_options(
+        self, settings: Settings | None = None, *, role: str = "knowledge_generator"
+    ) -> dict:
         """Sampling overrides: smaller completion budget than kernel Super models."""
         cfg = settings or get_settings()
+        role_cfg = cfg.for_role(role)
         return {
-            "thinking_level": cfg.knowledge_thinking_level or "medium",
+            "thinking_level": role_cfg.thinking_level,
             "max_output_tokens": int(cfg.knowledge_max_output_tokens or 8192),
         }
 

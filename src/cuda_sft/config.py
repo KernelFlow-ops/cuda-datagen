@@ -7,12 +7,13 @@ import re
 import shutil
 import subprocess
 import sys
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
 from dotenv import load_dotenv
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_env_file() -> None:
     """Load project-root ``.env`` if present (does not override existing env)."""
+    if os.environ.get("CUDA_SFT_NO_DOTENV") == "1":
+        return
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
         load_dotenv(env_path, override=False)
@@ -34,6 +37,26 @@ def normalize_anthropic_base_url(url: str) -> str:
     if cleaned.endswith("/v1"):
         cleaned = cleaned[: -len("/v1")]
     return cleaned
+
+
+def normalize_openai_base_url(url: str) -> str:
+    """OpenAI SDK appends ``/chat/completions`` under ``/v1``."""
+    cleaned = url.strip().rstrip("/")
+    return cleaned if cleaned.endswith("/v1") else f"{cleaned}/v1"
+
+
+ROLE_CONFIG_PREFIXES = {
+    "generator": "generator",
+    "repair.compile": "repair_compile",
+    "repair.numeric": "repair_numeric",
+    "repair.semantic": "repair_semantic",
+    "critic": "critic",
+    "cot_editor": "cot_editor",
+    "refval_extract": "refval_extract",
+    "knowledge_judge": "knowledge_judge",
+    "knowledge_generator": "knowledge_generator",
+    "knowledge_repair": "knowledge_repair",
+}
 
 
 def _run_text(cmd: list[str]) -> str | None:
@@ -161,13 +184,12 @@ class WorkerSlot(NamedTuple):
 class Settings(BaseSettings):
     """Pipeline config loaded from environment / ``.env``.
 
-    Provider-specific keys (OpenRouter vs NVIDIA NIM) are selected through
-    :attr:`llm_provider`. Empty ``MODEL`` falls back to ``OPENROUTER_MODEL`` or
-    ``NVIDIA_MODEL``.
+    Provider keys are shared; each agent role can override the worker's
+    provider, model, and API base URL.
     """
 
     model_config = SettingsConfigDict(
-        env_file=str(PROJECT_ROOT / ".env"),
+        env_file=None if os.environ.get("CUDA_SFT_NO_DOTENV") == "1" else str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -177,14 +199,50 @@ class Settings(BaseSettings):
     llm_providers: str = Field(default="")
     workers_per_provider: int = Field(default=0, ge=0)
     openrouter_api_key: str = Field(default="")
-    openrouter_base_url: str = Field(default="https://openrouter.ai/api")
     openrouter_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b:free")
     nvidia_api_key: str = Field(default="")
     nvidia_api_key_2: str = Field(default="")
     nvidia_api_key_3: str = Field(default="")
-    nvidia_base_url: str = Field(default="https://integrate.api.nvidia.com/v1")
     nvidia_model: str = Field(default="nvidia/nemotron-3-ultra-550b-a55b")
+    openai_api_key: str = Field(default="")
+    openai_model: str = Field(default="gpt-6-luna")
     model: str = Field(default="")
+    api_base_url: str = Field(default="")
+    generator_provider: str = Field(default="")
+    generator_model: str = Field(default="")
+    generator_api_base_url: str = Field(default="")
+    generator_thinking_level: str = Field(default="")
+    repair_compile_provider: str = Field(default="")
+    repair_compile_model: str = Field(default="")
+    repair_compile_api_base_url: str = Field(default="")
+    repair_compile_thinking_level: str = Field(default="")
+    repair_numeric_provider: str = Field(default="")
+    repair_numeric_model: str = Field(default="")
+    repair_numeric_api_base_url: str = Field(default="")
+    repair_semantic_provider: str = Field(default="")
+    repair_semantic_model: str = Field(default="")
+    repair_semantic_api_base_url: str = Field(default="")
+    critic_provider: str = Field(default="")
+    critic_model: str = Field(default="")
+    critic_api_base_url: str = Field(default="")
+    cot_editor_provider: str = Field(default="")
+    cot_editor_model: str = Field(default="")
+    cot_editor_api_base_url: str = Field(default="")
+    cot_editor_thinking_level: str = Field(default="")
+    refval_extract_provider: str = Field(default="")
+    refval_extract_model: str = Field(default="")
+    refval_extract_api_base_url: str = Field(default="")
+    refval_extract_thinking_level: str = Field(default="")
+    knowledge_judge_provider: str = Field(default="")
+    knowledge_judge_model: str = Field(default="")
+    knowledge_judge_api_base_url: str = Field(default="")
+    knowledge_generator_provider: str = Field(default="")
+    knowledge_generator_model: str = Field(default="")
+    knowledge_generator_api_base_url: str = Field(default="")
+    knowledge_generator_thinking_level: str = Field(default="")
+    knowledge_repair_provider: str = Field(default="")
+    knowledge_repair_model: str = Field(default="")
+    knowledge_repair_api_base_url: str = Field(default="")
     thinking_level: str = Field(default="medium")
     max_input_tokens: int = Field(default=131072, ge=1024)
     max_output_tokens: int = Field(default=0, ge=0)
@@ -194,11 +252,15 @@ class Settings(BaseSettings):
 
     max_candidates: int = Field(default=3, ge=1)
     max_repairs: int = Field(default=3, ge=0)
+    kernel_fast_mode: bool = Field(default=False)
+    kernel_deadline_sec: int = Field(default=115, ge=1)
     workers: int = Field(default=1, ge=1)
+    max_inflight_jobs: int = Field(default=2, ge=1)
+    llm_concurrency: int = Field(default=2, ge=1)
+    compile_concurrency: int = Field(default=1, ge=1)
     repair_error_max_chars: int = Field(default=6000, ge=500)
     work_keep: str = Field(default="simple")
     judge_enabled: bool = Field(default=True)
-    use_judge_optimization: bool = Field(default=False)
     async_llm_enabled: bool = Field(default=True)
     async_llm_max_workers: int = Field(default=2, ge=1, le=4)
     cot_enabled: bool = Field(default=True)
@@ -210,9 +272,17 @@ class Settings(BaseSettings):
     cot_raw_store_max_chars: int = Field(default=32768, ge=0)
     cot_on_empty: str = Field(default="synthetic")
     cot_on_agent_fail: str = Field(default="raw")
+    cot_repaired_policy: str = Field(default="synthetic")
+    cot_consistency_check: bool = Field(default=True)
+    # Total CoT-editor LLM calls per sample: drafts, feedback retries, the
+    # synthetic fallback and transport retries all share this budget.
+    cot_max_calls: int = Field(default=3, ge=1, le=10)
     sft_user_is_raw_question: bool = Field(default=True)
+    sft_system_mode: str = Field(default="fixed")
     kernel_llm_critic: str = Field(default="adaptive")
+    critic_retry_on_error: int = Field(default=1, ge=0, le=3)
     kernel_critic_blocks_save: bool = Field(default=False)
+    repair_history_mode: str = Field(default="single_turn")
     knowledge_judge_mode: str = Field(default="capped")
     difficulty_aware: bool = Field(default=True)
 
@@ -241,12 +311,19 @@ class Settings(BaseSettings):
 
     refval_enabled: bool = Field(default=True)
     refval_timeout_sec: int = Field(default=45, ge=5)
+    refval_extract_timeout_sec: int = Field(default=180, ge=5)
+    refval_build_timeout_sec: int = Field(default=120, ge=5)
+    refval_run_timeout_sec: int = Field(default=45, ge=5)
+    oracle_retry_max: int = Field(default=2, ge=0, le=5)
+    oracle_retry_backoff_s: str = Field(default="5,20")
     refval_cases: str = Field(default="standard")
     # A training release must have executable numeric evidence.  Set
     # REFVAL_STRICT=false explicitly for compile-only exploration.
     refval_strict: bool = Field(default=True)
     refval_max_elements: int = Field(default=4_000_000, ge=1024)
     refval_cache: bool = Field(default=True)
+    trace_enabled: bool = Field(default=True)
+    trace_dir: str = Field(default="")
 
     cuda_arch: str = Field(default="")
     gpu_name: str = Field(default="")
@@ -260,13 +337,16 @@ class Settings(BaseSettings):
     data_dir: str = Field(default=str(PROJECT_ROOT / "data"))
     work_dir: str = Field(default=str(PROJECT_ROOT / "work"))
 
-    @field_validator("openrouter_base_url")
-    @classmethod
-    def _normalize_base_url(cls, value: str) -> str:
-        """Strip a trailing ``/v1`` so the Anthropic SDK does not double it."""
-        return normalize_anthropic_base_url(value)
-
-    @field_validator("thinking_level", "cutlass_thinking_level", "knowledge_thinking_level")
+    @field_validator(
+        "thinking_level",
+        "cutlass_thinking_level",
+        "knowledge_thinking_level",
+        "generator_thinking_level",
+        "repair_compile_thinking_level",
+        "cot_editor_thinking_level",
+        "refval_extract_thinking_level",
+        "knowledge_generator_thinking_level",
+    )
     @classmethod
     def _normalize_thinking(cls, value: str) -> str:
         """Lowercase thinking level (``medium``, ``high``, ``none``, ...)."""
@@ -275,7 +355,7 @@ class Settings(BaseSettings):
     @field_validator("llm_provider")
     @classmethod
     def _normalize_provider(cls, value: str) -> str:
-        """Map aliases to ``openrouter`` or ``nvidia``.
+        """Map aliases to a supported provider.
 
         Raises:
             ValueError: If the name is not a known provider.
@@ -289,9 +369,14 @@ class Settings(BaseSettings):
             "open-router": "openrouter",
         }
         name = aliases.get(name, name)
-        if name not in {"openrouter", "nvidia"}:
-            raise ValueError("LLM_PROVIDER must be 'openrouter' or 'nvidia'")
+        if name not in {"openrouter", "nvidia", "openai"}:
+            raise ValueError("LLM_PROVIDER must be 'openrouter', 'nvidia', or 'openai'")
         return name
+
+    @field_validator(*(f"{prefix}_provider" for prefix in ROLE_CONFIG_PREFIXES.values()))
+    @classmethod
+    def _normalize_role_provider(cls, value: str) -> str:
+        return cls._normalize_provider(value) if value.strip() else ""
 
     @field_validator("work_keep")
     @classmethod
@@ -309,6 +394,39 @@ class Settings(BaseSettings):
         if name not in {"simple", "detailed"}:
             raise ValueError("WORK_KEEP must be 'simple' or 'detailed'")
         return name
+
+    @field_validator("sft_system_mode")
+    @classmethod
+    def _normalize_sft_system_mode(cls, value: str) -> str:
+        mode = value.strip().lower()
+        if mode not in {"fixed", "generation", "none"}:
+            raise ValueError("SFT_SYSTEM_MODE must be fixed, generation, or none")
+        return mode
+
+    @field_validator("cot_repaired_policy")
+    @classmethod
+    def _normalize_cot_repaired_policy(cls, value: str) -> str:
+        policy = value.strip().lower()
+        if policy not in {"synthetic", "drop_cot", "first_turn"}:
+            raise ValueError("COT_REPAIRED_POLICY must be synthetic, drop_cot, or first_turn")
+        return policy
+
+    @field_validator("repair_history_mode")
+    @classmethod
+    def _normalize_repair_history_mode(cls, value: str) -> str:
+        mode = value.strip().lower()
+        if mode not in {"single_turn", "full"}:
+            raise ValueError("REPAIR_HISTORY_MODE must be single_turn or full")
+        return mode
+
+    @model_validator(mode="after")
+    def _legacy_refval_timeout(self) -> Settings:
+        if "USE_JUDGE_OPTIMIZATION" in os.environ:
+            warnings.warn("USE_JUDGE_OPTIMIZATION is deprecated and ignored", DeprecationWarning, stacklevel=2)
+        if "REFVAL_TIMEOUT_SEC" in os.environ and "REFVAL_RUN_TIMEOUT_SEC" not in os.environ:
+            warnings.warn("REFVAL_TIMEOUT_SEC is deprecated; use REFVAL_RUN_TIMEOUT_SEC", DeprecationWarning, stacklevel=2)
+            self.refval_run_timeout_sec = self.refval_timeout_sec
+        return self
 
     @field_validator("kernel_mode")
     @classmethod
@@ -462,7 +580,7 @@ class Settings(BaseSettings):
                 "open-router": "openrouter",
             }
             item = aliases.get(item, item)
-            if item not in {"openrouter", "nvidia"}:
+            if item not in {"openrouter", "nvidia", "openai"}:
                 raise ValueError(f"unknown provider in LLM_PROVIDERS: {part!r}")
             if item not in names:
                 names.append(item)
@@ -486,15 +604,70 @@ class Settings(BaseSettings):
                 break
         return keys[:3]
 
-    def missing_provider_secrets(self, providers: list[str] | None = None) -> list[str]:
-        """Env var names that are empty for the active provider pool."""
+    def active_llm_roles(self) -> list[str]:
+        """Roles reachable under the selected task mode and feature flags."""
+        roles: list[str] = []
+        if self.task_mode in {"kernel", "auto"}:
+            roles.extend(("generator", "repair.compile", "repair.numeric", "repair.semantic"))
+            if self.refval_enabled:
+                roles.append("refval_extract")
+            if self.kernel_llm_critic != "off" and not self.kernel_fast_mode:
+                roles.append("critic")
+        if self.task_mode in {"knowledge", "auto"}:
+            roles.extend(("knowledge_generator", "knowledge_repair"))
+            if self.knowledge_judge_enabled:
+                roles.append("knowledge_judge")
+        if self.cot_enabled and self.cot_agent_enabled and (
+            not self.kernel_fast_mode or self.task_mode in {"knowledge", "auto"}
+        ):
+            roles.append("cot_editor")
+        return roles
+
+    def missing_provider_secrets(
+        self, providers: list[str] | None = None, *, roles: list[str] | None = None
+    ) -> list[str]:
+        """Env var names missing for providers reached by enabled roles."""
         missing: list[str] = []
-        for name in providers or self.provider_pool():
+        workers = list(providers or self.provider_pool())
+        names: list[str] = []
+        if roles is None:
+            names = workers
+        else:
+            for worker_provider in workers:
+                worker = self.model_copy(update={"llm_provider": worker_provider})
+                for role in roles:
+                    provider = worker.for_role(role).llm_provider
+                    if provider not in names:
+                        names.append(provider)
+        for name in names:
             if name == "nvidia" and not self.nvidia_api_keys():
                 missing.append("NVIDIA_API_KEY")
             elif name == "openrouter" and not self.openrouter_api_key.strip():
                 missing.append("OPENROUTER_API_KEY")
+            elif name == "openai" and not self.openai_api_key.strip():
+                missing.append("OPENAI_API_KEY")
         return missing
+
+    def for_role(self, role: str) -> Settings:
+        """Resolve one role's explicit overrides against the worker defaults."""
+        prefix = ROLE_CONFIG_PREFIXES.get(role)
+        if prefix is None:
+            return self
+        provider = getattr(self, f"{prefix}_provider").strip() or self.llm_provider
+        model = getattr(self, f"{prefix}_model").strip() or self.model
+        base_url = getattr(self, f"{prefix}_api_base_url").strip() or self.api_base_url
+        thinking_level = getattr(self, f"{prefix}_thinking_level", "").strip()
+        if not thinking_level:
+            if prefix.startswith("knowledge_"):
+                thinking_level = self.knowledge_thinking_level
+            else:
+                thinking_level = self.thinking_level
+        return self.model_copy(update={
+            "llm_provider": provider,
+            "model": model,
+            "api_base_url": base_url,
+            "thinking_level": thinking_level,
+        })
 
     def build_worker_assignments(
         self,
@@ -525,6 +698,10 @@ class Settings(BaseSettings):
         names = list(providers or self.provider_pool())
         nvidia_keys = self.nvidia_api_keys()
         openrouter_key = self.openrouter_api_key.strip()
+        provider_keys = {
+            "openrouter": openrouter_key,
+            "openai": self.openai_api_key.strip(),
+        }
 
         def nvidia_slots() -> list[tuple[str, str]]:
             """``(api_key, label)`` for each NVIDIA key (one empty slot if none)."""
@@ -542,7 +719,7 @@ class Settings(BaseSettings):
                 return [
                     WorkerSlot("nvidia", key, label) for key, label in nvidia_slots()
                 ]
-            key = openrouter_key if name == "openrouter" else ""
+            key = provider_keys.get(name, "")
             return [WorkerSlot(name, key, name)]
 
         if workers_per_provider and workers_per_provider > 0:
@@ -567,7 +744,7 @@ class Settings(BaseSettings):
                 nvidia_i += 1
                 out.append(WorkerSlot("nvidia", key, label))
             else:
-                key = openrouter_key if name == "openrouter" else ""
+                key = provider_keys.get(name, "")
                 out.append(WorkerSlot(name, key, name))
         return out
 
@@ -584,14 +761,22 @@ class Settings(BaseSettings):
         if self.llm_provider == "nvidia":
             keys = self.nvidia_api_keys()
             return keys[0] if keys else ""
+        if self.llm_provider == "openai":
+            return self.openai_api_key.strip()
         return self.openrouter_api_key.strip()
 
     @property
     def resolved_base_url(self) -> str:
         """HTTP base URL for the active provider."""
-        if self.llm_provider == "nvidia":
-            return self.nvidia_base_url.rstrip("/")
-        return self.openrouter_base_url
+        defaults = {
+            "openrouter": "https://openrouter.ai/api",
+            "nvidia": "https://integrate.api.nvidia.com/v1",
+            "openai": "https://www.poke2api.com",
+        }
+        url = self.api_base_url.strip() or defaults[self.llm_provider]
+        if self.llm_provider == "openrouter":
+            return normalize_anthropic_base_url(url)
+        return normalize_openai_base_url(url)
 
     @property
     def resolved_model(self) -> str:
@@ -600,6 +785,8 @@ class Settings(BaseSettings):
             return self.model.strip()
         if self.llm_provider == "nvidia":
             return self.nvidia_model.strip()
+        if self.llm_provider == "openai":
+            return self.openai_model.strip()
         return self.openrouter_model.strip()
 
     @property

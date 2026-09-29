@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from cuda_sft.refval.cases import read_tensor_bin
 from cuda_sft.refval.spec import (
+    COMPLEX_DTYPES,
     CasePlan,
     CaseResult,
     FLOAT_DTYPES,
@@ -79,7 +80,9 @@ def compare_arrays(
             "f32": np.dtype("float32"), "f64": np.dtype("float64"),
             "f16": np.dtype("float16"), "i32": np.dtype("int32"),
             "i64": np.dtype("int64"), "i8": np.dtype("int8"),
-            "u8": np.dtype("uint8"), "u32": np.dtype("uint32"),
+            "u8": np.dtype("uint8"), "u16": np.dtype("uint16"),
+            "u32": np.dtype("uint32"),
+            "c64": np.dtype("complex64"),
             "bool": np.dtype("bool"),
         }.get(canon)
         dtype_ok = expected_np is None or got_arr.dtype == expected_np
@@ -114,7 +117,7 @@ def compare_arrays(
 
     # Integer outputs (notably int64 indices/counts) must never pass through
     # float64: adjacent values above 2**53 otherwise become indistinguishable.
-    if canon not in FLOAT_DTYPES:
+    if canon not in FLOAT_DTYPES and canon not in COMPLEX_DTYPES:
         bad = g != e
         count = int(np.count_nonzero(bad))
         return CaseResult(
@@ -122,8 +125,10 @@ def compare_arrays(
             n_compared=n, n_mismatch=count, shape=shape, seed=seed,
             error="" if count == 0 else f"{count} exact integer mismatches",
         )
-    g = g[:n].astype(np.float64, copy=False)
-    e = e[:n].astype(np.float64, copy=False)
+    is_complex = canon in COMPLEX_DTYPES
+    precision = np.complex128 if is_complex else np.float64
+    g = g[:n].astype(precision, copy=False)
+    e = e[:n].astype(precision, copy=False)
     tol = tolerances_for(canon, tolerances)
 
     got_nan = np.isnan(g)
@@ -131,7 +136,7 @@ def compare_arrays(
     got_inf = np.isinf(g)
     exp_inf = np.isinf(e)
 
-    if not allows_nan and bool(got_nan.any()):
+    if not allows_nan and bool((got_nan | exp_nan).any()):
         return CaseResult(
             name=name,
             ok=False,
@@ -144,7 +149,12 @@ def compare_arrays(
         )
 
     # Inf is allowed only where the CPU reference also produced Inf of the same sign.
-    inf_mismatch = (got_inf != exp_inf) | (got_inf & exp_inf & (np.signbit(g) != np.signbit(e)))
+    if is_complex:
+        same_real = (g.real == e.real) | (np.isnan(g.real) & np.isnan(e.real) & allows_nan)
+        same_imag = (g.imag == e.imag) | (np.isnan(g.imag) & np.isnan(e.imag) & allows_nan)
+        inf_mismatch = (got_inf | exp_inf) & ~(same_real & same_imag)
+    else:
+        inf_mismatch = (got_inf != exp_inf) | (got_inf & exp_inf & (np.signbit(g) != np.signbit(e)))
     if bool(inf_mismatch.any()):
         idx = int(np.argmax(inf_mismatch))
         return CaseResult(
@@ -156,7 +166,7 @@ def compare_arrays(
             n_mismatch=int(inf_mismatch.sum()),
             shape=shape,
             seed=seed,
-            mismatches=[{"index": idx, "got": float(g[idx]), "exp": float(e[idx])}],
+            mismatches=[{"index": idx, "got": str(g[idx]) if is_complex else float(g[idx]), "exp": str(e[idx]) if is_complex else float(e[idx])}],
         )
 
     if allows_nan:
@@ -175,7 +185,7 @@ def compare_arrays(
             )
         finite = ~(got_nan | exp_nan | got_inf | exp_inf)
     else:
-        finite = ~(got_inf | exp_inf)
+        finite = ~(got_inf | exp_inf) if not is_complex else ~(got_nan | exp_nan | got_inf | exp_inf)
 
     atol = float(tol["atol"])
     rtol = float(tol["rtol"])
@@ -200,8 +210,8 @@ def compare_arrays(
             mismatches.append(
                 {
                     "index": i,
-                    "got": float(g[i]),
-                    "exp": float(e[i]),
+                    "got": str(g[i]) if is_complex else float(g[i]),
+                    "exp": str(e[i]) if is_complex else float(e[i]),
                     "abs": float(abs_err[i]),
                     "rel": float(rel_err[i]),
                 }
@@ -248,10 +258,19 @@ def compare_outputs(
             return merged
         param = next((p for p in abi.params if p.name == name), None)
         dtype = param.dtype if param is not None else (abi.returns if name == "__return__" else abi.dtype)
+        np = _try_numpy()
+        is_half_bits = dtype == "u16" and abi.dtype == "f16" and np is not None
+        got_value = np.asarray(got[name]) if is_half_bits else got[name]
+        expected_value = np.asarray(expected[name]) if is_half_bits else expected[name]
+        if is_half_bits and got_value.dtype == np.uint16 and expected_value.dtype == np.uint16:
+            got_value = got_value.view(np.float16)
+            expected_value = expected_value.view(np.float16)
+        else:
+            is_half_bits = False
         one = compare_arrays(
-            got[name],
-            expected[name],
-            dtype=dtype,
+            got_value,
+            expected_value,
+            dtype="f16" if is_half_bits else dtype,
             tolerances=tolerances,
             allows_nan=abi.allows_nan,
             sort_mode=sort_mode,

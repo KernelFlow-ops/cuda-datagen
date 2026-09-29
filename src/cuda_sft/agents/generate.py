@@ -1,8 +1,7 @@
 """Shared generate-node LLM call for kernel and knowledge graphs.
 
-Compile nodes must not touch :class:`AsyncLLMPool` directly. They call
-:func:`enqueue_speculative_repair` after a failed compile; this module
-owns pool lookup, streaming, and cancellation.
+The async pool supports refval prefetch while compilation runs. Repair calls
+follow their diagnostic directly through :func:`complete_chat`.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from cuda_sft.config import get_settings
 from cuda_sft.llm import LLMClient, LLMCompletion, get_llm_client
 from cuda_sft.llm_async import get_async_pool
 from cuda_sft.pipeline.common import print_stream_enabled
+from cuda_sft.runtime.meta import CallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ def complete_chat(
     llm_options: Mapping[str, Any] | None = None,
     client: LLMClient | None = None,
     log_header: str = "",
+    meta: CallMeta | None = None,
 ) -> GenerateResult:
     """Stream one assistant turn, optionally waiting on a speculative repair.
 
@@ -44,7 +45,7 @@ def complete_chat(
         Visible text, reasoning, and whether a speculative hit was used.
     """
     settings = get_settings()
-    llm = client or get_llm_client()
+    llm = client or get_llm_client(role=meta.role if meta else "generator")
     options = dict(llm_options or {})
     completion: LLMCompletion | None = None
     used_speculative = False
@@ -53,7 +54,7 @@ def complete_chat(
     if request_id and settings.async_llm_enabled:
         pool = get_async_pool(settings.async_llm_max_workers)
         if pool.is_pending(request_id):
-            completion = pool.try_get(request_id, timeout_sec=settings.llm_timeout_sec)
+            completion = pool.get(request_id, timeout_sec=settings.llm_timeout_sec)
             if completion is not None:
                 used_speculative = True
                 logger.info("%s using speculative LLM response (saved ~10-30s)", header)
@@ -69,6 +70,7 @@ def complete_chat(
                 system=system,
                 temperature=temperature,
                 print_stream=print_stream_enabled(),
+                meta=meta,
                 **options,
             )
         else:
@@ -77,6 +79,7 @@ def complete_chat(
                 system=system,
                 temperature=temperature,
                 print_stream=print_stream_enabled(),
+                meta=meta,
             )
             completion = LLMCompletion(
                 text=text, reasoning="", reasoning_source="empty"
@@ -89,6 +92,7 @@ def complete_chat(
             completion.reasoning_source if settings.cot_enabled else "empty"
         ),
         used_speculative=used_speculative,
+        origin=getattr(completion, "origin", "unknown"),
     )
 
 
@@ -125,6 +129,7 @@ def assistant_state_update(
         "messages": messages,
         "raw_reasoning": result.reasoning,
         "reasoning_source": result.reasoning_source,
+        "origin": result.origin,
     }
 
 
@@ -136,8 +141,9 @@ def enqueue_speculative_repair(
     temperature: float,
     llm_options: Mapping[str, Any] | None = None,
     client: LLMClient | None = None,
+    meta: CallMeta | None = None,
 ) -> bool:
-    """Start the next repair LLM call while compile is already finished.
+    """Queue a request for stages which can actually overlap work.
 
     Args:
         request_id: Pool key, typically ``q{id}_{dialect}_c{c}_r{r}``.
@@ -156,13 +162,14 @@ def enqueue_speculative_repair(
     options = dict(llm_options or {})
     try:
         pool = get_async_pool(settings.async_llm_max_workers)
-        llm = client or get_llm_client()
+        llm = client or get_llm_client(role=meta.role if meta else "repair.compile")
         pool.enqueue(
             request_id=request_id,
             llm_client=llm,
             messages=messages,
             system=system,
             temperature=temperature,
+            meta=meta,
             **options,
         )
         logger.info("Started speculative repair request: %s", request_id)

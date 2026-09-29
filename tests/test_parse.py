@@ -8,6 +8,7 @@ from cuda_sft.parse import (
     extract_cuda_source,
     extract_fenced_source,
     extract_thinking,
+    has_numbered_headings,
     split_visible_and_thinking,
     strip_code_from_cot,
     unwrap_cot_assistant,
@@ -17,11 +18,7 @@ from cuda_sft.parse import (
 
 class ParseThinkingTests(unittest.TestCase):
     def test_extract_thinking_tags(self) -> None:
-        text = (
-            "<think>first</think>\n"
-            "```cuda\nint x;\n```\n"
-            "<reasoning>second</reasoning>"
-        )
+        text = "<think>first</think>\n```cuda\nint x;\n```\n<reasoning>second</reasoning>"
         self.assertEqual(extract_thinking(text), "first\n\nsecond")
 
     def test_split_visible_and_thinking(self) -> None:
@@ -50,6 +47,11 @@ class ParseThinkingTests(unittest.TestCase):
     def test_wrap_empty_cot_is_code_only(self) -> None:
         code = "__global__ void k() {}\n"
         self.assertEqual(wrap_cot_assistant("  ", code), code)
+
+    def test_markdown_numbered_headings_are_valid(self) -> None:
+        headings = "\n".join(f"### {index}. Section" for index in range(1, 7))
+        self.assertTrue(has_numbered_headings(headings, 6))
+        self.assertFalse(has_numbered_headings(headings.replace("### 6.", "### 7."), 6))
 
     def test_strip_leading_fence_language_line(self) -> None:
         text = "```cuda\ncuda\n__global__ void k() {}\n```\n"

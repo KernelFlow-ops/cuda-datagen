@@ -5,6 +5,7 @@ Shares generate-node LLM calls and print-stream state with the kernel graph.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Literal
 
@@ -16,20 +17,20 @@ from cuda_sft.agents.repairer import repair_system_prompt, wrap_repair_user
 from cuda_sft.config import get_settings
 from cuda_sft.knowledge.agent import get_knowledge_agent
 from cuda_sft.knowledge.cot import KnowledgeCotAgent
-from cuda_sft.knowledge.judge import KnowledgeJudge, hard_gate
+from cuda_sft.knowledge.judge import KnowledgeJudge, accepted_knowledge_answer, hard_gate
 from cuda_sft.knowledge.parse import extract_answer
 from cuda_sft.knowledge.prompt import (
     SYSTEM_PROMPTS,
+    TOPIC_HINTS,
     build_repair_prompt,
     candidate_temperature,
     select_prompts,
 )
 from cuda_sft.knowledge.state import KnowledgeGraphState
-from cuda_sft.pipeline.common import (
-    graph_recursion_limit,
-    retry_policy,
-    set_print_stream,
-)
+from cuda_sft.pipeline.common import graph_recursion_limit, retry_policy
+from cuda_sft.pipeline.common import set_print_stream as set_print_stream
+from cuda_sft.runtime.meta import CallMeta, legacy_job_key
+from cuda_sft.runtime.trace import traced
 from cuda_sft.store import get_store
 from cuda_sft.tasks.kinds import knowledge_track
 
@@ -43,6 +44,18 @@ def _topic(state: KnowledgeGraphState) -> str:
         state: Graph state; missing topic becomes ``general``.
     """
     return str(state.get("topic") or "general")
+
+
+def _repair_cap(state: KnowledgeGraphState, settings: Any) -> int:
+    value = state.get("repair_cap")
+    if value is not None:
+        return int(value)
+    return plan_topology(
+        question=str(state.get("question") or ""),
+        kind="knowledge",
+        topic=_topic(state),
+        settings=settings,
+    ).max_repairs
 
 
 def _write_attempt(state: KnowledgeGraphState, answer: str) -> None:
@@ -108,11 +121,20 @@ def prepare(state: KnowledgeGraphState) -> dict[str, Any]:
         "track": str(state.get("track") or knowledge_track(topic)),
         "system_prompt": selected.system,
         "user_prompt": selected.user,
+        "gen_system": selected.system,
+        "gen_user": selected.user,
+        "gen_prompt_variant": {
+            "system_index": selected.system_index,
+            "suffix_index": selected.suffix_index,
+            "temperature": candidate_temperature(1),
+            "prompt_pack": "knowledge-gen-v1",
+        },
         "messages": [{"role": "user", "content": selected.user}],
         "candidate_idx": 1,
         "repair_idx": 0,
         "temperature": candidate_temperature(1),
         "raw_response": "",
+        "origin": "unknown",
         "answer": "",
         "gate_ok": False,
         "gate_reasons": [],
@@ -138,6 +160,7 @@ def prepare(state: KnowledgeGraphState) -> dict[str, Any]:
         "cot_error": "",
         "difficulty": topo.difficulty,
         "candidate_cap": topo.max_candidates,
+        "repair_cap": topo.max_repairs,
     }
 
 
@@ -150,26 +173,55 @@ def generate(state: KnowledgeGraphState) -> dict[str, Any]:
     topic = _topic(state)
     header = f"[Q{qid} knowledge/{topic} candidate={cand} repair={repair} temp={temperature}]"
     settings = get_settings()
+    role = "knowledge_generator" if not repair else "knowledge_repair"
     result = complete_chat(
         messages=list(state.get("messages") or []),
         system=state.get("system_prompt") or SYSTEM_PROMPTS[0],
         temperature=temperature,
-        llm_options=get_knowledge_agent().llm_call_options(settings),
+        llm_options=get_knowledge_agent().llm_call_options(settings, role=role),
         log_header=header,
+        meta=CallMeta(
+            role=role,
+            job_key=legacy_job_key(int(qid), str(state.get("track") or f"knowledge:{topic}")),
+            question_id=int(qid),
+            track=str(state.get("track") or f"knowledge:{topic}"),
+            candidate=int(cand),
+            repair=int(repair),
+        ),
     )
-    return assistant_state_update(state, result, log_header=header)
+    update = assistant_state_update(state, result, log_header=header)
+    route = settings.for_role(role)
+    provenance = dict(state.get("provenance") or {})
+    provenance.update(provider=route.llm_provider, model=route.resolved_model)
+    update["provenance"] = provenance
+    update["origin"] = getattr(result, "origin", "unknown")
+    return update
 
 
 def extract(state: KnowledgeGraphState) -> dict[str, Any]:
     """Pull visible prose out of the last model reply (keep formulas)."""
+    return _extract(state, persist_attempt=True)
+
+
+def extract_compute(state: KnowledgeGraphState) -> dict[str, Any]:
+    """Extract a draft without writing child-process work files."""
+    return _extract(state, persist_attempt=False)
+
+
+def _extract(state: KnowledgeGraphState, *, persist_attempt: bool) -> dict[str, Any]:
     answer = extract_answer(state.get("raw_response") or "")
     if not answer.strip():
         logger.warning("Q%s knowledge: no answer extracted", state["question_id"])
-    _write_attempt(state, answer)
+    if persist_attempt:
+        _write_attempt(state, answer)
+    # Scores belong to the previous draft; a hard-gate failure on this draft
+    # must not show them in the next repair prompt.
     return {
         "answer": answer,
         "judge_must_fix": [],
         "judge_issues": [],
+        "judge_score": 0.0,
+        "judge_dimensions": {},
         "judge_error": "",
         "judge_unavailable": False,
     }
@@ -216,9 +268,19 @@ def judge(state: KnowledgeGraphState) -> dict[str, Any]:
         question=str(state.get("question") or ""),
         answer=str(state.get("answer") or ""),
         topic=_topic(state),
+        meta=CallMeta(
+            role="knowledge_judge",
+            job_key=legacy_job_key(int(state["question_id"]), str(state.get("track") or "knowledge:general")),
+            question_id=int(state["question_id"]),
+            track=str(state.get("track") or "knowledge:general"),
+            candidate=int(state.get("candidate_idx") or 1),
+            repair=int(state.get("repair_idx") or 0),
+            purpose="rubric",
+        ),
     )
     metadata = dict(state.get("metadata") or {})
     metadata["knowledge_judge"] = {
+        "answer_sha256": hashlib.sha256(str(state.get("answer") or "").encode("utf-8")).hexdigest(),
         "pass": result.passed,
         "overall": result.overall,
         "dimensions": result.dimensions,
@@ -267,6 +329,19 @@ def judge(state: KnowledgeGraphState) -> dict[str, Any]:
     }
 
 
+def _generation_requirements(state: KnowledgeGraphState) -> str:
+    """Topic hint and answer rules from the generation prompt, without the question.
+
+    A single-turn repair does not resend the generation turn, so these would
+    otherwise be lost.
+    """
+    gen_user = str(state.get("gen_user") or "").strip()
+    question = str(state.get("question") or "").strip()
+    if question and gen_user.startswith(question):
+        return gen_user[len(question):].strip()
+    return TOPIC_HINTS.get(_topic(state), TOPIC_HINTS["general"])
+
+
 def repair(state: KnowledgeGraphState) -> dict[str, Any]:
     """Append a critique-and-rewrite user message and bump repair_idx."""
     settings = get_settings()
@@ -277,27 +352,37 @@ def repair(state: KnowledgeGraphState) -> dict[str, Any]:
         gate_reasons=list(state.get("gate_reasons") or []),
         must_fix=list(state.get("judge_must_fix") or []),
         issues=list(state.get("judge_issues") or []),
+        judge_score=float(state.get("judge_score") or 0),
+        judge_dimensions=dict(state.get("judge_dimensions") or {}),
     )
+    single_turn = settings.repair_history_mode != "full"
+    if single_turn:
+        requirements = _generation_requirements(state)
+        if requirements:
+            inner = f"{inner}\n\n## Answer requirements (from the original brief)\n{requirements}"
     repair_user = wrap_repair_user(
         question=str(state.get("question") or ""),
         inner=inner,
         error_class="knowledge_quality",
         dialect="knowledge",
     )
-    messages = list(state.get("messages") or [])
-    messages.append({"role": "user", "content": repair_user})
+    if single_turn:
+        messages = [{"role": "user", "content": repair_user}]
+    else:
+        messages = [*(state.get("messages") or []), {"role": "user", "content": repair_user}]
     logger.info(
         "Q%s knowledge candidate %s starting repair %s/%s",
         state["question_id"],
         state.get("candidate_idx", 1),
         next_repair,
-        settings.knowledge_max_repairs,
+        _repair_cap(state, settings),
     )
     return {
         "repair_idx": next_repair,
         "messages": messages,
         "system_prompt": repair_system_prompt("knowledge"),
         "raw_response": "",
+        "origin": "unknown",
         "gate_ok": False,
         "judge_pass": False,
         "judge_error": "",
@@ -337,8 +422,17 @@ def next_candidate(state: KnowledgeGraphState) -> dict[str, Any]:
         "temperature": temperature,
         "system_prompt": selected.system,
         "user_prompt": selected.user,
+        "gen_system": selected.system,
+        "gen_user": selected.user,
+        "gen_prompt_variant": {
+            "system_index": selected.system_index,
+            "suffix_index": selected.suffix_index,
+            "temperature": temperature,
+            "prompt_pack": "knowledge-gen-v1",
+        },
         "messages": [{"role": "user", "content": selected.user}],
         "raw_response": "",
+        "origin": "unknown",
         "answer": "",
         "gate_ok": False,
         "gate_reasons": [],
@@ -397,7 +491,10 @@ def cot(state: KnowledgeGraphState) -> dict[str, Any]:
 def save_success(state: KnowledgeGraphState) -> dict[str, Any]:
     """Write SFT jsonl rows for a quality-gated knowledge answer."""
     settings = get_settings()
-    get_store().write_success(state, model_name=settings.resolved_model)
+    if not accepted_knowledge_answer(state, settings):
+        raise ValueError("knowledge answer lacks matching passing judge evidence")
+    model = str((state.get("provenance") or {}).get("model") or settings.resolved_model)
+    get_store().write_success(state, model_name=model)
     _finalize_answer(state, success=True)
     logger.info(
         "Q%s knowledge saved SFT sample (candidate=%s repairs=%s score=%s cot=%s)",
@@ -407,19 +504,39 @@ def save_success(state: KnowledgeGraphState) -> dict[str, Any]:
         state.get("judge_score", 0),
         state.get("cot_source", "empty"),
     )
+    return finish_success(state)
+
+
+def finish_success(state: KnowledgeGraphState) -> dict[str, Any]:
+    """Return a successful result for parent-process persistence."""
+    if not accepted_knowledge_answer(state, get_settings()):
+        raise ValueError("knowledge answer lacks matching passing judge evidence")
     return {"status": "success"}
+
+
+def _abandon_reason(state: KnowledgeGraphState) -> str:
+    if state.get("judge_unavailable"):
+        return "knowledge_judge_unavailable"
+    if state.get("judge_pass") and not accepted_knowledge_answer(state, get_settings()):
+        return "knowledge_judge_unverified"
+    return "knowledge_quality"
+
+
+def finish_abandoned(state: KnowledgeGraphState) -> dict[str, Any]:
+    """Return an abandoned result for parent-process persistence."""
+    return {"status": "abandoned", "abandon_reason": _abandon_reason(state)}
 
 
 def save_abandoned(state: KnowledgeGraphState) -> dict[str, Any]:
     """Write the abandoned record after all candidates failed the rubric."""
-    reason = "knowledge_judge_unavailable" if state.get("judge_unavailable") else "knowledge_quality"
+    reason = _abandon_reason(state)
     payload = dict(state)
     payload["abandon_reason"] = reason
     get_store().write_abandoned(payload)  # type: ignore[arg-type]
     _finalize_answer(state, success=False)
     logger.info("Q%s knowledge abandoned (%s)", state["question_id"], reason)
     print(f"[Q{state['question_id']} knowledge] abandoned ({reason})", flush=True)
-    return {"status": "abandoned", "abandon_reason": reason}
+    return finish_abandoned(state)
 
 
 def route_after_gate(
@@ -430,7 +547,7 @@ def route_after_gate(
     cap = int(state.get("candidate_cap") or settings.knowledge_max_candidates)
     if state.get("gate_ok"):
         return "judge"
-    if int(state.get("repair_idx") or 0) < settings.knowledge_max_repairs:
+    if int(state.get("repair_idx") or 0) < _repair_cap(state, settings):
         return "repair"
     if int(state.get("candidate_idx") or 1) < cap:
         return "next_candidate"
@@ -446,27 +563,31 @@ def route_after_judge(
     if state.get("judge_unavailable"):
         return "save_abandoned"
     if state.get("judge_pass"):
-        return "cot"
-    if int(state.get("repair_idx") or 0) < settings.knowledge_max_repairs:
+        return "cot" if accepted_knowledge_answer(state, settings) else "save_abandoned"
+    if int(state.get("repair_idx") or 0) < _repair_cap(state, settings):
         return "repair"
     if int(state.get("candidate_idx") or 1) < cap:
         return "next_candidate"
     return "save_abandoned"
 
 
-def build_knowledge_graph():
-    """Compile the per-question knowledge StateGraph."""
+def _build_knowledge_graph(*, persist: bool):
     builder = StateGraph(KnowledgeGraphState)
-    builder.add_node("prepare", prepare)
-    builder.add_node("generate", generate, retry_policy=retry_policy())
-    builder.add_node("extract", extract)
-    builder.add_node("gate", gate)
-    builder.add_node("repair", repair)
-    builder.add_node("next_candidate", next_candidate)
-    builder.add_node("judge", judge)
-    builder.add_node("cot", cot)
-    builder.add_node("save_success", save_success)
-    builder.add_node("save_abandoned", save_abandoned)
+    builder.add_node("prepare", traced("prepare")(prepare))
+    builder.add_node("generate", traced("generate")(generate), retry_policy=retry_policy())
+    builder.add_node("extract", traced("extract")(extract if persist else extract_compute))
+    builder.add_node("gate", traced("gate")(gate))
+    builder.add_node("repair", traced("repair")(repair))
+    builder.add_node("next_candidate", traced("next_candidate")(next_candidate))
+    builder.add_node("judge", traced("judge")(judge))
+    builder.add_node("cot", traced("cot")(cot))
+    success_node = "save_success" if persist else "finish_success"
+    abandoned_node = "save_abandoned" if persist else "finish_abandoned"
+    builder.add_node(success_node, traced(success_node)(save_success if persist else finish_success))
+    builder.add_node(
+        abandoned_node,
+        traced(abandoned_node)(save_abandoned if persist else finish_abandoned),
+    )
 
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "generate")
@@ -479,7 +600,7 @@ def build_knowledge_graph():
             "judge": "judge",
             "repair": "repair",
             "next_candidate": "next_candidate",
-            "save_abandoned": "save_abandoned",
+            "save_abandoned": abandoned_node,
         },
     )
     builder.add_edge("repair", "generate")
@@ -491,13 +612,23 @@ def build_knowledge_graph():
             "cot": "cot",
             "repair": "repair",
             "next_candidate": "next_candidate",
-            "save_abandoned": "save_abandoned",
+            "save_abandoned": abandoned_node,
         },
     )
-    builder.add_edge("cot", "save_success")
-    builder.add_edge("save_success", END)
-    builder.add_edge("save_abandoned", END)
+    builder.add_edge("cot", success_node)
+    builder.add_edge(success_node, END)
+    builder.add_edge(abandoned_node, END)
     return builder.compile()
+
+
+def build_knowledge_graph():
+    """Compile the legacy graph, including sample and work-file writes."""
+    return _build_knowledge_graph(persist=True)
+
+
+def build_knowledge_compute_graph():
+    """Compile the knowledge graph without writes; the caller persists its final state."""
+    return _build_knowledge_graph(persist=False)
 
 
 def knowledge_recursion_limit() -> int:

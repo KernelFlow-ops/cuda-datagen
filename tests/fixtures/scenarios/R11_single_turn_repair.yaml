@@ -1,0 +1,19 @@
+id: R11
+title: 修复调用是单轮消息，包含原题、上一版代码与错误证据
+issues: [Q8]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "1", MAX_REPAIRS: "2", KERNEL_LLM_CRITIC: "off"}
+job: {question_id: 11, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_syntax_error.cu}
+  repair.compile:
+    c1r1: {code: kernels/add_ok.cu}
+  cot_editor:
+    default: {text_file: cot/add_cot_zh.md}
+expect:
+  status: success
+  llm:
+    call_checks:
+      - role: "repair.*"
+        messages_len: 1
+        user_contains: ["## Original problem", "逐元素相加", "## Previous solution.cu", "## Evidence", "expected a"]

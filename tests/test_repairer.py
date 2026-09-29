@@ -8,8 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cuda_sft.agents.repairer import classify_compile_error, wrap_repair_user
+from cuda_sft.agents.repairer import (
+    classify_compile_error,
+    quality_repair_body,
+    repair_system_prompt,
+    wrap_repair_user,
+)
 from cuda_sft.config import Settings
+from cuda_sft.core.types import build_snapshot
 from cuda_sft.prompt import select_prompts
 from cuda_sft.store import Store
 
@@ -35,6 +41,18 @@ class ClassifyTests(unittest.TestCase):
 
 
 class WrapRepairTests(unittest.TestCase):
+    def test_numeric_and_semantic_repair_can_change_wrong_algorithm(self) -> None:
+        for role in ("repair.numeric", "repair.semantic"):
+            body = quality_repair_body(
+                dialect="tilelang", code="def launch(): pass",
+                diagnosis="wrong output", role=role,
+            )
+            system = repair_system_prompt("tilelang", role=role)
+            self.assertIn("wrong output", body)
+            self.assertIn("```python", body)
+            self.assertIn("may change the implementation algorithm", system)
+            self.assertNotIn("only compile", system.lower())
+
     def test_includes_original_question(self) -> None:
         text = wrap_repair_user(
             question="Write vector add",
@@ -86,10 +104,24 @@ class LanguageMatchTests(unittest.TestCase):
         self.assertFalse(selected.system.startswith("你是"))
 
 
+def _selected_state(state: dict) -> dict:
+    metadata = state.get("metadata") or {}
+    refval = metadata.get("refval") or {}
+    state["compile_ok"] = True
+    state["refval_status"] = refval.get("status", "skip")
+    state["candidate_ctx"] = {
+        "gen_system": state.get("system_prompt", ""),
+        "gen_user": state.get("user_prompt", ""),
+        "prompt_variant": {"temperature": 0.2},
+    }
+    state["selected"] = build_snapshot(state, banked_reason="final")
+    return state
+
+
 class StoreUserTests(unittest.TestCase):
     def test_sft_user_is_raw_question(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp))
+            store = Store(Path(tmp), allow_test_sources=True)
             state = {
                 "kind": "kernel",
                 "question_id": 1,
@@ -109,16 +141,16 @@ class StoreUserTests(unittest.TestCase):
                 refval_strict=False,
             )
             with patch("cuda_sft.store.get_settings", return_value=settings):
-                store.write_success(state, model_name="m")  # type: ignore[arg-type]
+                store.write_success(_selected_state(state), model_name="m")  # type: ignore[arg-type]
             row = json.loads(store.sft_path.read_text(encoding="utf-8").splitlines()[0])
             user = next(m["content"] for m in row["messages"] if m["role"] == "user")
             self.assertEqual(user, "vector add")
             self.assertNotIn("nvcc -c", user)
-            self.assertIn("nvcc -c", row["metadata"]["generation_user_prompt"])
+            self.assertIn("nvcc -c", row["metadata"]["generation"]["user"])
 
     def test_critic_and_difficulty_are_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp))
+            store = Store(Path(tmp), allow_test_sources=True)
             state = {
                 "kind": "kernel",
                 "question_id": 2,
@@ -142,7 +174,7 @@ class StoreUserTests(unittest.TestCase):
                 refval_strict=False,
             )
             with patch("cuda_sft.store.get_settings", return_value=settings):
-                store.write_success(state, model_name="m")  # type: ignore[arg-type]
+                store.write_success(_selected_state(state), model_name="m")  # type: ignore[arg-type]
             row = json.loads(store.sft_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertTrue(row["metadata"]["critic"]["skipped"])
             self.assertEqual(row["metadata"]["difficulty"], "simple")
@@ -150,7 +182,7 @@ class StoreUserTests(unittest.TestCase):
 
     def test_refval_metadata_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp))
+            store = Store(Path(tmp), allow_test_sources=True)
             state = {
                 "kind": "kernel",
                 "question_id": 3,
@@ -180,7 +212,7 @@ class StoreUserTests(unittest.TestCase):
                 refval_strict=False,
             )
             with patch("cuda_sft.store.get_settings", return_value=settings):
-                store.write_success(state, model_name="m")  # type: ignore[arg-type]
+                store.write_success(_selected_state(state), model_name="m")  # type: ignore[arg-type]
             row = json.loads(store.sft_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(row["metadata"]["refval"]["status"], "pass")
             self.assertEqual(row["metadata"]["refval"]["cases_run"], 4)

@@ -1,0 +1,25 @@
+id: R03
+title: 胜出者不是最后一个候选（system、user、推理必须属于胜出者）
+issues: [Q1, Q13]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "2", MAX_REPAIRS: "1", KERNEL_LLM_CRITIC: "off", EARLY_STOP: "false"}
+schedules: [serial]
+job: {question_id: 3, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_ok.cu, reasoning: "C1_THINK"}
+    c2r0: {code: kernels/add_syntax_error.cu, reasoning: "C2_THINK"}
+  repair.compile:
+    c2r1: {code: kernels/add_syntax_error.cu, reasoning: "C2_REPAIR_THINK"}
+  cot_editor:
+    default: {text_file: cot/add_cot_zh.md}
+expect:
+  status: success
+  selected: {candidate: 1, repairs: 0, code_file: kernels/add_ok.cu}
+  sample:
+    system_absent_patterns: ["repairer", "compile-fix", "nvcc -c", "Do not explain"]
+    cot_absent_markers: [C2_THINK, C2_REPAIR_THINK]
+    metadata:
+      generation.prompt_variant.temperature: 0.2
+  llm:
+    call_checks:
+      - {role: cot_editor, user_absent: ["C2_THINK", "C2_REPAIR_THINK"]}

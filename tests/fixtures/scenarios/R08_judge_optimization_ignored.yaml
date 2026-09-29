@@ -1,0 +1,15 @@
+id: R08
+title: judge 给出的优化代码未经验证，不得落盘
+issues: [Q7]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "1", MAX_REPAIRS: "0", KERNEL_LLM_CRITIC: "off", USE_JUDGE_OPTIMIZATION: "true"}
+job: {question_id: 8, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_ok.cu}
+  cot_editor:
+    default: {text_file: cot/add_cot_zh.md}
+patches:
+  judge_optimized_code: kernels/add_bad.cu
+expect:
+  status: success
+  selected: {candidate: 1, repairs: 0, code_file: kernels/add_ok.cu}

@@ -17,10 +17,25 @@ from pathlib import Path
 
 from cuda_sft.config import Settings
 from cuda_sft.dialects.agent import get_spec
-from cuda_sft.refval.cases import build_case_plans, case_plan_hash
-from cuda_sft.refval.cross_dialect import canonical_plans, canonical_tasks, group_hash, make_manifest, task_source
-from cuda_sft.refval.runner import run_refval, toolchain_status
-from cuda_sft.refval.spec import stable_hash
+from cuda_sft.refval.cases import case_plan_hash
+from cuda_sft.refval.cross_dialect import (
+    canonical_plans,
+    canonical_tasks,
+    group_hash,
+    make_manifest,
+    task_source,
+)
+from cuda_sft.refval.runner import run_refval
+from cuda_sft.refval.spec import RefvalReport, stable_hash
+
+
+def mutation_caught(report: RefvalReport) -> bool:
+    """Count a mutant only when a numeric comparison detected the error."""
+    return (
+        report.status == "fail"
+        and report.error_class in {"numeric_mismatch", "nan_inf"}
+        and report.cases_run > 0
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,8 +43,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tasks", default="elementwise_add,scale,row_sum")
     parser.add_argument("--dialects", default="cuda,cutlass,triton,tilelang")
     parser.add_argument("--cases", default="smoke", choices=("smoke", "standard", "full"))
-    parser.add_argument("--mutants", action="store_true", help="also run deliberate wrong implementations")
+    parser.add_argument(
+        "--mutants", action="store_true", help="also run deliberate wrong implementations"
+    )
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--work-dir", type=Path, default=None)
     args = parser.parse_args(argv)
 
     settings = Settings(
@@ -40,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         refval_cache=False,
         async_llm_enabled=False,
         workers=1,
-        work_dir=tempfile.mkdtemp(prefix="cross-dialect-oracle-"),
+        work_dir=str(args.work_dir or tempfile.mkdtemp(prefix="cross-dialect-oracle-")),
     )
     registry = canonical_tasks()
     tasks = [item.strip() for item in args.tasks.split(",") if item.strip()]
@@ -50,7 +68,9 @@ def main(argv: list[str] | None = None) -> int:
     for task_id in tasks:
         task = registry.get(task_id)
         if task is None:
-            rows.append({"task_id": task_id, "status": "unavailable", "reason": "unknown canonical task"})
+            rows.append(
+                {"task_id": task_id, "status": "unavailable", "reason": "unknown canonical task"}
+            )
             continue
         for dialect in dialects:
             spec = get_spec(dialect)
@@ -66,7 +86,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             source = task_source(task, dialect)
             if not source.strip():
-                rows.append({**row_base, "status": "unavailable", "reason": "no canonical adapter source for dialect"})
+                rows.append(
+                    {
+                        **row_base,
+                        "status": "unavailable",
+                        "reason": "no canonical adapter source for dialect",
+                    }
+                )
                 continue
             qid = int(stable_hash({"task": task_id})[:8], 16) & 0x7FFFFFFF
             manifest = make_manifest(task, question_id=qid, dialect=dialect)
@@ -115,32 +141,40 @@ def main(argv: list[str] | None = None) -> int:
                     oracle_spec=manifest.backend_contract,
                     case_plans=plans,
                 )
-                rows.append({
-                    **row_base,
-                    "variant": "mutant",
-                    "status": mutant_report.status,
-                    "error_class": mutant_report.error_class,
-                    "cases_run": mutant_report.cases_run,
-                    "failed_case": mutant_report.failed_case,
-                    "cases_hash": mutant_report.cases_hash or case_plan_hash(plans),
-                    "mutation_caught": mutant_report.status == "fail",
-                    "elapsed_sec": round(mutant_report.elapsed_sec, 3),
-                })
+                rows.append(
+                    {
+                        **row_base,
+                        "variant": "mutant",
+                        "status": mutant_report.status,
+                        "error_class": mutant_report.error_class,
+                        "cases_run": mutant_report.cases_run,
+                        "failed_case": mutant_report.failed_case,
+                        "cases_hash": mutant_report.cases_hash or case_plan_hash(plans),
+                    "mutation_caught": mutation_caught(mutant_report),
+                        "elapsed_sec": round(mutant_report.elapsed_sec, 3),
+                    }
+                )
 
     summary = {
         "tasks": tasks,
         "dialects": dialects,
         "cases": args.cases,
         "rows": rows,
-        "good_pass": sum(1 for r in rows if r.get("variant") == "good" and r.get("status") == "pass"),
-        "mutants_caught": sum(1 for r in rows if r.get("variant") == "mutant" and r.get("mutation_caught")),
+        "good_pass": sum(
+            1 for r in rows if r.get("variant") == "good" and r.get("status") == "pass"
+        ),
+        "mutants_caught": sum(
+            1 for r in rows if r.get("variant") == "mutant" and r.get("mutation_caught")
+        ),
         "unavailable": sum(1 for r in rows if r.get("status") == "unavailable"),
         "work_dir": settings.work_dir,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        args.report.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     return 0 if summary["good_pass"] > 0 else 1
 
 

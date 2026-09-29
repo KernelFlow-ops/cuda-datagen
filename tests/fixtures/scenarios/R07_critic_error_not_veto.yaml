@@ -1,0 +1,18 @@
+id: R07
+title: critic 调用故障（unverified）不否决已通过 refval 的候选
+issues: [Q5]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "1", MAX_REPAIRS: "1", KERNEL_LLM_CRITIC: "always"}
+job: {question_id: 7, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_ok.cu, reasoning: "C1_THINK"}
+  critic:
+    default: {raise: timeout}
+  cot_editor:
+    default: {text_file: cot/add_cot_zh.md}
+expect:
+  status: success
+  selected: {candidate: 1, repairs: 0, code_file: kernels/add_ok.cu}
+  sample:
+    metadata:
+      critic.status: unverified

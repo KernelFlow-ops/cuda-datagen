@@ -6,7 +6,6 @@ import unittest
 
 from cuda_sft.parse import abi_matches_source, heuristic_cuda_abi, parse_refval_manifest
 
-
 ADD_SOURCE = """
 #include <cuda_runtime.h>
 __global__ void add_kernel(const float* a, const float* b, float* c, int n) {
@@ -83,6 +82,25 @@ class HeuristicAbiTests(unittest.TestCase):
         issues = abi_matches_source(abi, bad)
         self.assertTrue(any("count mismatch" in issue for issue in issues))
         self.assertTrue(any("type mismatch" in issue for issue in issues))
+
+    def test_unsigned_short_half_storage_signature(self) -> None:
+        source = """
+#include <cuda_fp16.h>
+__global__ void row_kernel(const unsigned short* A, unsigned short* sums, int cols) {}
+void matrix_row_sum_fp16(const unsigned short* A, unsigned short* sums, int rows, int cols) {
+  row_kernel<<<rows, 32>>>(A, sums, cols);
+}
+"""
+        abi = heuristic_cuda_abi(source)
+        self.assertIsNotNone(abi)
+        assert abi is not None
+        self.assertEqual([p.dtype for p in abi.params[:2]], ["u16", "u16"])
+        self.assertEqual(abi_matches_source(abi, source), [])
+        from cuda_sft.refval.harness import render_cuda_harness
+
+        harness = render_cuda_harness(abi, [])
+        self.assertIn("const unsigned short*", harness)
+        self.assertIn("unsigned short*", harness)
 
     def test_multiletter_scalar_names_match(self) -> None:
         source = """

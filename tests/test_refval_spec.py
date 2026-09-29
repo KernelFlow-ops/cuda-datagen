@@ -15,6 +15,9 @@ from cuda_sft.refval.spec import (
     dumps,
     loads_manifest,
     normalize_dtype,
+    cpp_type,
+    dtype_nbytes,
+    numpy_dtype_name,
     seed_for,
 )
 
@@ -33,6 +36,21 @@ class DtypeTests(unittest.TestCase):
         self.assertEqual(normalize_dtype("float32"), "f32")
         self.assertEqual(normalize_dtype("int32_t"), "i32")
         self.assertEqual(normalize_dtype("__half"), "f16")
+        self.assertEqual(normalize_dtype("unsigned short"), "u16")
+        self.assertEqual(normalize_dtype("uint16_t"), "u16")
+        self.assertEqual(normalize_dtype("cublasHandle_t"), "cublas_handle")
+        self.assertEqual(normalize_dtype("cufftHandle"), "cufft_handle")
+        self.assertEqual(normalize_dtype("cufftComplex"), "c64")
+        self.assertEqual(numpy_dtype_name("c64"), "complex64")
+        self.assertEqual(dtype_nbytes("c64"), 8)
+        self.assertEqual(cpp_type("cublas_handle"), "cublasHandle_t")
+        self.assertEqual(
+            KernelParam.from_dict({"name": "handle", "kind": "scalar", "dtype": "cublasHandle_t"}).dtype,
+            "cublas_handle",
+        )
+        self.assertEqual(cpp_type("u16", pointer=True), "unsigned short*")
+        self.assertEqual(numpy_dtype_name("u16"), "uint16")
+        self.assertEqual(dtype_nbytes("u16"), 2)
 
 
 class RoundTripTests(unittest.TestCase):

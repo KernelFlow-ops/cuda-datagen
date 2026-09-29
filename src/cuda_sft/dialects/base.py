@@ -104,8 +104,8 @@ class DialectSpec(Protocol):
         """Built-in compile smoke for ``--dry-compile``."""
         ...
 
-    def cot_skeleton(self) -> str:
-        """Six-heading CoT outline for the editor agent."""
+    def cot_skeleton(self, lang: str = "en") -> str:
+        """Six-heading CoT outline for the editor agent (``en`` or ``zh``)."""
         ...
 
     def refval_spec(self, settings: Settings) -> DialectRefvalSpec:

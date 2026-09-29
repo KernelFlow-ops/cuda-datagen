@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from cuda_sft.core.cot import clean_raw_reasoning as _clean_raw_reasoning
+from cuda_sft.core.cot import clip_at_boundary
 from cuda_sft.parse import (
     ANY_FENCE_RE,
     collapse_blank_lines,
@@ -14,21 +16,22 @@ from cuda_sft.parse import (
 
 MIN_COT_CHARS = 120
 
+_TRUNCATED_TAIL_RE = re.compile(
+    r"(?:\.\.\.\s*\[truncated[^\]]*\]|\[truncated[^\]]*\]|\.\.\.|…)$",
+    re.IGNORECASE,
+)
+
 
 def clean_raw_reasoning(text: str, max_chars: int) -> str:
     """Normalize teacher thinking before storing or sending to the CoT editor.
 
+    Formulas and code are kept (knowledge answers may quote them).
+
     Args:
         text: Raw API reasoning, possibly tagged.
-        max_chars: Truncate to this many characters; ``<=0`` disables.
+        max_chars: Budget; ``<=0`` disables. Keeps the head and the tail.
     """
-    raw = text or ""
-    tagged = extract_thinking(raw)
-    body = tagged if tagged.strip() else raw
-    body = collapse_blank_lines(body)
-    if max_chars > 0 and len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n...[truncated reasoning]..."
-    return body
+    return _clean_raw_reasoning(text, max_chars, strip_code=False)
 
 HEADING_RE = re.compile(r"(?m)^(#{1,4}\s+\S+|#{0,4}\s*(结论|推导|机制|适用边界|答案|Answer|Conclusion|Derivation|Caveats)\b)")
 NUMBERED_RE = re.compile(r"(?m)^\s*(?:\d+[\.\)]\s+\S+|[-*]\s+\S+)")
@@ -49,6 +52,21 @@ def extract_answer(text: str) -> str:
     """
     visible, _thinking = split_visible_and_thinking(text or "")
     return collapse_blank_lines(visible)
+
+
+def answer_integrity_issues(answer: str) -> list[str]:
+    """Catch visible signs of an unfinished response before quality review."""
+    body = (answer or "").rstrip()
+    if not body:
+        return []
+    issues: list[str] = []
+    if _TRUNCATED_TAIL_RE.search(body) or body.endswith((",", ":", ";", "=", "->", "→")):
+        issues.append("answer ends mid-thought or with a truncation marker")
+    if len(re.findall(r"(?m)^[ \t]*```", body)) % 2:
+        issues.append("answer has an unclosed Markdown fence")
+    if body.count("$$") % 2 or body.count(r"\[") != body.count(r"\]"):
+        issues.append("answer has an unclosed display equation")
+    return issues
 
 
 def fence_char_ratio(text: str) -> float:
@@ -76,9 +94,7 @@ def looks_structured(text: str) -> bool:
     raw = text or ""
     if HEADING_RE.search(raw):
         return True
-    if len(NUMBERED_RE.findall(raw)) >= 2:
-        return True
-    return False
+    return len(NUMBERED_RE.findall(raw)) >= 2
 
 
 def has_derivation_steps(text: str) -> bool:
@@ -86,9 +102,7 @@ def has_derivation_steps(text: str) -> bool:
     raw = text or ""
     if len(STEP_RE.findall(raw)) >= 2:
         return True
-    if len(NUMBERED_RE.findall(raw)) >= 3:
-        return True
-    return False
+    return len(NUMBERED_RE.findall(raw)) >= 3
 
 
 def sanitize_knowledge_cot(text: str, max_chars: int) -> str:
@@ -97,6 +111,4 @@ def sanitize_knowledge_cot(text: str, max_chars: int) -> str:
     tagged = extract_thinking(raw)
     body = tagged if tagged.strip() else strip_thinking(raw)
     body = collapse_blank_lines(body)
-    if max_chars > 0 and len(body) > max_chars:
-        body = body[:max_chars].rstrip()
-    return body
+    return clip_at_boundary(body, max_chars)

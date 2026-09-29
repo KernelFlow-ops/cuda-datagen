@@ -8,6 +8,8 @@ Knowledge jobs use ``knowledge:{topic}`` so progress keys stay disjoint from
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import unicodedata
 from typing import Any, Literal, Mapping
 
 Kind = Literal["kernel", "knowledge"]
@@ -24,6 +26,16 @@ KNOWN_TOPICS = (
     "worked_example",
     "general",
 )
+
+
+def normalize_question(text: str) -> str:
+    """Normalize question text for stable identity across input files."""
+    return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+def question_hash(text: str) -> str:
+    """SHA256 of the normalized question, independent of its source line."""
+    return hashlib.sha256(normalize_question(text).encode("utf-8")).hexdigest()
 
 
 def knowledge_track(topic: str) -> str:

@@ -73,7 +73,9 @@ class AgentExpandTests(unittest.TestCase):
             kernel_dialects = "cuda,triton"
             kernel_dialect = ""
 
-        with patch.object(agent, "resolve", return_value=[agent.spec("cuda"), agent.spec("triton")]):
+        with patch.object(
+            agent, "resolve", return_value=[agent.spec("cuda"), agent.spec("triton")]
+        ):
             jobs = agent.expand_jobs([(1, "q1"), (2, "q2")], settings=_S())  # type: ignore[arg-type]
         self.assertEqual(
             jobs,
@@ -95,7 +97,8 @@ class ProgressKeyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "progress.jsonl"
             path.write_text(
-                json.dumps({"id": 7, "status": "success"}) + "\n"
+                json.dumps({"id": 7, "status": "success"})
+                + "\n"
                 + json.dumps({"id": 8, "dialect": "triton", "status": "success"})
                 + "\n",
                 encoding="utf-8",

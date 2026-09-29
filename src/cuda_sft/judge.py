@@ -21,7 +21,7 @@ class JudgeResult:
     quality_score: int
     issues: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
-    optimized_code: str = ""
+    optimized_code: str = ""  # Legacy field; judge output never replaces validated code.
 
 
 class CudaCodeJudge:

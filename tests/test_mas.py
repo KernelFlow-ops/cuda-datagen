@@ -37,6 +37,11 @@ class DifficultyTests(unittest.TestCase):
     def test_gemm_is_hard(self) -> None:
         self.assertEqual(kernel_difficulty("Write a tiled GEMM kernel"), "hard")
 
+    def test_chinese_kernel_questions_use_operation_difficulty(self) -> None:
+        self.assertEqual(kernel_difficulty("实现向量加法，每个线程处理一个元素"), "simple")
+        self.assertEqual(kernel_difficulty("实现分块矩阵乘法并使用共享内存"), "hard")
+        self.assertEqual(kernel_difficulty("实现每行前缀和扫描"), "hard")
+
     def test_simple_skips_critic_and_uses_small_candidate_budget(self) -> None:
         plan = plan_topology(
             question="elementwise relu",
@@ -79,7 +84,7 @@ class CriticRouteTests(unittest.TestCase):
                 "collect_candidate",
             )
 
-    def test_must_fix_repairs_when_budget_left(self) -> None:
+    def test_failed_critic_banks_before_repair_when_budget_left(self) -> None:
         with patch("cuda_sft.graph.get_settings", return_value=_settings()):
             self.assertEqual(
                 route_after_critic(
@@ -87,9 +92,10 @@ class CriticRouteTests(unittest.TestCase):
                         "critic_pass": False,
                         "critic_must_fix": ["wrong host signature"],
                         "repair_idx": 0,
+                        "metadata": {"critic": {"status": "failed"}},
                     }
                 ),
-                "repair",
+                "bank_pre_repair",
             )
 
 

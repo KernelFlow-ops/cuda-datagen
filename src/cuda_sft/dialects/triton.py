@@ -9,7 +9,7 @@ from cuda_sft.config import Settings
 from cuda_sft.dialects.python_check import run_python_gate
 from cuda_sft.judge import JudgeResult
 from cuda_sft.parse import extract_fenced_source
-from cuda_sft.prompt import SelectedPrompts, format_nvcc_for_prompt
+from cuda_sft.prompt import SelectedPrompts
 from cuda_sft.prompts.selection import language_matched_index, stable_index
 from cuda_sft.refval.spec import DialectRefvalSpec
 
@@ -89,6 +89,15 @@ COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry.
 4. Memory and mask — tl.load/store masks, coalescing.
 5. Bounds and edge cases — n not multiple of BLOCK, empty n.
 6. Implementation checklist — jit kernel name, host launcher, constexprs."""
+
+COT_SKELETON_ZH_TRITON = (
+    "1. 题意与张量/入口\n"
+    "2. 算法\n"
+    "3. program_id 与 BLOCK 映射\n"
+    "4. 访存与 mask\n"
+    "5. 边界与异常\n"
+    "6. 实现清单"
+)
 
 
 def looks_like_triton(source: str) -> bool:
@@ -190,7 +199,7 @@ class TritonDialect:
         )
         return REPAIR_PROMPTS[idx].format(
             cuda_arch=cuda_arch,
-            error=format_nvcc_for_prompt(compile_error),
+            error=compile_error.strip() or "(empty compiler output)",
             code=previous_code.strip() or "(no source extracted)",
         )
 
@@ -221,8 +230,9 @@ class TritonDialect:
     def smoke(self, settings: Settings, workdir: Path) -> CompileResult:
         return self.compile(SMOKE_SOURCE, workdir, settings)
 
-    def cot_skeleton(self) -> str:
-        return COT_SKELETON
+    def cot_skeleton(self, lang: str = "en") -> str:
+        """Six-heading CoT outline; ``lang="zh"`` returns the Chinese headings."""
+        return COT_SKELETON_ZH_TRITON if lang == "zh" else COT_SKELETON
 
     def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
         """Import ``solution.py`` and call the host launcher with torch CUDA tensors."""

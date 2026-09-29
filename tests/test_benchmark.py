@@ -51,7 +51,9 @@ def test_redaction_preserves_json_types(monkeypatch) -> None:
     assert "secret-one" in secrets and "secret-two" in secrets
     assert "50000" not in secrets
     assert benchmark._sanitize({"tokens": 50000, "nested": ["secret-one"]}, secrets) == {
-        "tokens": 50000, "nested": ["[REDACTED]"]}
+        "tokens": 50000,
+        "nested": ["[REDACTED]"],
+    }
 
 
 def test_safe_settings_env_only(monkeypatch) -> None:
@@ -68,10 +70,15 @@ def test_duplicate_and_wrong_track_are_integrity_errors(tmp_path: Path, monkeypa
     directory.mkdir(parents=True)
     rows = [{"id": 1, "dialect": "triton", "status": "success"}] * 2
     (directory / "progress.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in rows) + "\ninvalid\n", encoding="utf-8")
+        "\n".join(json.dumps(row) for row in rows) + "\ninvalid\n", encoding="utf-8"
+    )
     result = benchmark.collect_pipeline("baseline", "cuda", "bad")
     assert result["artifacts"]["progress.jsonl"] == {
-        "rows": 2, "duplicates": 1, "extraneous": 2, "corrupt": 1}
+        "rows": 2,
+        "duplicates": 1,
+        "extraneous": 2,
+        "corrupt": 1,
+    }
     assert not result["complete"]
 
 
@@ -99,8 +106,11 @@ def test_negative_subprocess_exit_is_failure(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(benchmark, "run_pipeline", lambda *args: -9)
     monkeypatch.setattr(benchmark, "collect_pipeline", lambda *args: {"complete": True})
-    monkeypatch.setattr(benchmark, "write_report", lambda *args: (
-        tmp_path / "benchmark.json", tmp_path / "benchmark.md"))
+    monkeypatch.setattr(
+        benchmark,
+        "write_report",
+        lambda *args: (tmp_path / "benchmark.json", tmp_path / "benchmark.md"),
+    )
     assert benchmark.main(["--run-id", "kill", "--pipeline", "cuda"]) == 1
 
 
@@ -111,11 +121,17 @@ def test_report_rebuild_preserves_runtime_evidence(tmp_path: Path, monkeypatch) 
     for index, pipeline in enumerate(benchmark.PIPELINES):
         directory = benchmark.pipeline_dir("baseline", pipeline, "timing")
         directory.mkdir(parents=True)
-        (directory / "benchmark_runtime.json").write_text(json.dumps({
-            "started_at": f"2026-09-17T15:{index:02d}:00+00:00",
-            "finished_at": f"2026-09-17T15:{index + 1:02d}:00+00:00",
-            "return_code": 0, "monotonic_wall_seconds": 60,
-        }), encoding="utf-8")
+        (directory / "benchmark_runtime.json").write_text(
+            json.dumps(
+                {
+                    "started_at": f"2026-09-17T15:{index:02d}:00+00:00",
+                    "finished_at": f"2026-09-17T15:{index + 1:02d}:00+00:00",
+                    "return_code": 0,
+                    "monotonic_wall_seconds": 60,
+                }
+            ),
+            encoding="utf-8",
+        )
     json_path, _ = benchmark.write_report("baseline", "timing")
     first = json.loads(json_path.read_text())
     json_path, _ = benchmark.write_report("baseline", "timing")
@@ -131,17 +147,24 @@ def test_terminal_artifacts_require_finished_zero_exit(tmp_path: Path, monkeypat
     monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
     directory = benchmark.pipeline_dir("baseline", "cuda", "terminal")
     directory.mkdir(parents=True)
-    progress = [{"id": qid, "dialect": "cuda", "status": "abandoned"}
-                for qid in benchmark.KERNEL_IDS]
-    abandoned = [{"id": qid, "dialect": "cuda", "reason": "knowledge_judge_unavailable"}
-                 for qid in benchmark.KERNEL_IDS]
+    progress = [
+        {"id": qid, "dialect": "cuda", "status": "abandoned"} for qid in benchmark.KERNEL_IDS
+    ]
+    abandoned = [
+        {"id": qid, "dialect": "cuda", "reason": "knowledge_judge_unavailable"}
+        for qid in benchmark.KERNEL_IDS
+    ]
     for filename, rows in (("progress.jsonl", progress), ("abandoned.jsonl", abandoned)):
         (directory / filename).write_text("\n".join(map(json.dumps, rows)), encoding="utf-8")
     assert not benchmark.collect_pipeline("baseline", "cuda", "terminal")["complete"]
     runtime_path = directory / "benchmark_runtime.json"
-    runtime_path.write_text('{"return_code":1,"finished_at":"2026-09-17T15:00:00Z"}', encoding="utf-8")
+    runtime_path.write_text(
+        '{"return_code":1,"finished_at":"2026-09-17T15:00:00Z"}', encoding="utf-8"
+    )
     assert not benchmark.collect_pipeline("baseline", "cuda", "terminal")["complete"]
-    runtime_path.write_text('{"return_code":0,"finished_at":"2026-09-17T15:00:00Z"}', encoding="utf-8")
+    runtime_path.write_text(
+        '{"return_code":0,"finished_at":"2026-09-17T15:00:00Z"}', encoding="utf-8"
+    )
     result = benchmark.collect_pipeline("baseline", "cuda", "terminal")
     assert result["complete"]
     assert result["jobs"][0]["error_category"] == "judge_unavailable"
@@ -149,12 +172,15 @@ def test_terminal_artifacts_require_finished_zero_exit(tmp_path: Path, monkeypat
 
 def test_log_metrics_provider_compile_and_midnight() -> None:
     """Log evidence maps providers and handles second-resolution midnight wrap."""
-    log = "\n".join([
-        "23:59:50 INFO [w2] cuda_sft: worker 2 provider=nvidia#2 model=m",
-        "23:59:55 INFO [w2] cuda_sft.graph: [Q1 cuda candidate=1] calling model",
-        "[Q1 cuda] compile FAIL", "[Q1 cuda] compile PASS",
-        "00:00:10 INFO [w2] cuda_sft.graph: Q1 cuda saved SFT sample",
-    ])
+    log = "\n".join(
+        [
+            "23:59:50 INFO [w2] cuda_sft: worker 2 provider=nvidia#2 model=m",
+            "23:59:55 INFO [w2] cuda_sft.graph: [Q1 cuda candidate=1] calling model",
+            "[Q1 cuda] compile FAIL",
+            "[Q1 cuda] compile PASS",
+            "00:00:10 INFO [w2] cuda_sft.graph: Q1 cuda saved SFT sample",
+        ]
+    )
     result = benchmark._log_job_metrics(log)[1]
     assert result["provider"] == "nvidia"
     assert result["derived_elapsed_seconds"] == 15

@@ -32,6 +32,7 @@ ERROR_CLASSES = (
     "timeout",
     "signature_mismatch",
     "reference_error",
+    "invalid_oracle",
     "compile_error",
     "driver_import",
     "entry_missing",
@@ -97,12 +98,26 @@ DTYPE_ALIASES = {
     "uint8_t": "u8",
     "unsigned char": "u8",
     "u8": "u8",
+    "uint16": "u16",
+    "uint16_t": "u16",
+    "unsigned short": "u16",
+    "unsigned short int": "u16",
+    "u16": "u16",
     "uint32": "u32",
     "uint32_t": "u32",
     "unsigned": "u32",
     "unsigned int": "u32",
     "u32": "u32",
     "bool": "bool",
+    "cublashandle_t": "cublas_handle",
+    "cublas_handle": "cublas_handle",
+    "cuffthandle": "cufft_handle",
+    "cufft_handle": "cufft_handle",
+    "cufftcomplex": "c64",
+    "cucomplex": "c64",
+    "float2": "c64",
+    "complex64": "c64",
+    "c64": "c64",
 }
 
 CPP_DTYPE = {
@@ -114,8 +129,12 @@ CPP_DTYPE = {
     "i64": "long long",
     "i8": "signed char",
     "u8": "unsigned char",
+    "u16": "unsigned short",
     "u32": "unsigned int",
     "bool": "bool",
+    "cublas_handle": "cublasHandle_t",
+    "cufft_handle": "cufftHandle",
+    "c64": "cufftComplex",
 }
 
 NUMPY_DTYPE = {
@@ -127,8 +146,10 @@ NUMPY_DTYPE = {
     "i64": "int64",
     "i8": "int8",
     "u8": "uint8",
+    "u16": "uint16",
     "u32": "uint32",
     "bool": "bool",
+    "c64": "complex64",
 }
 
 DTYPE_NBYTES = {
@@ -140,8 +161,10 @@ DTYPE_NBYTES = {
     "i64": 8,
     "i8": 1,
     "u8": 1,
+    "u16": 2,
     "u32": 4,
     "bool": 1,
+    "c64": 8,
 }
 
 DEFAULT_TOLERANCES: dict[str, dict[str, float]] = {
@@ -153,12 +176,15 @@ DEFAULT_TOLERANCES: dict[str, dict[str, float]] = {
     "i64": {"atol": 0.0, "rtol": 0.0},
     "i8": {"atol": 0.0, "rtol": 0.0},
     "u8": {"atol": 0.0, "rtol": 0.0},
+    "u16": {"atol": 0.0, "rtol": 0.0},
     "u32": {"atol": 0.0, "rtol": 0.0},
     "bool": {"atol": 0.0, "rtol": 0.0},
+    "c64": {"atol": 1.0e-4, "rtol": 1.0e-3},
 }
 
 FLOAT_DTYPES = frozenset({"f32", "f64", "f16", "bf16"})
-INT_DTYPES = frozenset({"i32", "i64", "i8", "u8", "u32"})
+COMPLEX_DTYPES = frozenset({"c64"})
+INT_DTYPES = frozenset({"i32", "i64", "i8", "u8", "u16", "u32"})
 
 
 def normalize_dtype(raw: str | None) -> str:
@@ -571,6 +597,14 @@ class KernelABI:
             for dim in param.shape_from:
                 if dim not in size_names and dim not in names:
                     problems.append(f"{param.name}.shape_from references unknown {dim!r}")
+        for param in self.params:
+            if param.dtype in {"cublas_handle", "cufft_handle"} and param.kind != "scalar":
+                problems.append(f"{param.name}: {param.dtype} must be a scalar parameter")
+        if self.returns in {"cublas_handle", "cufft_handle"}:
+            problems.append(f"{self.returns} return is unsupported")
+        if any(p.dtype == "cufft_handle" for p in self.params):
+            if not any(p.dtype == "c64" and p.rank == 2 for p in self.input_params()):
+                problems.append("cufft_handle requires a rank-2 c64 input for plan dimensions")
         if not self.output_params() and (not self.returns or self.returns == "void"):
             problems.append("no output buffers and no scalar return")
         return problems
@@ -882,6 +916,8 @@ class RefvalReport:
     semantic_contract: dict[str, Any] = field(default_factory=dict)
     backend_contract: dict[str, Any] = field(default_factory=dict)
     contract_version: str = REFVAL_CONTRACT_VERSION
+    oracle_origin: str = "none"
+    verification_tier: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         """Full JSON-serializable mapping."""
@@ -912,6 +948,8 @@ class RefvalReport:
             "semantic_contract": self.semantic_contract,
             "backend_contract": self.backend_contract,
             "contract_version": self.contract_version,
+            "oracle_origin": self.oracle_origin,
+            "verification_tier": self.verification_tier,
         }
 
     def to_metadata(self) -> dict[str, Any]:
@@ -940,6 +978,8 @@ class RefvalReport:
             "semantic_contract": self.semantic_contract,
             "backend_contract": self.backend_contract,
             "contract_version": self.contract_version,
+            "oracle_origin": self.oracle_origin,
+            "verification_tier": self.verification_tier,
         }
 
     @classmethod
@@ -978,6 +1018,8 @@ class RefvalReport:
             semantic_contract=dict(data.get("semantic_contract") or {}) if isinstance(data.get("semantic_contract"), Mapping) else {},
             backend_contract=dict(data.get("backend_contract") or {}) if isinstance(data.get("backend_contract"), Mapping) else {},
             contract_version=str(data.get("contract_version") or REFVAL_CONTRACT_VERSION),
+            oracle_origin=str(data.get("oracle_origin") or "none"),
+            verification_tier=str(data.get("verification_tier") or "none"),
         )
 
     @classmethod

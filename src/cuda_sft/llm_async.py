@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
@@ -11,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cuda_sft.llm import LLMCompletion
+from cuda_sft.runtime.meta import CallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,7 @@ class AsyncLLMPool:
 
     Since LangGraph nodes run synchronously, we use a ThreadPoolExecutor
     to launch LLM calls in the background. Compile nodes can enqueue
-    speculative repair requests, and repair nodes can check if the response
-    is ready.
+    independent prefetch requests and consume them at the dependent stage.
     """
 
     def __init__(self, max_workers: int = 2) -> None:
@@ -62,6 +61,7 @@ class AsyncLLMPool:
         thinking_level: str | None = None,
         max_output_tokens: int | None = None,
         reasoning_max_tokens: int | None = None,
+        meta: CallMeta | None = None,
     ) -> None:
         """Start a speculative LLM call in the background.
 
@@ -75,11 +75,6 @@ class AsyncLLMPool:
             max_output_tokens: Optional per-call max_tokens override.
             reasoning_max_tokens: Optional reasoning token cap.
         """
-        with self._lock:
-            if request_id in self.pending:
-                logger.warning("Request %s already pending; skipping duplicate", request_id)
-                return
-
         def _call() -> LLMCompletion:
             """Wrapper for executor."""
             try:
@@ -94,6 +89,7 @@ class AsyncLLMPool:
                         thinking_level=thinking_level,
                         max_output_tokens=max_output_tokens,
                         reasoning_max_tokens=reasoning_max_tokens,
+                        meta=meta,
                     )
                 else:
                     text = llm_client.stream_text(
@@ -101,6 +97,7 @@ class AsyncLLMPool:
                         system=system,
                         temperature=temperature,
                         print_stream=False,
+                        meta=meta,
                     )
                     completion = LLMCompletion(
                         text=text, reasoning="", reasoning_source="empty"
@@ -116,15 +113,16 @@ class AsyncLLMPool:
                 logger.exception("Async LLM call failed: %s", request_id)
                 raise
 
-        future = self.executor.submit(_call)
-        req = PendingRequest(
-            request_id=request_id,
-            future=future,
-            started_at=time.time(),
-        )
-
         with self._lock:
-            self.pending[request_id] = req
+            if request_id in self.pending:
+                logger.warning("Request %s already pending; skipping duplicate", request_id)
+                return
+            future = self.executor.submit(_call)
+            self.pending[request_id] = PendingRequest(
+                request_id=request_id,
+                future=future,
+                started_at=time.time(),
+            )
 
     def is_pending(self, request_id: str) -> bool:
         """Return True if ``request_id`` is still tracked (running or finished)."""
@@ -146,30 +144,37 @@ class AsyncLLMPool:
         Returns:
             LLM completion if ready, else None.
         """
-        with self._lock:
-            req = self.pending.get(request_id)
-
-        if req is None:
-            return None
-
         try:
-            wait = timeout_sec if timeout_sec > 0 else 0
-            if wait <= 0 and not req.future.done():
-                return None
-            text = req.future.result(timeout=wait)
+            return self.get(request_id, timeout_sec=timeout_sec)
         except (TimeoutError, FuturesTimeoutError):
             return None
         except Exception as exc:
-            if not req.future.done():
-                return None
             logger.warning("Failed to retrieve async result for %s: %s", request_id, exc)
-            with self._lock:
-                self.pending.pop(request_id, None)
             return None
 
+    def get(self, request_id: str, timeout_sec: float = 0) -> LLMCompletion | None:
+        """Consume one request, preserving a running future on timeout.
+
+        Errors from the original API request propagate so callers cannot
+        silently issue the same prompt a second time.
+        """
         with self._lock:
-            self.pending.pop(request_id, None)
-        return text
+            req = self.pending.get(request_id)
+        if req is None:
+            return None
+        try:
+            return req.future.result(timeout=max(0.0, timeout_sec))
+        except FuturesTimeoutError as exc:
+            if type(exc) is TimeoutError:
+                raise
+            raise TimeoutError(str(exc) or "asynchronous LLM request timed out") from exc
+        except TimeoutError:
+            raise
+        finally:
+            if req.future.done():
+                with self._lock:
+                    if self.pending.get(request_id) is req:
+                        self.pending.pop(request_id, None)
 
     def cancel(self, request_id: str) -> None:
         """Cancel a pending request (e.g., when another candidate wins).

@@ -116,9 +116,11 @@ class ExpandTests(unittest.TestCase):
         agent = KernelDialectAgent()
         rows = [QuestionRow(1, "q1", {}), QuestionRow(2, "q2", {"task": "knowledge"})]
         settings = _settings(task_mode="kernel", kernel_mode="single", kernel_dialects="cuda")
-        with patch.object(agent, "resolve", return_value=[agent.spec("cuda")]):
-            with patch("cuda_sft.dialects.agent.get_dialect_agent", return_value=agent):
-                jobs = expand_pipeline_jobs(rows, settings=settings)  # type: ignore[arg-type]
+        with (
+            patch.object(agent, "resolve", return_value=[agent.spec("cuda")]),
+            patch("cuda_sft.dialects.agent.get_dialect_agent", return_value=agent),
+        ):
+            jobs = expand_pipeline_jobs(rows, settings=settings)  # type: ignore[arg-type]
         self.assertEqual([job.kind for job in jobs], ["kernel", "kernel"])
         self.assertEqual([job.track for job in jobs], ["cuda", "cuda"])
         self.assertTrue(all(job.kind == "kernel" for job in jobs))
@@ -148,11 +150,11 @@ class ExpandTests(unittest.TestCase):
             QuestionRow(2, "Explain CUDA memory hierarchy.", {"task": "knowledge"}),
         ]
         settings = _settings(task_mode="auto", kernel_mode="all", kernel_dialects="cuda,triton")
-        with patch.object(
-            agent, "resolve", return_value=[agent.spec("cuda"), agent.spec("triton")]
+        with (
+            patch.object(agent, "resolve", return_value=[agent.spec("cuda"), agent.spec("triton")]),
+            patch("cuda_sft.dialects.agent.get_dialect_agent", return_value=agent),
         ):
-            with patch("cuda_sft.dialects.agent.get_dialect_agent", return_value=agent):
-                jobs = expand_pipeline_jobs(rows, settings=settings)  # type: ignore[arg-type]
+            jobs = expand_pipeline_jobs(rows, settings=settings)  # type: ignore[arg-type]
         kernel = [job for job in jobs if job.kind == "kernel"]
         knowledge = [job for job in jobs if job.kind == "knowledge"]
         self.assertEqual({job.track for job in kernel}, {"cuda", "triton"})

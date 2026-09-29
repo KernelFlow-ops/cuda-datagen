@@ -17,18 +17,20 @@ def _is_setup_cli(argv: list[str]) -> bool:
 
 
 def _bootstrap_core_deps() -> None:
-    """Install requirements.txt if the generation CLI cannot import its stack."""
+    """Install the local project if the generation CLI cannot import its stack."""
     missing: list[str] = []
-    for name in ("pydantic", "pydantic_settings", "dotenv", "langgraph", "tqdm"):
+    for name in (
+        "numpy", "langgraph", "anthropic", "openai", "dotenv",
+        "pydantic", "pydantic_settings", "tqdm",
+    ):
         try:
             __import__(name)
         except ImportError:
             missing.append(name)
     if not missing:
         return
-    req = ROOT / "requirements.txt"
-    print(f"missing Python packages ({', '.join(missing)}); pip install -r {req}", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", str(req)])
+    print(f"missing Python packages ({', '.join(missing)}); installing {ROOT}", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", str(ROOT)])
 
 
 if __name__ == "__main__":

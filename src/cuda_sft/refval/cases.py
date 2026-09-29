@@ -11,21 +11,21 @@ import json
 import math
 import shutil
 import struct
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from cuda_sft.refval.spec import (
-    CasePlan,
+    COMPLEX_DTYPES,
     FLOAT_DTYPES,
     INT_DTYPES,
+    CasePlan,
     KernelABI,
     KernelParam,
-    dtype_nbytes,
     case_seed_for,
     cases_hash,
     normalize_dtype,
     numpy_dtype_name,
-    seed_for,
 )
 
 NON_TILE_SIZES = (1, 7, 33, 63, 255, 257)
@@ -97,10 +97,9 @@ def _shape_for_param(
         dims: list[int] = []
         for name in param.shape_from:
             dims.append(int(sizes.get(name, default_n)))
-        if broadcast and dims:
-            # Shrink the last axis of non-output inputs so broadcast bugs surface.
-            if param.kind == "input" and len(dims) >= 2:
-                dims[-1] = 1 if dims[-1] > 1 else dims[-1]
+        # Shrink the last axis of non-output inputs so broadcast bugs surface.
+        if broadcast and dims and param.kind == "input" and len(dims) >= 2:
+            dims[-1] = 1 if dims[-1] > 1 else dims[-1]
         return tuple(max(0, d) for d in dims)
     rank = max(1, int(param.rank or 1))
     if rank == 1:
@@ -134,6 +133,9 @@ def _scalar_defaults(abi: KernelABI, sizes: Mapping[str, int], rng_seed: int) ->
     for param in abi.scalar_params():
         dtype = normalize_dtype(param.dtype)
         name = param.name.lower()
+        if dtype in {"cublas_handle", "cufft_handle"}:
+            out[param.name] = None
+            continue
         if dtype in INT_DTYPES:
             if "stride" in name:
                 out[param.name] = 1
@@ -211,6 +213,9 @@ def build_case_plans(
                 sizes[name] = max(1, int(n) // 2)
             else:
                 sizes[name] = int(n)
+        if "kernel_size" in sizes:
+            # A filter extent is independent of the image dimensions.
+            sizes["kernel_size"] = (3, 5, 7)[len(plans) % 3]
         return sizes
 
     def _plan(
@@ -219,11 +224,12 @@ def build_case_plans(
         n: int,
         *,
         broadcast: bool = False,
+        vary_tail: bool = False,
         inplace: bool = False,
         large: bool = False,
         **flags: bool,
     ) -> CasePlan:
-        sizes = _sizes_for(n, vary_tail=broadcast or kind == "broadcast")
+        sizes = _sizes_for(n, vary_tail=broadcast or vary_tail)
         shapes: dict[str, tuple[int, ...]] = {}
         for param in abi.tensor_params():
             shapes[param.name] = _shape_for_param(
@@ -242,7 +248,23 @@ def build_case_plans(
                 if len(shape) == 1 and shape[0] > 0:
                     strides[param.name] = (2,)
                 elif len(shape) >= 2 and all(int(x) > 0 for x in shape):
-                    strides[param.name] = tuple(int(x) * 2 for x in shape[1:]) + (1,)
+                    physical: list[int] = []
+                    step = 2
+                    for dim in reversed(shape):
+                        physical.append(step)
+                        step *= int(dim)
+                    strides[param.name] = tuple(reversed(physical))
+            for param in (*abi.scalar_params(), *abi.size_params()):
+                scalar_name = param.name.lower()
+                for tensor, layout in strides.items():
+                    prefix = tensor.lower()
+                    if (
+                        (scalar_name == f"{prefix}_stride" and len(layout) == 1)
+                        or (scalar_name == f"{prefix}_row_stride" and len(layout) == 2)
+                    ):
+                        scalars[param.name] = layout[0]
+                    elif scalar_name == f"{prefix}_col_stride" and len(layout) == 2:
+                        scalars[param.name] = layout[1]
         dtypes = {param.name: normalize_dtype(param.dtype) for param in abi.tensor_params()}
         return CasePlan(
             name=name,
@@ -293,8 +315,10 @@ def build_case_plans(
     if abi.supports_strided or any(p.layout == "strided" for p in abi.params) or abi.layout == "strided":
         plans.append(_plan("strided", "strided", 33))
 
-    if abi.supports_broadcast or len(size_names) > 1 or any(len(p.shape_from) > 1 for p in abi.tensor_params()):
+    if abi.supports_broadcast:
         plans.append(_plan("broadcast", "broadcast", 15, broadcast=True))
+    elif len(size_names) > 1 or any(len(p.shape_from) > 1 for p in abi.tensor_params()):
+        plans.append(_plan("rectangular", "non_tile", 15, vary_tail=True))
 
     if abi.supports_inplace or abi.in_place or any(p.alias_of for p in abi.params):
         plans.append(_plan("inplace", "inplace", 33, inplace=True))
@@ -343,6 +367,7 @@ def _pack_ints(values: list[int], dtype: str) -> bytes:
         "i64": "<q",
         "i8": "<b",
         "u8": "<B",
+        "u16": "<H",
         "u32": "<I",
         "bool": "<?",
     }.get(dtype, "<i")
@@ -358,6 +383,8 @@ def _fill_list(
 ) -> list[Any]:
     if n <= 0:
         return []
+    if dtype in COMPLEX_DTYPES:
+        return [complex(rng.random() * 4.0 - 2.0, rng.random() * 4.0 - 2.0) for _ in range(n)]
     if dtype in FLOAT_DTYPES:
         if plan.generate_dup:
             base = [0.0, 1.0, 1.0, 2.0, 2.0, 3.0]
@@ -388,6 +415,11 @@ def _fill_list(
         return out
     if dtype == "bool":
         return [bool(i % 2) for i in range(n)]
+    if dtype == "u16" and not plan.generate_dup:
+        # Include ordinary integers and finite FP16 bit patterns for ABIs
+        # that use unsigned short as half storage.
+        patterns = (0, 1, 255, 0x3400, 0x3800, 0x3C00, 0x4000, 0xBC00, 0xC000)
+        return [patterns[rng.randrange(len(patterns))] for _ in range(n)]
     if plan.generate_dup:
         base = [1, 1, 2, 2, 3, 4, 4]
         return [base[i % len(base)] for i in range(n)]
@@ -434,6 +466,9 @@ def materialize_arrays(
             arrays[param.name] = arr
         else:
             arrays[param.name] = values
+    for output_name, input_name in plan.alias.items():
+        if output_name in arrays and input_name in arrays:
+            arrays[output_name] = arrays[input_name]
     return arrays
 
 
@@ -457,11 +492,7 @@ def write_tensor_bin(path: Path, array: Any, dtype: str) -> int:
             payload = np.asarray(arr, dtype=numpy_dtype_name(canon)).tobytes()
         path.write_bytes(payload)
         return len(payload)
-    flat: list[Any]
-    if isinstance(array, (list, tuple)):
-        flat = list(array)
-    else:
-        flat = list(array)
+    flat: list[Any] = list(array)
     if canon in FLOAT_DTYPES:
         if canon == "bf16":
             payload = b"".join(
@@ -486,7 +517,6 @@ def read_tensor_bin(path: Path, dtype: str, shape: tuple[int, ...]) -> Any:
     np = _try_numpy()
     payload = path.read_bytes()
     canon = normalize_dtype(dtype)
-    n = _prod(shape) if shape else (len(payload) // max(1, dtype_nbytes(canon)))
     if np is not None:
         dt = numpy_dtype_name(canon)
         if canon == "bf16":
@@ -494,6 +524,8 @@ def read_tensor_bin(path: Path, dtype: str, shape: tuple[int, ...]) -> Any:
             arr = (raw << 16).view(np.float32)
         else:
             arr = np.frombuffer(payload, dtype=dt)
+        if not shape and arr.size == 1:
+            return arr.reshape(())
         if shape and arr.size == _prod(shape):
             return arr.reshape(shape)
         return arr
@@ -526,7 +558,6 @@ def write_cases(
             arrays = (arrays_by_case or {}).get(plan.name)
             if arrays is None:
                 arrays = materialize(plan, abi)
-            case_dir = testdir / "cases" / plan.name
             files: dict[str, str] = {}
             (testdir / "out" / plan.name).mkdir(parents=True, exist_ok=True)
             for param in abi.input_params():

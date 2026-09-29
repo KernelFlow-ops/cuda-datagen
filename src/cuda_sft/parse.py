@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 from collections.abc import Callable
+from itertools import pairwise
 
 THINK_BLOCK_RE = re.compile(
     r"<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>",
@@ -118,20 +119,46 @@ def unwrap_cot_assistant(assistant: str) -> tuple[str, str]:
     return cot, code
 
 
-_NUMBERED_HEADING_RE = re.compile(r"(?m)^\s*(\d+)\.\s+\S")
+# Accepts ``1.``, ``### 1.``, ``**1. Title**``, ``1)`` and ``1、`` heading styles.
+_NUMBERED_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*(\d+)[ \t]*[.)、．][ \t]*\S"
+)
 
 
-def has_numbered_headings(text: str, count: int) -> bool:
-    """Return True when headings ``1.`` .. ``count.`` all appear.
+def missing_numbered_headings(text: str, count: int) -> list[int]:
+    """Heading numbers ``1..count`` that are absent or appear out of order.
 
-    Used to reject truncated CoT checklists (models often stop mid heading 6).
+    A number is out of order when its first occurrence precedes the first
+    occurrence of the number before it.
 
     Args:
         text: Polished CoT body.
         count: Required last heading number (6 for kernels, 5 for knowledge).
     """
-    found = {int(match.group(1)) for match in _NUMBERED_HEADING_RE.finditer(text or "")}
-    return all(index in found for index in range(1, int(count) + 1))
+    first: dict[int, int] = {}
+    for match in _NUMBERED_HEADING_RE.finditer(text or ""):
+        first.setdefault(int(match.group(1)), match.start())
+    needed = list(range(1, int(count) + 1))
+    problems = [index for index in needed if index not in first]
+    present = [index for index in needed if index in first]
+    problems.extend(
+        later for earlier, later in pairwise(present) if first[later] < first[earlier]
+    )
+    return sorted(set(problems))
+
+
+def has_numbered_headings(text: str, count: int) -> bool:
+    """Return True when headings ``1.`` .. ``count.`` all appear, in order.
+
+    Used to reject truncated CoT checklists (models often stop mid heading 6).
+    The first occurrence of each number must come after the previous one, so
+    a draft cannot pass with its headings shuffled.
+
+    Args:
+        text: Polished CoT body.
+        count: Required last heading number (6 for kernels, 5 for knowledge).
+    """
+    return not missing_numbered_headings(text, count)
 
 
 def collapse_blank_lines(text: str) -> str:
@@ -139,11 +166,19 @@ def collapse_blank_lines(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", (text or "").strip())
 
 
-def strip_fences(text: str) -> str:
-    """Remove markdown fences, keeping inner text for non-CUDA fences.
+_CODE_FENCE_LANGS = {
+    "cuda", "cu", "cpp", "c++", "cc", "cxx", "c", "hpp",
+    "python", "py", "triton", "tilelang", "cutlass", "cute",
+}
+_PY_KERNEL_HINTS = ("@triton.jit", "import triton", "tl.program_id", "@T.prim_func", "import tilelang")
 
-    CUDA/C++ fences are dropped entirely so CoT does not keep a second kernel.
-    Other fences keep their body as prose.
+
+def strip_fences(text: str) -> str:
+    """Remove markdown fences, keeping inner text for non-code fences.
+
+    Kernel-language fences (CUDA/C++ and Triton/TileLang Python) are dropped
+    entirely so CoT does not keep a second kernel. Other fences keep their
+    body as prose.
     """
     if not text:
         return ""
@@ -152,17 +187,52 @@ def strip_fences(text: str) -> str:
         raw = match.group(0)
         lang_match = re.match(r"```([^\n]*)\n", raw)
         lang = (lang_match.group(1) if lang_match else "").strip().lower()
+        token = lang.split()[0] if lang else ""
         body = match.group(1) if match.lastindex else ""
-        cuda_langs = {"cuda", "cu", "cpp", "c++", "cc", "cxx", "c", "hpp"}
-        if lang in cuda_langs or looks_like_cuda(body):
+        if (
+            token in _CODE_FENCE_LANGS
+            or looks_like_cuda(body)
+            or any(hint in body for hint in _PY_KERNEL_HINTS)
+        ):
             return "\n"
         return body
 
     return ANY_FENCE_RE.sub(_replace, text)
 
 
+_CJK_RE = re.compile(r"[㐀-鿿]")
+_CODE_DECL_RE = re.compile(
+    r"^(?:#\s*(?:include|define|pragma)\b|template\s*<|"
+    r"(?:extern\s+\"C\"\s+)?(?:static\s+)?(?:__global__|__device__|__host__)\b.*\()"
+)
+_CODE_TAIL_RE = re.compile(r"(?:;|\{|\})\s*(?://.*)?$")
+_PROSE_PREFIX_RE = re.compile(r"^(?:[-*+]\s|\d+[.)、]\s*|#{1,6}\s)")
+
+
+def _code_line_kind(line: str) -> str:
+    """Classify one unfenced line as ``decl`` / ``stmt`` code, or ``""`` for prose.
+
+    Lines with inline backticks or CJK text are prose: a CoT may name
+    ``__global__`` or a kernel signature in passing without being code.
+    """
+    stripped = line.strip()
+    if not stripped or "`" in stripped or _CJK_RE.search(stripped):
+        return ""
+    if stripped in {"{", "}", "};", "});"} or _CODE_DECL_RE.match(stripped):
+        return "decl"
+    if _PROSE_PREFIX_RE.match(stripped):
+        return ""
+    if "<<<" in stripped or _CODE_TAIL_RE.search(stripped):
+        return "stmt"
+    return ""
+
+
 def strip_code_from_cot(text: str) -> str:
-    """Drop fenced or inline CUDA kernels from a CoT draft.
+    """Drop fenced or inline kernel code from a CoT draft, keeping the prose.
+
+    Declarations (``#include``, ``template<``, ``__global__ …(``) are always
+    removed. Statement-like lines (ending in ``;``/``{``/``}``) are removed
+    only when they sit next to other code, so a lone prose line survives.
 
     Args:
         text: Agent or raw-thinking text.
@@ -170,13 +240,20 @@ def strip_code_from_cot(text: str) -> str:
     Returns:
         Prose-only CoT, possibly empty.
     """
-    cleaned = strip_fences(text or "")
-    cleaned = collapse_blank_lines(cleaned)
-    if "__global__" not in cleaned:
-        return cleaned
-    cut = cleaned.find("__global__")
-    prefix = collapse_blank_lines(cleaned[:cut])
-    return prefix
+    lines = collapse_blank_lines(strip_fences(text or "")).splitlines()
+    kinds = [_code_line_kind(line) for line in lines]
+    kept: list[str] = []
+    for index, line in enumerate(lines):
+        kind = kinds[index]
+        if kind == "decl":
+            continue
+        if kind == "stmt" and (
+            (index > 0 and kinds[index - 1])
+            or (index + 1 < len(lines) and kinds[index + 1])
+        ):
+            continue
+        kept.append(line)
+    return collapse_blank_lines("\n".join(kept))
 
 
 def looks_like_cuda(source: str) -> bool:
@@ -434,7 +511,15 @@ _SUPPORTED_C_TYPES = {
     "int8_t": "i8",
     "unsigned char": "u8",
     "uint8_t": "u8",
+    "uint16_t": "u16",
+    "unsigned short": "u16",
+    "unsigned short int": "u16",
     "bool": "bool",
+    "cublashandle_t": "cublas_handle",
+    "cuffthandle": "cufft_handle",
+    "cufftcomplex": "c64",
+    "cucomplex": "c64",
+    "float2": "c64",
 }
 
 
@@ -695,7 +780,7 @@ def _parse_c_param(raw: str):
         # Vector types are not in the canonical dtype set; keep as f32/i32 buffer.
         pass
     cleaned = text.replace("*", " ").replace("&", " ")
-    cleaned = re.sub(r"\b(const|volatile|unsigned|signed)\b", " ", cleaned)
+    cleaned = re.sub(r"\b(const|volatile)\b", " ", cleaned)
     tokens = [tok for tok in cleaned.split() if tok]
     if not tokens:
         return None

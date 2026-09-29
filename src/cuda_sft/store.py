@@ -6,16 +6,23 @@ import fcntl
 import hashlib
 import json
 import os
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from cuda_sft.config import get_settings
+from cuda_sft.core.sample import training_system, training_user
+from cuda_sft.core.selection import MIN_CASES, critic_rejected
+from cuda_sft.core.types import snapshot_for_metadata
 from cuda_sft.formats import export_training_files
 from cuda_sft.parse import wrap_cot_assistant
 from cuda_sft.refval.spec import strict_refval_enabled
+from cuda_sft.runtime.trace import RUN_ID
 from cuda_sft.state import GraphState
+from cuda_sft.tasks.kinds import question_hash
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -144,23 +151,6 @@ def iter_question_rows(path: Path) -> Iterable[tuple[int, str, dict[str, Any]]]:
             yield index, question, obj
 
 
-def _training_user(state: GraphState, settings: Any) -> str:
-    """User text written into SFT jsonl.
-
-    When ``SFT_USER_IS_RAW_QUESTION`` is true (default), the student sees the
-    original problem rather than the datagen protocol suffix.
-
-    Args:
-        state: Graph state with ``question`` and ``user_prompt``.
-        settings: Pipeline settings.
-    """
-    raw = str(state.get("question") or "").strip()
-    generated = str(state.get("user_prompt") or "").strip()
-    if getattr(settings, "sft_user_is_raw_question", True) and raw:
-        return raw
-    return generated or raw
-
-
 def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
     """Yield ``(1-based line id, question text)`` from ``question.jsonl``.
 
@@ -172,18 +162,22 @@ def iter_questions(path: Path) -> Iterable[tuple[int, str]]:
 
 
 def _strict_refval_blocks_state(state: GraphState, settings: Any) -> bool:
-    """Return whether strict policy disallows persisting this candidate.
+    """Apply the semantic veto and strict numeric evidence gate at publication.
 
-    Strict mode intentionally reads the persisted metadata contract rather
+    The gates intentionally read the persisted metadata contract rather
     than convenience fields on ``state``. This prevents an older graph state
     with an optimistic ``refval_ok=True`` from bypassing the gate.
     """
     if str(state.get("kind") or "kernel").strip().lower() == "knowledge":
         return False
-    if not strict_refval_enabled(settings):
-        return False
     metadata = state.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
+    critic = metadata.get("critic")
+    critic = critic if isinstance(critic, dict) else {}
+    if settings.kernel_critic_blocks_save and critic_rejected(critic):
+        return True
+    if not strict_refval_enabled(settings):
+        return False
     refval = metadata.get("refval")
     if not isinstance(refval, dict):
         return True
@@ -192,11 +186,10 @@ def _strict_refval_blocks_state(state: GraphState, settings: Any) -> bool:
     cases_run = refval.get("cases_run")
     if isinstance(cases_run, bool) or not isinstance(cases_run, (int, float)):
         return True
-    if cases_run <= 0 or not str(refval.get("manifest_hash") or "").strip():
+    if cases_run < MIN_CASES or not str(refval.get("manifest_hash") or "").strip():
         return True
 
-    critic = metadata.get("critic")
-    if not isinstance(critic, dict):
+    if not critic:
         return True
     critic_status = str(critic.get("status") or "").strip().lower()
     # Rows produced before status was added are accepted only when they carry
@@ -210,7 +203,11 @@ def _strict_refval_blocks_state(state: GraphState, settings: Any) -> bool:
             critic_status = "failed"
         elif critic.get("passed") is True:
             critic_status = "skipped" if critic.get("skipped") else "verified"
-    return critic_status in {"unverified", "failed", ""}
+    if critic_status == "unverified":
+        return False
+    if critic_status == "failed":
+        return False
+    return not critic_status
 
 
 def _merge_contract_metadata(metadata: dict[str, Any], state: GraphState) -> None:
@@ -219,13 +216,7 @@ def _merge_contract_metadata(metadata: dict[str, Any], state: GraphState) -> Non
         value = state.get(key)
         if value is not None:
             if key == "candidate_reports" and isinstance(value, list):
-                # Keep rejection/ranking evidence, but do not duplicate every
-                # candidate's full source inside the training JSONL row.
-                value = [
-                    {k: item[k] for k in item if k != "code"}
-                    for item in value
-                    if isinstance(item, dict)
-                ]
+                value = [snapshot_for_metadata(item) for item in value if isinstance(item, dict)]
             metadata[key] = value
     # Refval report metadata is normally under ``metadata.refval``.  Keep the
     # top-level hash/provenance fields too so downstream filters need no graph
@@ -235,10 +226,11 @@ def _merge_contract_metadata(metadata: dict[str, Any], state: GraphState) -> Non
         for key in (
             "cache_hash", "manifest_hash", "validator_version", "harness_version",
             "schema_version", "case_suite", "case_suite_version", "provenance",
-            "task_spec", "oracle_spec",
+            "task_spec", "oracle_spec", "oracle_origin",
         ):
             if key in refval and key not in metadata:
                 metadata[key] = refval[key]
+        metadata["verification_tier"] = str(refval.get("verification_tier") or "none")
 
 
 @dataclass
@@ -248,9 +240,12 @@ class Store:
     Files:
         ``sft.jsonl``, ``sft_ms_swift.jsonl``, ``sft_openrlhf.jsonl``,
         ``abandoned.jsonl``, ``progress.jsonl``.
+
+    ``allow_test_sources`` is only for explicit fake-client test harnesses.
     """
 
     data_dir: Path
+    allow_test_sources: bool = False
     sft_path: Path = field(init=False)
     abandoned_path: Path = field(init=False)
     progress_path: Path = field(init=False)
@@ -359,23 +354,38 @@ class Store:
             ``True`` when the sample was committed or was already committed;
             ``False`` when strict quality policy quarantined the state.
         """
+        kind = str(state.get("kind") or "kernel")
+        selected = state.get("selected") if kind == "kernel" else None
+        if kind == "kernel":
+            if not isinstance(selected, dict) or not selected:
+                raise RuntimeError("write_success requires state['selected']")
+            if selected["code"] != state.get("code"):
+                raise RuntimeError("selected code differs from graph state")
+        origin = str(
+            (selected.get("origin") if isinstance(selected, dict) else state.get("origin"))
+            or "unknown"
+        )
+        if origin != "live_api" and not self.allow_test_sources:
+            raise RuntimeError(f"refusing to save {kind} answer without live API origin: {origin}")
         # A strict refval run must never leak an unvalidated kernel into the
         # primary training files.  This guard also covers legacy graph paths
         # that initialized ``refval_ok=True`` for disabled/skipped validation.
         if _strict_refval_blocks_state(state, get_settings()):
             rejected = dict(state)
-            rejected.setdefault("abandon_reason", "strict_quality_gate")
+            if not rejected.get("abandon_reason"):
+                rejected["abandon_reason"] = "strict_quality_gate"
             rejected.setdefault(
                 "abandon_error",
-                "strict gate requires refval pass evidence and a verified critic",
+                "strict gate requires numeric evidence and an eligible critic result",
             )
             self.write_abandoned(rejected)  # type: ignore[arg-type]
             return False
-        if str(state.get("kind") or "kernel") == "knowledge":
+        if kind == "knowledge":
             return self._write_knowledge_success(state, model_name=model_name)
+        assert selected is not None
         settings = get_settings()
-        user = _training_user(state, settings)
-        code = state["code"]
+        user = training_user(state, selected, settings)
+        code = str(selected["code"])
         code_hash = _content_hash(str(code))
         question = str(state.get("question") or "")
         dialect = str(state.get("dialect") or "cuda")
@@ -392,26 +402,47 @@ class Store:
             assistant = wrap_cot_assistant(cot, code)
         else:
             assistant = code
-        system = str(state.get("system_prompt") or "")
+        system = training_system(selected, question, settings)
         extra_meta = dict(state.get("metadata") or {})
         dialect = str(state.get("dialect") or "cuda")
         language = "python" if dialect in {"triton", "tilelang"} else "cuda-cpp"
+        try:
+            source_line = int((state.get("input_metadata") or {}).get("source_line", state["question_id"]))
+        except (TypeError, ValueError):
+            source_line = int(state["question_id"])
+        provenance = dict(state.get("provenance") or {})
+        provenance["origin"] = origin
+        provenance.setdefault("model", model_name)
+        provenance.setdefault("provider", settings.llm_provider)
+        provenance.setdefault("prompt_packs", {"generator": "gen-v1", "train_system": "train-sys-v1"})
+        provenance.setdefault("run_id", RUN_ID)
+        provenance.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         metadata: dict[str, Any] = {
-            "candidate": state.get("candidate_idx", 1),
-            "repairs": state.get("repair_idx", 0),
+            "candidate": selected["candidate"],
+            "repairs": selected["repairs"],
             "arch": state.get("cuda_arch", ""),
             "gpu_name": state.get("gpu_name", ""),
             "model": model_name,
             "used_rdc": state.get("used_rdc", False),
-            "system": system,
             "judge_score": state.get("judge_score", 0),
             "dialect": dialect,
+            "track": dialect,
             "language": language,
-            "generation_user_prompt": str(state.get("user_prompt") or ""),
-            "dataset_version": "cuda-sft-1",
+            "dataset_version": "cuda-sft-2",
+            "system_mode": settings.sft_system_mode,
+            "user_mode": "raw_question" if settings.sft_user_is_raw_question else "generation_prompt",
+            "selected_code_sha256": selected["code_sha256"],
+            "generation": {
+                "system": selected["gen_system"],
+                "user": selected["gen_user"],
+                "prompt_variant": selected["prompt_variant"],
+            },
             "code_hash": code_hash,
-            "question_hash": _content_hash(question),
+            "question_hash": question_hash(question),
+            "source_line": source_line,
             "sample_key": sample_key,
+            "candidate_pool": dict(extra_meta.get("candidate_pool") or {}),
+            "provenance": provenance,
             "release_tier": str(
                 quality_dict.get("release_tier") or "compile_only"
             ),
@@ -427,23 +458,28 @@ class Store:
         for key in ("task_spec", "oracle_spec", "quality_status", "provenance", "candidate_reports"):
             if key not in metadata and extra_meta.get(key) is not None:
                 metadata[key] = extra_meta[key]
+        metadata["provenance"] = provenance
         if state.get("difficulty"):
             metadata["difficulty"] = state.get("difficulty")
             metadata["candidate_cap"] = state.get("candidate_cap")
+        cot_meta = extra_meta.get("cot")
+        if not isinstance(cot_meta, dict):
+            cot_meta = {}
+        metadata["cot"] = {
+            "source": state.get("cot_source") or cot_meta.get("source") or "empty",
+            "text": cot,
+            "policy": str(getattr(settings, "cot_repaired_policy", "synthetic")),
+            "chars": len(cot),
+            "reasoning_source": state.get("reasoning_source") or cot_meta.get("reasoning_source") or "",
+            "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
+            "polished_chars": len(cot),
+            "error": state.get("cot_error") or cot_meta.get("error") or "",
+        }
+        if "consistency_issues" in cot_meta:
+            metadata["cot"]["consistency_issues"] = list(cot_meta["consistency_issues"])
+        if "soft_issues" in cot_meta:
+            metadata["cot"]["soft_issues"] = list(cot_meta["soft_issues"])
         if settings.cot_enabled:
-            cot_meta = extra_meta.get("cot")
-            if not isinstance(cot_meta, dict):
-                cot_meta = {}
-            metadata["cot"] = {
-                "source": state.get("cot_source") or cot_meta.get("source") or "empty",
-                "text": cot,
-                "reasoning_source": state.get("reasoning_source")
-                or cot_meta.get("reasoning_source")
-                or "",
-                "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
-                "polished_chars": len(cot),
-                "error": state.get("cot_error") or cot_meta.get("error") or "",
-            }
             raw = str(state.get("raw_reasoning") or "")
             limit = settings.cot_raw_store_max_chars
             if raw:
@@ -453,7 +489,7 @@ class Store:
         sample = {
             "id": state["question_id"],
             "messages": [
-                *([{"role": "system", "content": system}] if system.strip() else []),
+                *([{"role": "system", "content": system}] if system else []),
                 {"role": "user", "content": user},
                 {"role": "assistant", "content": assistant},
             ],
@@ -465,8 +501,8 @@ class Store:
                 "id": state["question_id"],
                 "dialect": dialect,
                 "status": "success",
-                "candidate": state.get("candidate_idx", 1),
-                "repairs": state.get("repair_idx", 0),
+                "candidate": selected["candidate"],
+                "repairs": selected["repairs"],
             },
             sample_key=sample_key,
             cot_in_assistant=bool(settings.cot_in_assistant),
@@ -474,25 +510,52 @@ class Store:
 
     def _write_knowledge_success(self, state: GraphState, *, model_name: str) -> bool:
         """Persist a rubric-passing knowledge sample (prose assistant)."""
+        from cuda_sft.knowledge.judge import accepted_knowledge_answer
+
         settings = get_settings()
-        user = _training_user(state, settings)
+        if not accepted_knowledge_answer(state, settings):
+            rejected = dict(state)
+            rejected["abandon_reason"] = "strict_quality_gate"
+            rejected["abandon_error"] = "knowledge answer lacks valid live judge evidence"
+            self.write_abandoned(rejected)
+            return False
+        question = str(state.get("question") or "")
+        gen_system = str(state.get("gen_system") or "")
+        if settings.sft_system_mode == "generation" and not gen_system:
+            raise RuntimeError("knowledge success requires state['gen_system']")
+        gen_user = str(state.get("gen_user") or state.get("user_prompt") or "")
+        generation = {
+            "gen_system": gen_system,
+            "gen_user": gen_user,
+        }
+        user = training_user(state, generation, settings)
         answer = str(state.get("answer") or "")
         cot = str(state.get("cot") or "")
         if settings.cot_enabled and settings.cot_in_assistant and cot.strip():
             assistant = wrap_cot_assistant(cot, answer)
         else:
             assistant = answer
-        system = str(state.get("system_prompt") or "")
+        system = training_system(generation, question, settings, kind="knowledge")
         extra_meta = dict(state.get("metadata") or {})
         topic = str(state.get("topic") or "general")
         track = str(state.get("track") or f"knowledge:{topic}")
-        question = str(state.get("question") or "")
         sample_key = _sample_key(
             question=question,
             code=answer,
             dialect=track,
             question_id=int(state["question_id"]),
         )
+        try:
+            source_line = int((state.get("input_metadata") or {}).get("source_line", state["question_id"]))
+        except (TypeError, ValueError):
+            source_line = int(state["question_id"])
+        provenance = dict(state.get("provenance") or {})
+        provenance["origin"] = str(state.get("origin") or "unknown")
+        provenance.setdefault("model", model_name)
+        provenance.setdefault("provider", settings.llm_provider)
+        provenance.setdefault("prompt_packs", {"knowledge_generator": "gen-v1", "train_system": "train-sys-v1"})
+        provenance.setdefault("run_id", RUN_ID)
+        provenance.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         metadata: dict[str, Any] = {
             "task": "knowledge",
             "topic": topic,
@@ -501,14 +564,24 @@ class Store:
             "arch": state.get("cuda_arch", ""),
             "gpu_name": state.get("gpu_name", ""),
             "model": model_name,
-            "system": system,
             "judge_score": state.get("judge_score", 0),
             "dialect": track,
+            "track": track,
             "language": "prose",
-            "generation_user_prompt": str(state.get("user_prompt") or ""),
-            "question_hash": _content_hash(question),
+            "dataset_version": "cuda-sft-2",
+            "system_mode": settings.sft_system_mode,
+            "user_mode": "raw_question" if settings.sft_user_is_raw_question else "generation_prompt",
+            "generation": {
+                "system": gen_system,
+                "user": gen_user,
+                "prompt_variant": dict(state.get("gen_prompt_variant") or {}),
+            },
+            "question_hash": question_hash(question),
+            "source_line": source_line,
             "code_hash": _content_hash(answer),
             "sample_key": sample_key,
+            "release_tier": "strict",
+            "provenance": provenance,
         }
         _merge_contract_metadata(metadata, state)
         if extra_meta.get("knowledge_judge"):
@@ -517,23 +590,24 @@ class Store:
         for key in ("task_spec", "oracle_spec", "quality_status", "provenance", "candidate_reports"):
             if key not in metadata and extra_meta.get(key) is not None:
                 metadata[key] = extra_meta[key]
+        metadata["provenance"] = provenance
         if state.get("difficulty"):
             metadata["difficulty"] = state.get("difficulty")
             metadata["candidate_cap"] = state.get("candidate_cap")
+        cot_meta = extra_meta.get("cot")
+        if not isinstance(cot_meta, dict):
+            cot_meta = {}
+        metadata["cot"] = {
+            "source": state.get("cot_source") or cot_meta.get("source") or "empty",
+            "text": cot,
+            "policy": str(getattr(settings, "cot_repaired_policy", "synthetic")),
+            "chars": len(cot),
+            "reasoning_source": state.get("reasoning_source") or cot_meta.get("reasoning_source") or "",
+            "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
+            "polished_chars": len(cot),
+            "error": state.get("cot_error") or cot_meta.get("error") or "",
+        }
         if settings.cot_enabled:
-            cot_meta = extra_meta.get("cot")
-            if not isinstance(cot_meta, dict):
-                cot_meta = {}
-            metadata["cot"] = {
-                "source": state.get("cot_source") or cot_meta.get("source") or "empty",
-                "text": cot,
-                "reasoning_source": state.get("reasoning_source")
-                or cot_meta.get("reasoning_source")
-                or "",
-                "raw_chars": cot_meta.get("raw_chars", len(str(state.get("raw_reasoning") or ""))),
-                "polished_chars": len(cot),
-                "error": state.get("cot_error") or cot_meta.get("error") or "",
-            }
             raw = str(state.get("raw_reasoning") or "")
             limit = settings.cot_raw_store_max_chars
             if raw:
@@ -543,7 +617,7 @@ class Store:
         sample = {
             "id": state["question_id"],
             "messages": [
-                *([{"role": "system", "content": system}] if system.strip() else []),
+                *([{"role": "system", "content": system}] if system else []),
                 {"role": "user", "content": user},
                 {"role": "assistant", "content": assistant},
             ],
@@ -642,10 +716,27 @@ class Store:
         record = {
             "id": state["question_id"],
             "dialect": dialect,
+            "track": dialect,
             "question": state.get("question", ""),
+            "question_hash": question_hash(str(state.get("question") or "")),
+            "abandon_reason": str(state.get("abandon_reason") or "all_candidates_failed"),
             "reason": str(state.get("abandon_reason") or "all_candidates_failed"),
             "last_error": state.get("abandon_error") or state.get("compile_error", ""),
             "attempts": state.get("attempts", []),
+            "candidate_errors": state.get("candidate_errors", []),
+            "candidates": [
+                {
+                    "candidate": item.get("candidate"),
+                    "repairs": item.get("repairs"),
+                    "last_gate": dict(item.get("last_gate") or {}),
+                    "code_sha256": item.get("code_sha256"),
+                    "oracle_blocked": bool(item.get("oracle_blocked")),
+                }
+                for item in (state.get("candidate_reports") or [])
+                if isinstance(item, dict)
+            ],
+            "run_id": RUN_ID,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self._commit_abandoned(
             record,
@@ -661,14 +752,15 @@ class Store:
 _store: Store | None = None
 
 
-def init_store(data_dir: Path) -> Store:
+def init_store(data_dir: Path, *, allow_test_sources: bool = False) -> Store:
     """Create the process-global :class:`Store` (call once per worker).
 
     Args:
         data_dir: Output directory.
+        allow_test_sources: Permit non-live completions in test harnesses.
     """
     global _store
-    _store = Store(data_dir)
+    _store = Store(data_dir, allow_test_sources=allow_test_sources)
     return _store
 
 

@@ -9,3 +9,14 @@ work/_smoke_*/
 work/
 data/
 .env
+paper/
+knowledge_questions.jsonl/
+question.jsonl/
+cuda_gen_fix/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+runs/
+.pytest_cache/
+*.zip

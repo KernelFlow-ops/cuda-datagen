@@ -9,10 +9,12 @@ from unittest.mock import patch
 
 from cuda_sft.dialects.cutlass import is_cutlass4_home, read_cutlass_major
 from cuda_sft.setup_env import (
+    PROJECT_ROOT,
     CheckRow,
     _is_cutlass4_home,
     check_cutlass,
     check_triton,
+    install_python_deps,
     parse_setup_dialects,
     run_setup,
     upsert_env_var,
@@ -75,6 +77,11 @@ class UpsertEnvTests(unittest.TestCase):
 
 
 class CheckOnlyTests(unittest.TestCase):
+    def test_python_dependencies_install_from_pyproject(self) -> None:
+        with patch("cuda_sft.setup_env._pip_install", return_value=(True, "ok")) as pip:
+            self.assertEqual(install_python_deps(), (True, "ok"))
+        pip.assert_called_once_with("-e", str(PROJECT_ROOT))
+
     def test_check_does_not_call_installers(self) -> None:
         with (
             patch("cuda_sft.setup_env._pip_install") as pip,
@@ -128,7 +135,9 @@ class CheckOnlyTests(unittest.TestCase):
             ),
             patch("cuda_sft.setup_env.check_git", return_value=CheckRow("git", True, "git", "ok")),
             patch("cuda_sft.setup_env.check_cutlass", side_effect=_cut),
-            patch("cuda_sft.setup_env.install_cutlass", return_value=(True, "/tmp/cutlass")) as clone,
+            patch(
+                "cuda_sft.setup_env.install_cutlass", return_value=(True, "/tmp/cutlass")
+            ) as clone,
             patch("cuda_sft.setup_env.upsert_env_var") as upsert,
             patch("cuda_sft.setup_env.smoke_dialects", return_value=[]),
         ):

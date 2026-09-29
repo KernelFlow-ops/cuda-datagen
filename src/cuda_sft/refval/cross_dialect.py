@@ -178,7 +178,8 @@ def {entry}(x, out, rows, cols, x_row_stride, x_col_stride, out_stride):
 
 def _tilelang_source() -> str:
     """TileLang source with explicit positional launch wrappers."""
-    return '''import tilelang
+    return '''import torch
+import tilelang
 import tilelang.language as T
 
 def _add_program(n, block=256):
@@ -191,7 +192,11 @@ def _add_program(n, block=256):
                 if j < n: C[j * cstride] = A[j * astride] + B[j * bstride]
     return main
 def launch_add(a, b, c, n, a_stride, b_stride, c_stride):
-    if n > 0: tilelang.compile(_add_program(n), target="cuda")(a, b, c, a_stride, b_stride, c_stride)
+    if n <= 0: return
+    aa, bb = a.contiguous(), b.contiguous()
+    cc = c if c.is_contiguous() else torch.empty((n,), device=c.device, dtype=c.dtype)
+    tilelang.compile(_add_program(n), target="cuda")(aa, bb, cc, 1, 1, 1)
+    if cc is not c: c.copy_(cc)
 
 def _scale_program(n, block=256):
     @T.prim_func
@@ -203,7 +208,11 @@ def _scale_program(n, block=256):
                 if j < n: O[j * ostride] = X[j * xstride] * scale
     return main
 def launch_scale(x, out, scale, n, x_stride, out_stride):
-    if n > 0: tilelang.compile(_scale_program(n), target="cuda")(x, out, scale, x_stride, out_stride)
+    if n <= 0: return
+    xx = x.contiguous()
+    oo = out if out.is_contiguous() else torch.empty((n,), device=out.device, dtype=out.dtype)
+    tilelang.compile(_scale_program(n), target="cuda")(xx, oo, scale, 1, 1)
+    if oo is not out: out.copy_(oo)
 
 def _row_sum_program(rows, cols, block=512):
     @T.prim_func
@@ -222,7 +231,11 @@ def _row_sum_program(rows, cols, block=512):
                 O[br] = reduced[0]
     return main
 def launch_row_sum(x, out, rows, cols, x_row_stride, x_col_stride, out_stride):
-    if rows > 0 and cols > 0: tilelang.compile(_row_sum_program(rows, cols), target="cuda")(x, out, x_row_stride, x_col_stride, out_stride)
+    if rows <= 0 or cols <= 0: return
+    xx = x.contiguous()
+    oo = out if out.is_contiguous() else torch.empty((rows,), device=out.device, dtype=out.dtype)
+    tilelang.compile(_row_sum_program(rows, cols), target="cuda")(xx, oo, cols, 1, 1)
+    if oo is not out: out.copy_(oo)
 
 # Public compile-gate factories are deliberately separate from the ABI
 # wrappers.  The gate can lower one PrimFunc at import time, while refval
@@ -293,7 +306,7 @@ def make_manifest(task: CanonicalTask, *, question_id: int, dialect: str) -> Ref
     semantic["operation"] = task.operation
     semantic_hash = stable_hash(semantic)
     backend = {"dialect": dialect, "entry": task.abi.entry, "call_style": "positional"}
-    return RefManifest(question_id=question_id, dialect=dialect, abi=task.abi, reference_source=task.reference_source, task_spec={"operation": task.operation, "semantic_contract_hash": semantic_hash, **semantic}, oracle_spec={"oracle_id": task.operation, "oracle_hash": stable_hash(task.reference_source)}, semantic_contract=semantic, backend_contract=backend, provenance={"canonical": True, "task_id": task.task_id, "contract_hash": semantic_hash})
+    return RefManifest(question_id=question_id, dialect=dialect, abi=task.abi, reference_source=task.reference_source, extracted_from="independent", task_spec={"operation": task.operation, "semantic_contract_hash": semantic_hash, **semantic}, oracle_spec={"oracle_id": task.operation, "oracle_hash": stable_hash(task.reference_source)}, semantic_contract=semantic, backend_contract=backend, provenance={"canonical": True, "task_id": task.task_id, "contract_hash": semantic_hash})
 
 
 def task_source(task: CanonicalTask, dialect: str, *, mutant: bool = False) -> str:

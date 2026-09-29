@@ -1,0 +1,22 @@
+id: R02
+title: 编译失败后修复通过；CoT 不得泄漏修复叙事
+issues: [Q2]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "1", MAX_REPAIRS: "2", KERNEL_LLM_CRITIC: "off"}
+job: {question_id: 2, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_syntax_error.cu, reasoning: "首轮思考 FIRST_TURN_MARKER"}
+  repair.compile:
+    c1r1: {code: kernels/add_ok.cu, reasoning: "上一版少了分号，修复编译错误。REPAIR_REASONING_MARKER"}
+  cot_editor:
+    default: {text_file: cot/add_cot_zh.md}
+expect:
+  status: success
+  selected: {candidate: 1, repairs: 1, code_file: kernels/add_ok.cu}
+  sample:
+    cot_absent_markers: [REPAIR_REASONING_MARKER, "repairs=", "last_error_summary"]
+    cot_absent_patterns: ["修复", "编译错误"]
+  llm:
+    calls: {generator: {eq: 1}, "repair.*": {eq: 1}}
+    call_checks:
+      - {role: cot_editor, user_absent: ["repairs=", "last_error_summary", "REPAIR_REASONING_MARKER"]}

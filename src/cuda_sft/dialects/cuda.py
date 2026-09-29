@@ -9,6 +9,7 @@ from cuda_sft.config import Settings
 from cuda_sft.judge import CudaCodeJudge, JudgeResult
 from cuda_sft.parse import extract_cuda_source
 from cuda_sft.prompt import (
+    COT_SKELETON_ZH,
     SelectedPrompts,
     build_repair_prompt,
     select_prompts,
@@ -18,7 +19,7 @@ from cuda_sft.refval.spec import DialectRefvalSpec
 COT_SKELETON = """1. Problem restatement — tensors/shapes, host entry, success criteria.
 2. Algorithm — formula, reduction/scan/gemm pattern, numerical notes.
 3. Thread/block mapping — index math, grid/block, why this layout.
-4. Memory and sync — global/shared/registers, coalescing, __syncthreads__.
+4. Memory and sync — only the memory spaces and synchronization the code uses.
 5. Bounds and edge cases — empty n, misaligned tails, overflow.
 6. Implementation checklist — 4–8 bullets that map onto the actual code."""
 
@@ -136,9 +137,9 @@ class CudaDialect:
         """
         return smoke_compile(settings, workdir)
 
-    def cot_skeleton(self) -> str:
-        """Six English headings; Chinese problems swap in ``COT_SKELETON_ZH``."""
-        return COT_SKELETON
+    def cot_skeleton(self, lang: str = "en") -> str:
+        """Six-heading CoT outline; ``lang="zh"`` returns the Chinese headings."""
+        return COT_SKELETON_ZH if lang == "zh" else COT_SKELETON
 
     def refval_spec(self, settings: Settings) -> DialectRefvalSpec:
         """nvcc-link harness: ``#include solution.cu`` + generated ``main``."""

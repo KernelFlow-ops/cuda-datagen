@@ -5,11 +5,11 @@ from __future__ import annotations
 import unittest
 
 from cuda_sft.llm import (
-    assemble_completion,
+    _thinking_from_content_blocks,
     affordable_max_tokens,
+    assemble_completion,
     is_retryable_llm_error,
     reasoning_from_openrouter_message,
-    _thinking_from_content_blocks,
 )
 
 
@@ -62,10 +62,7 @@ class AffordableMaxTokensTests(unittest.TestCase):
         class _Err(Exception):
             status_code = 402
 
-        exc = _Err(
-            "Error code: 402 - you requested up to 100000 tokens, "
-            "but can only afford 24305"
-        )
+        exc = _Err("Error code: 402 - you requested up to 100000 tokens, but can only afford 24305")
         self.assertEqual(affordable_max_tokens(exc, 100000), 24304)
 
     def test_ignores_unrelated_404(self) -> None:
@@ -95,8 +92,7 @@ class OpenRouterMessageTests(unittest.TestCase):
 
     def test_incomplete_chunked_read_is_retryable(self) -> None:
         exc = RuntimeError(
-            "peer closed connection without sending complete message body "
-            "(incomplete chunked read)"
+            "peer closed connection without sending complete message body (incomplete chunked read)"
         )
         self.assertTrue(is_retryable_llm_error(exc))
 

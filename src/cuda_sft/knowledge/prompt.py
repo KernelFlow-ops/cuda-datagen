@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from cuda_sft.prompts.selection import candidate_temperature, looks_chinese
+from cuda_sft.prompts.selection import candidate_temperature as candidate_temperature
+from cuda_sft.prompts.selection import looks_chinese
 from cuda_sft.tasks.kinds import KNOWN_TOPICS
 
 SYSTEM_PROMPTS: tuple[str, ...] = (
@@ -25,6 +26,15 @@ SYSTEM_PROMPTS: tuple[str, ...] = (
         "CuTe layout 或公式推导。必须写明假设的 GPU 代际与 CUDA 版本。"
         "不要把答案写成可编译 kernel；允许不超过 15 行的示意伪代码。"
     ),
+)
+
+TRAINING_SYSTEM_PROMPT_EN = (
+    "You are a GPU computing instructor. Answer conceptual CUDA and NVIDIA GPU "
+    "questions with accurate terminology, clear reasoning, and explicit "
+    "architecture-dependent assumptions."
+)
+TRAINING_SYSTEM_PROMPT_ZH = (
+    "你是一名 GPU 计算教师。请用准确术语、清晰推理和明确的架构前提，回答 CUDA 与 NVIDIA GPU 原理问题。"
 )
 
 USER_SUFFIXES: tuple[str, ...] = (
@@ -71,12 +81,15 @@ must_fix:
 {must_fix}
 other issues:
 {issues}
+judge scores:
+{scores}
 
 ## Previous answer
 {answer}
 
 ## 重写要求
 - 修正 must_fix 与硬门闩问题。
+- 若因评分未达标，优先补强最低分的维度。
 - 保留正确部分，补全缺失推导/前提。
 - 仍不要输出完整可编译 kernel。
 - 匹配题面语言，使用 Markdown 小标题。
@@ -153,9 +166,6 @@ Required headings:
 
 ## Raw teacher thinking (may be empty or noisy)
 {raw_reasoning}
-
-## Optional quality notes (context only)
-repairs={repair_idx}; gate={gate}; judge_issues={issues}
 
 ## Output
 Return ONLY the polished CoT using the required headings. No code fences. Character budget: {max_chars}.
@@ -391,6 +401,8 @@ def build_repair_prompt(
     gate_reasons: list[str],
     must_fix: list[str],
     issues: list[str],
+    judge_score: float | None = None,
+    judge_dimensions: dict[str, float] | None = None,
 ) -> str:
     """User turn asking for a full rewrite after a failed quality gate."""
     def _lines(items: list[str]) -> str:
@@ -398,11 +410,18 @@ def build_repair_prompt(
             return "(none)"
         return "\n".join(f"- {item}" for item in items)
 
+    score_lines = []
+    if judge_score is not None and judge_score > 0:
+        score_lines.append(f"overall: {judge_score:.1f}/10")
+    score_lines.extend(
+        f"{name}: {value}/10" for name, value in sorted((judge_dimensions or {}).items())
+    )
     return REPAIR_TEMPLATE.format(
         topic=topic or "general",
         gate=_lines(gate_reasons),
         must_fix=_lines(must_fix),
         issues=_lines(issues),
+        scores=_lines(score_lines),
         answer=(answer or "").strip() or "(empty)",
     ).strip()
 
@@ -433,9 +452,6 @@ def build_cot_user(
     answer: str,
     raw_reasoning: str,
     topic: str,
-    repair_idx: int,
-    gate: str,
-    issues: list[str],
     max_chars: int,
 ) -> str:
     """User message for the knowledge CoT editor."""
@@ -445,8 +461,5 @@ def build_cot_user(
         skeleton=cot_skeleton(topic, question),
         answer=(answer or "").strip() or "(empty)",
         raw_reasoning=(raw_reasoning or "").strip() or "(none)",
-        repair_idx=int(repair_idx or 0),
-        gate=(gate or "").strip() or "(none)",
-        issues="; ".join(issues) if issues else "(none)",
         max_chars=int(max_chars),
     ).strip()

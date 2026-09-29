@@ -48,7 +48,7 @@ def split_user_assistant(row: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def extract_system(row: dict[str, Any]) -> str:
-    """Read the system prompt from ``messages`` or ``metadata``, else default.
+    """Read only an explicit system message from the archived sample.
 
     Args:
         row: One jsonl object from ``sft.jsonl``.
@@ -60,12 +60,7 @@ def extract_system(row: dict[str, Any]) -> str:
                 text = _content(msg)
                 if text.strip():
                     return text
-    metadata = row.get("metadata")
-    if isinstance(metadata, dict):
-        extra = metadata.get("system")
-        if isinstance(extra, str) and extra.strip():
-            return extra
-    return SYSTEM_PROMPT
+    return ""
 
 
 def to_ms_swift(user: str, assistant: str, *, system: str = SYSTEM_PROMPT) -> dict[str, Any]:

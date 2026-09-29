@@ -1,0 +1,65 @@
+id: K01
+title: 知识题首轮过短，修复后训练 system 仍属于首轮生成
+issues: [Q1]
+settings:
+  DIFFICULTY_AWARE: "false"
+  KNOWLEDGE_MAX_CANDIDATES: "1"
+  KNOWLEDGE_MAX_REPAIRS: "1"
+  KNOWLEDGE_MIN_ANSWER_CHARS: "120"
+  KNOWLEDGE_JUDGE_ENABLED: "true"
+  SFT_SYSTEM_MODE: generation
+job:
+  question_id: 21
+  source_line: 39
+  question: "解释 CUDA warp 与 SM 的关系，以及在不同 GPU 代际中应注意的前提。"
+  kind: knowledge
+  topic: architecture
+llm:
+  knowledge_generator:
+    c1r0: {text: "warp 由线程组成。", reasoning: "先定义 warp，再说明 SM。"}
+  knowledge_repair:
+    c1r1:
+      text: |
+        ## 结论
+        在 NVIDIA CUDA 编程模型中，warp 是一组通常由 32 个线程组成的调度单元，SM 是执行这些 warp 的处理器。一个 SM 可以同时驻留多个 warp，但驻留数量受寄存器、共享内存和线程块资源限制。
+
+        ## 机制
+        线程块分配到某个 SM 后，其中的线程按 warp 组织。调度器从就绪 warp 中选择可发射的指令；当某个 warp 等待内存时，其他就绪 warp 可以前进，从而隐藏部分延迟。warp 与 SM 不处于相同层级：前者是线程分组，后者是执行资源。
+
+        ## 适用边界
+        warp 宽度是 NVIDIA CUDA 的模型属性，但每个 SM 的调度器数量、可驻留 warp 上限与共享资源容量取决于具体架构。分析占用率时应注明 GPU 代际和资源用量，不能把本机数值推广到所有设备。
+      reasoning: "上一版太短，需要修复。KNOWLEDGE_REPAIR_REASONING"
+  knowledge_judge:
+    default:
+      json:
+        dimensions: {factual: 8, completeness: 8, derivation: 8, terminology: 8, structure: 8, grounding: 8}
+        must_fix: []
+        issues: []
+  cot_editor:
+    default:
+      text: |
+        1. 题意与要解释的硬件层次
+        先区分线程分组和执行处理器两个层次：warp 是线程组织方式，SM 是运行这些线程的硬件位置，二者不能视为同一种资源。
+
+        2. 相关部件及其关系
+        一个线程块分配到 SM 后拆成若干 warp；一个 SM 可驻留多个 warp，但寄存器和共享内存会限制同时驻留的数量。
+
+        3. 与 CUDA 编程模型的对应
+        CUDA 线程属于线程块，线程块映射到 SM，warp 调度器从就绪 warp 中挑选指令，等待内存的 warp 可以让出发射机会。
+
+        4. 代际差异与前提
+        warp 宽度通常为 32 个线程，但每个 SM 的调度器和资源上限依架构变化，讨论占用率前必须说明具体代际。
+
+        5. 常见误区
+        不要把 warp 当成 SM，也不要把本机的 SM 容量写成所有 NVIDIA GPU 都满足的常数。
+expect:
+  status: success
+  selected: {candidate: 1, repairs: 1}
+  sample:
+    system_absent_patterns: ["rewriting a failed knowledge answer", "repairer", "compile-fix"]
+    cot_absent_markers: [KNOWLEDGE_REPAIR_REASONING]
+  llm:
+    calls: {knowledge_generator: {eq: 1}, knowledge_repair: {eq: 1}, knowledge_judge: {eq: 1}, cot_editor: {min: 1}}
+    call_checks:
+      - role: cot_editor
+        user_absent: ["repairs=", "gate=", "judge_issues=", "KNOWLEDGE_REPAIR_REASONING"]

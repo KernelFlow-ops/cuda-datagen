@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import unittest
 
+from cuda_sft.prompt import _stable_index
 from cuda_sft.prompts.nvcc_log import format_nvcc_for_prompt
 from cuda_sft.prompts.selection import (
     candidate_temperature,
     looks_chinese,
     stable_index,
 )
-from cuda_sft.prompt import _stable_index
 
 
 class StableIndexTests(unittest.TestCase):

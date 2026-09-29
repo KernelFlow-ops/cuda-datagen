@@ -17,6 +17,7 @@ from cuda_sft.config import Settings, get_settings
 from cuda_sft.judge import JudgeResult
 from cuda_sft.llm import LLMClient, get_llm_client
 from cuda_sft.parse import extract_thinking, strip_thinking
+from cuda_sft.runtime.meta import CallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -141,14 +142,20 @@ def should_run_critic(
     return bool(heuristic.issues)
 
 
-def parse_critic_json(text: str) -> dict[str, Any] | None:
-    """Parse a critic JSON object from a model reply."""
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    visible = strip_thinking(raw)
-    tagged = extract_thinking(raw)
-    for body in (visible, tagged, raw):
+def parse_critic_json(text: str, reasoning: str = "") -> dict[str, Any] | None:
+    """Parse the decision from either visible output or reasoning channels."""
+    bodies: list[str] = []
+    for raw in (text or "", reasoning or ""):
+        raw = raw.strip()
+        if raw:
+            bodies.extend((strip_thinking(raw), extract_thinking(raw), raw))
+    if text and reasoning:
+        bodies.append(f"{text}\n{reasoning}")
+    seen: set[str] = set()
+    for body in bodies:
+        if body in seen:
+            continue
+        seen.add(body)
         if not body:
             continue
         for blob in JSON_FENCE_RE.findall(body) + [body]:
@@ -183,6 +190,7 @@ class KernelCritic:
         refval_status: str = "",
         refval_error_class: str = "",
         refval_summary: str = "",
+        meta: CallMeta | None = None,
     ) -> CriticResult:
         """Return a critic decision. Never raises on LLM failure.
 
@@ -208,7 +216,6 @@ class KernelCritic:
                 status="skipped",
                 quality_score=int(heuristic.quality_score),
             )
-        client = self._client or get_llm_client(self.settings)
         if (refval_status or "").strip().lower() == "pass":
             refval_block = (
                 "status=pass. Numeric correctness was already checked against a "
@@ -237,96 +244,113 @@ class KernelCritic:
             refval_block=refval_block,
             code=(code or "").strip() or "(empty)",
         )
-        try:
-            stream_completion = getattr(client, "stream_completion", None)
-            if callable(stream_completion):
-                completion = stream_completion(
-                    messages=[{"role": "user", "content": user}],
-                    system=CRITIC_SYSTEM,
-                    temperature=0.0,
-                    print_stream=False,
-                    thinking_level="none",
-                    max_output_tokens=1024,
-                )
-                text = completion.text or completion.reasoning or ""
+        client = self._client
+        retries = max(0, int(getattr(self.settings, "critic_retry_on_error", 1)))
+        failure_kind = "invalid_response"
+        failure_message = "critic did not return a valid JSON decision"
+        failure_issues = ["critic_invalid_response"]
+        failure_raw: dict[str, Any] = {}
+        for attempt in range(1, retries + 2):
+            request_meta = meta.with_attempt(attempt) if meta else None
+            try:
+                client = client or get_llm_client(self.settings, role="critic")
+                stream_completion = getattr(client, "stream_completion", None)
+                if callable(stream_completion):
+                    completion = stream_completion(
+                        messages=[{"role": "user", "content": user}],
+                        system=CRITIC_SYSTEM,
+                        temperature=0.0,
+                        print_stream=False,
+                        thinking_level="low",
+                        max_output_tokens=4096,
+                        meta=request_meta,
+                    )
+                    text = completion.text or ""
+                    reasoning = completion.reasoning or ""
+                else:
+                    text = client.stream_text(
+                        messages=[{"role": "user", "content": user}],
+                        system=CRITIC_SYSTEM,
+                        temperature=0.0,
+                        print_stream=False,
+                        meta=request_meta,
+                    )
+                    reasoning = ""
+                payload = parse_critic_json(text, reasoning)
+            except Exception as exc:
+                failure_message = str(exc).strip() or exc.__class__.__name__
+                failure_kind = "critic_error"
+                failure_issues = [f"critic_error:{failure_message}"]
+                failure_raw = {}
+                logger.warning("kernel critic attempt %s/%s failed: %s", attempt, retries + 1, exc)
+                continue
+
+            if payload is None:
+                failure_kind = "invalid_response"
+                failure_message = "critic did not return a JSON object with pass/must_fix"
+                failure_issues = ["critic_invalid_response"]
+                failure_raw = {}
+                continue
+
+            must_fix_raw = payload.get("must_fix")
+            issues_raw = payload.get("issues")
+            if (must_fix_raw is not None and not isinstance(must_fix_raw, list)) or (
+                issues_raw is not None and not isinstance(issues_raw, list)
+            ):
+                failure_kind = "invalid_response"
+                failure_message = "critic must_fix and issues must be arrays"
+                failure_issues = ["critic_invalid_response"]
+                failure_raw = payload
+                continue
+            must_fix = [
+                item.strip()
+                for item in must_fix_raw or []
+                if isinstance(item, str) and item.strip()
+            ]
+            issues = [
+                item.strip()
+                for item in issues_raw or []
+                if isinstance(item, str) and item.strip()
+            ]
+            pass_value = payload.get("pass")
+            if must_fix:
+                passed = False
+                status = "failed"
+                failure = {"kind": "must_fix", "message": "critic reported blocking issues"}
+            elif isinstance(pass_value, bool):
+                passed = pass_value
+                status = "verified" if passed else "failed"
+                failure = None if passed else {
+                    "kind": "critic_rejected",
+                    "message": "critic returned pass=false",
+                }
             else:
-                text = client.stream_text(
-                    messages=[{"role": "user", "content": user}],
-                    system=CRITIC_SYSTEM,
-                    temperature=0.0,
-                    print_stream=False,
-                )
-        except Exception as exc:
-            logger.warning("kernel critic failed: %s", exc)
-            message = str(exc).strip() or exc.__class__.__name__
+                failure_kind = "invalid_response"
+                failure_message = "critic pass must be a boolean"
+                failure_issues = [*issues, "critic_invalid_response"]
+                failure_raw = payload
+                continue
             return _annotate_result(
                 CriticResult(
-                    passed=False,
+                    passed=passed,
+                    must_fix=must_fix,
+                    issues=issues,
                     skipped=False,
-                    issues=[f"critic_error:{message}"],
-                ),
-                status="unverified",
-                quality_score=int(heuristic.quality_score),
-                failure={"kind": "critic_error", "message": message},
-            )
-        payload = parse_critic_json(text)
-        if payload is None:
-            return _annotate_result(
-                CriticResult(
-                    passed=False,
-                    skipped=False,
-                    issues=["critic_invalid_response"],
-                ),
-                status="unverified",
-                quality_score=int(heuristic.quality_score),
-                failure={
-                    "kind": "invalid_response",
-                    "message": "critic did not return a JSON object with pass/must_fix",
-                },
-            )
-        must_fix = [
-            item.strip()
-            for item in payload.get("must_fix") or []
-            if isinstance(item, str) and item.strip()
-        ]
-        issues = [
-            item.strip()
-            for item in payload.get("issues") or []
-            if isinstance(item, str) and item.strip()
-        ]
-        pass_value = payload.get("pass")
-        # A missing/ill-typed pass value is not evidence of correctness.  A
-        # non-empty must_fix remains a normal, verified rejection.
-        if must_fix:
-            passed = False
-            status = "failed"
-            failure = {"kind": "must_fix", "message": "critic reported blocking issues"}
-        elif isinstance(pass_value, bool):
-            passed = pass_value
-            status = "verified" if passed else "failed"
-            failure = None if passed else {
-                "kind": "critic_rejected",
-                "message": "critic returned pass=false",
-            }
-        else:
-            return _annotate_result(
-                CriticResult(
-                    passed=False,
-                    skipped=False,
-                    issues=issues + ["critic_invalid_response"],
                     raw=payload,
                 ),
-                status="unverified",
+                status=status,
                 quality_score=int(heuristic.quality_score),
-                failure={
-                    "kind": "invalid_response",
-                    "message": "critic pass must be a boolean",
-                },
+                failure=failure,
             )
-        return _annotate_result(CriticResult(
-            passed=passed,
-            must_fix=must_fix,
-            issues=issues,
-            skipped=False,
-            raw=payload if isinstance(payload, dict) else {},
-        ), status=status, quality_score=int(heuristic.quality_score), failure=failure)
+
+        return _annotate_result(
+            CriticResult(
+                passed=False,
+                skipped=False,
+                issues=failure_issues,
+                raw=failure_raw,
+            ),
+            status="unverified",
+            quality_score=int(heuristic.quality_score),
+            failure={"kind": failure_kind, "message": failure_message},
+        )

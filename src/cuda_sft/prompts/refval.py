@@ -7,7 +7,7 @@ The project has NO include/solution_header.h — the host signature was invented
 Return ONE JSON object and nothing else with keys:
   "abi": {
     "entry": host function name (not the __global__ name unless they are the same),
-    "dtype": canonical compute dtype (f32|f64|f16|bf16|i32|i64|i8|u8|u32|bool),
+    "dtype": canonical compute dtype (f32|f64|f16|bf16|i32|i64|i8|u8|u16|u32|bool),
     "layout": contiguous|row_major|col_major|strided,
     "returns": "void" or a dtype,
     "sort_outputs": true if compare must sort-flatten (atomics / set-union / unordered),
@@ -25,9 +25,12 @@ Rules for reference_source:
 - Pure Python using numpy as np (already imported). No file I/O, no network, no subprocess.
 - Match the host ABI: take input tensors and scalars by name, return a dict of output name -> ndarray.
 - Implement the QUESTION's algorithm, not a copy of GPU indexing bugs.
+- For reductions, express the mathematical operation with NumPy and suitable accumulation precision; do not simulate thread or block reduction order.
 - Deterministic. Do not print.
 - For set-union / unordered outputs set sort_outputs=true.
 - Device pointers in the kernel correspond to numpy arrays on the CPU; do not use cuda.
+- CPU tensor arguments are dense logical arrays, even when the GPU case uses strided storage. A stride scalar describes GPU storage; do not index the CPU array by that stride. Use logical indices (for example a[:n] + b[:n]).
+- For unsigned short pointers carrying FP16 bits, use param dtype u16 and compute dtype f16. Interpret inputs with .view(np.float16), then return FP16 outputs viewed as np.uint16.
 JSON only."""
 
 EXTRACT_USER = """## Question

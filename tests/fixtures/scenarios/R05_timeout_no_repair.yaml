@@ -1,0 +1,17 @@
+id: R05
+title: refval 抽取阶段超时属于 INFRA，不得消耗修复预算
+issues: [Q4]
+settings: {DIFFICULTY_AWARE: "false", MAX_CANDIDATES: "1", MAX_REPAIRS: "2", KERNEL_LLM_CRITIC: "off"}
+job: {question_id: 5, question: "实现一个 CUDA kernel：对长度为 n 的 float 数组逐元素相加，c[i] = a[i] + b[i]。", dialects: [cuda], kind: kernel}
+llm:
+  generator:
+    c1r0: {code: kernels/add_timeout_before_gpu.cu}
+  repair.compile:
+    default: {code: kernels/add_timeout_before_gpu.cu}
+expect:
+  status: abandoned
+  abandon_reason: oracle_unavailable
+  llm:
+    calls: {generator: {eq: 1}, "repair.*": {eq: 0}}
+  refval: {calls: {eq: 3}}
+  sleeps: [5.0, 20.0]

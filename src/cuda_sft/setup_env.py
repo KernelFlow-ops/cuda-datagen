@@ -23,6 +23,7 @@ CUTLASS_TAG = "v4.3.5"
 CUTLASS_MAJOR_RE = re.compile(r"#define\s+CUTLASS_MAJOR\s+(\d+)")
 
 PYTHON_PACKAGES = (
+    "numpy",
     "langgraph",
     "anthropic",
     "openai",
@@ -446,11 +447,8 @@ def _print_table(rows: list[CheckRow]) -> None:
 
 
 def install_python_deps() -> tuple[bool, str]:
-    """pip install -r requirements.txt."""
-    req = PROJECT_ROOT / "requirements.txt"
-    if not req.is_file():
-        return False, f"missing {req}"
-    return _pip_install("-r", str(req))
+    """Install the core project dependencies from ``pyproject.toml``."""
+    return _pip_install("-e", str(PROJECT_ROOT))
 
 
 def install_triton() -> tuple[bool, str]:
@@ -609,7 +607,7 @@ def _apply_install(row: CheckRow) -> None:
     """Run the installer that matches a failed check row."""
     if row.name == "python-deps":
         ok, detail = install_python_deps()
-        print(f"pip requirements: {'OK' if ok else 'FAIL'}", flush=True)
+        print(f"pip project: {'OK' if ok else 'FAIL'}", flush=True)
         if not ok:
             print(detail, flush=True)
         return

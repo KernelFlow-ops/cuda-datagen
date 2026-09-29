@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -9,12 +10,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cuda_sft.knowledge.graph as knowledge_graph
+from cuda_sft.agents.contracts import GenerateResult
 from cuda_sft.config import Settings
 from cuda_sft.formats import resolve_export_assistant
+from cuda_sft.knowledge.cot import KnowledgeCotAgent
 from cuda_sft.knowledge.facts import fact_violations
 from cuda_sft.knowledge.graph import route_after_gate, route_after_judge
-from cuda_sft.knowledge.judge import KnowledgeJudge, hard_gate, parse_judge_json
-from cuda_sft.knowledge.parse import extract_answer, fence_char_ratio
+from cuda_sft.knowledge.judge import (
+    KnowledgeJudge,
+    KnowledgeJudgeResult,
+    accepted_knowledge_answer,
+    hard_gate,
+    parse_judge_json,
+)
+from cuda_sft.knowledge.parse import answer_integrity_issues, extract_answer, fence_char_ratio
+from cuda_sft.knowledge.prompt import build_repair_prompt
 from cuda_sft.knowledge.rubrics import overall_score, passes_threshold
 from cuda_sft.llm import LLMCompletion
 from cuda_sft.parse import wrap_cot_assistant
@@ -66,6 +77,17 @@ def _long(body: str) -> str:
     while len(text) < 420:
         text += pad
     return text
+
+
+def test_knowledge_repair_explains_score_only_rejection() -> None:
+    prompt = build_repair_prompt(
+        topic="execution", answer="An incomplete explanation.",
+        gate_reasons=[], must_fix=[], issues=[], judge_score=5.5,
+        judge_dimensions={"factual": 4, "completeness": 6},
+    )
+    assert "overall: 5.5/10" in prompt
+    assert "factual: 4/10" in prompt
+    assert "completeness: 6/10" in prompt
 
 
 class FactCardTests(unittest.TestCase):
@@ -120,6 +142,21 @@ class HardGateTests(unittest.TestCase):
         reasons = hard_gate(body, topic="formula", question="Derive occupancy", min_chars=400)
         self.assertTrue(any("equation" in item for item in reasons))
 
+    def test_formula_explanation_does_not_require_derivation_steps(self) -> None:
+        question = (
+            "Analyze arithmetic intensity in GPU workloads. Define it, explain its "
+            "relationship to computation and memory traffic, and compare memory-bound "
+            "and compute-bound workloads. Use a numerical example if helpful."
+        )
+        answer = _long(
+            "## Answer\nArithmetic intensity = operations / bytes transferred. "
+            "More data reuse increases operations per byte."
+        )
+        self.assertEqual(hard_gate(answer, topic="formula", question=question, min_chars=400), [])
+        for explicit in ("Derive arithmetic intensity", "Show your work calculating intensity"):
+            reasons = hard_gate(answer, topic="formula", question=explicit, min_chars=400)
+            self.assertTrue(any("step-by-step" in item for item in reasons))
+
     def test_code_ratio_fails_on_theory(self) -> None:
         kernel = "```cuda\n" + ("__global__ void k() {}\n" * 40) + "```\n"
         body = "## 结论\nsee code\n" + kernel
@@ -130,6 +167,12 @@ class HardGateTests(unittest.TestCase):
         text = "<think>plan</think>\n## 结论\nwarp size is 32.\n"
         self.assertIn("结论", extract_answer(text))
         self.assertNotIn("plan", extract_answer(text))
+
+    def test_incomplete_answer_fails_before_judge(self) -> None:
+        for ending in ("unfinished...", "```cuda\nint x = 1;", "$$x = 1"):
+            answer = _long(STRUCTURED) + "\n" + ending
+            self.assertTrue(answer_integrity_issues(answer))
+            self.assertTrue(hard_gate(answer, topic="architecture", min_chars=400))
 
 
 class RubricTests(unittest.TestCase):
@@ -147,9 +190,17 @@ class RubricTests(unittest.TestCase):
         self.assertGreater(arch, formula)
 
     def test_must_fix_blocks_pass(self) -> None:
-        dims = {key: 9 for key in (
-            "factual", "completeness", "derivation", "terminology", "structure", "grounding"
-        )}
+        dims = {
+            key: 9
+            for key in (
+                "factual",
+                "completeness",
+                "derivation",
+                "terminology",
+                "structure",
+                "grounding",
+            )
+        }
         self.assertFalse(
             passes_threshold(
                 overall=9,
@@ -163,11 +214,7 @@ class RubricTests(unittest.TestCase):
 
 class JudgeJsonTests(unittest.TestCase):
     def test_parse_fenced_json(self) -> None:
-        text = (
-            "```json\n"
-            '{"dimensions": {"factual": 8}, "must_fix": []}\n'
-            "```"
-        )
+        text = '```json\n{"dimensions": {"factual": 8}, "must_fix": []}\n```'
         payload = parse_judge_json(text)
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -193,10 +240,7 @@ class JudgeJsonTests(unittest.TestCase):
         self.assertEqual(payload["dimensions"]["factual"], 9)
 
     def test_parse_json_inside_think_tags(self) -> None:
-        text = (
-            '<think>planning</think>\n'
-            '{"dimensions": {"factual": 7}, "must_fix": []}'
-        )
+        text = '<think>planning</think>\n{"dimensions": {"factual": 7}, "must_fix": []}'
         payload = parse_judge_json(text)
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -359,8 +403,180 @@ class RouteTests(unittest.TestCase):
             )
             self.assertEqual(
                 route_after_judge({"judge_unavailable": False, "judge_pass": True}),
-                "cot",
+                "save_abandoned",
             )
+
+    def test_matching_review_evidence_allows_success_route(self) -> None:
+        settings = _settings()
+        answer = _long(STRUCTURED)
+
+        class PassingJudge:
+            def __init__(self, _settings: Settings) -> None:
+                pass
+
+            def judge(self, **_kwargs: object) -> KnowledgeJudgeResult:
+                return KnowledgeJudgeResult(
+                    passed=True,
+                    overall=8.0,
+                    dimensions={key: 8.0 for key in (
+                        "factual", "completeness", "derivation", "terminology", "structure", "grounding"
+                    )},
+                )
+
+        state = {
+            "question_id": 4,
+            "question": "Explain CUDA warps",
+            "topic": "architecture",
+            "track": "knowledge:architecture",
+            "answer": answer,
+            "gate_ok": True,
+        }
+        with (
+            patch.object(knowledge_graph, "get_settings", return_value=settings),
+            patch.object(knowledge_graph, "KnowledgeJudge", PassingJudge),
+        ):
+            reviewed = {**state, **knowledge_graph.judge(state)}
+            self.assertTrue(accepted_knowledge_answer(reviewed, settings))
+            self.assertEqual(route_after_judge(reviewed), "cot")
+            self.assertFalse(accepted_knowledge_answer({**reviewed, "answer": answer + " extra"}, settings))
+
+    def test_repair_routes_respect_difficulty_budget(self) -> None:
+        settings = _settings(knowledge_max_repairs=3, difficulty_aware=True)
+        with patch("cuda_sft.knowledge.graph.get_settings", return_value=settings):
+            prepared = knowledge_graph.prepare(
+                {"question_id": 14, "question": "Explain occupancy", "topic": "general"}
+            )
+            self.assertEqual(prepared["repair_cap"], 1)
+            capped_state = {
+                **prepared,
+                "repair_idx": 2,
+                "candidate_idx": 1,
+                "candidate_cap": 2,
+                "gate_ok": False,
+                "judge_pass": False,
+            }
+            self.assertEqual(route_after_gate(capped_state), "next_candidate")
+            self.assertEqual(route_after_judge(capped_state), "next_candidate")
+
+    def test_disabled_cot_agent_never_uses_synthetic_fallback(self) -> None:
+        class NeverCall:
+            calls = 0
+
+            def stream_completion(self, **_kwargs: object) -> LLMCompletion:
+                self.calls += 1
+                raise AssertionError("disabled CoT agent must not call the LLM")
+
+        client = NeverCall()
+        agent = KnowledgeCotAgent(
+            settings=_settings(cot_agent_enabled=False, cot_on_empty="synthetic"),
+            llm_client=client,  # type: ignore[arg-type]
+        )
+        result = agent.refine({"question_id": 15, "question": "Explain occupancy"})
+        self.assertEqual(result.source, "empty")
+        self.assertEqual(result.cot, "")
+        self.assertEqual(client.calls, 0)
+
+
+class KnowledgeComputeGraphTests(unittest.TestCase):
+    def test_first_passing_candidate_finishes_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                work_dir=str(Path(tmp) / "work"),
+                knowledge_max_candidates=2,
+                knowledge_max_repairs=0,
+            )
+            seen: list[int] = []
+
+            def generate(state: dict[str, object]) -> dict[str, object]:
+                candidate = int(state["candidate_idx"])
+                seen.append(candidate)
+                return {"raw_response": _long(STRUCTURED), "origin": "live_api"}
+
+            class PassingJudge:
+                def __init__(self, _settings: Settings) -> None:
+                    pass
+
+                def judge(self, **_kwargs: object) -> KnowledgeJudgeResult:
+                    return KnowledgeJudgeResult(
+                        passed=True, overall=8.0,
+                        dimensions={key: 8.0 for key in (
+                            "factual", "completeness", "derivation", "terminology", "structure", "grounding"
+                        )},
+                    )
+
+            with (
+                patch.object(knowledge_graph, "get_settings", return_value=settings),
+                patch.object(knowledge_graph, "prepare", return_value={
+                    "candidate_idx": 1, "repair_idx": 0, "candidate_cap": 2, "status": "running"
+                }),
+                patch.object(knowledge_graph, "generate", side_effect=generate),
+                patch.object(knowledge_graph, "KnowledgeJudge", PassingJudge),
+                patch.object(knowledge_graph, "cot", return_value={"cot": ""}),
+                patch.object(knowledge_graph, "get_store", side_effect=AssertionError("store write")),
+                patch.object(knowledge_graph, "_write_attempt", side_effect=AssertionError("attempt write")),
+                patch.object(knowledge_graph, "_finalize_answer", side_effect=AssertionError("final write")),
+            ):
+                graph = knowledge_graph.build_knowledge_compute_graph()
+                final = graph.invoke(
+                    {"question_id": 12, "question": "Explain CUDA", "topic": "architecture"},
+                    {"recursion_limit": 40},
+                )
+
+            self.assertEqual(final["status"], "success")
+            self.assertEqual(final["origin"], "live_api")
+            self.assertEqual(seen, [1])
+            self.assertFalse((Path(tmp) / "work").exists())
+
+    def test_failed_candidates_finish_abandoned_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                work_dir=str(Path(tmp) / "work"),
+                knowledge_max_candidates=2,
+                knowledge_max_repairs=0,
+            )
+            seen: list[int] = []
+
+            def generate(state: dict[str, object]) -> dict[str, object]:
+                candidate = int(state["candidate_idx"])
+                seen.append(candidate)
+                return {"raw_response": "too short", "origin": "live_api"}
+
+            with (
+                patch.object(knowledge_graph, "get_settings", return_value=settings),
+                patch.object(knowledge_graph, "prepare", return_value={
+                    "candidate_idx": 1, "repair_idx": 0, "candidate_cap": 2, "status": "running"
+                }),
+                patch.object(knowledge_graph, "generate", side_effect=generate),
+                patch.object(knowledge_graph, "get_store", side_effect=AssertionError("store write")),
+                patch.object(knowledge_graph, "_write_attempt", side_effect=AssertionError("attempt write")),
+                patch.object(knowledge_graph, "_finalize_answer", side_effect=AssertionError("final write")),
+            ):
+                graph = knowledge_graph.build_knowledge_compute_graph()
+                final = graph.invoke(
+                    {"question_id": 13, "question": "Explain CUDA", "topic": "architecture"},
+                    {"recursion_limit": 40},
+                )
+
+            self.assertEqual(final["status"], "abandoned")
+            self.assertEqual(final["abandon_reason"], "knowledge_quality")
+            self.assertEqual(seen, [1, 2])
+            self.assertFalse((Path(tmp) / "work").exists())
+
+    def test_generation_records_current_response_origin(self) -> None:
+        with (
+            patch.object(knowledge_graph, "get_settings", return_value=_settings()),
+            patch.object(knowledge_graph, "complete_chat", return_value=GenerateResult(
+                text="current answer", origin="live_api"
+            )),
+        ):
+            result = knowledge_graph.generate({
+                "question_id": 14,
+                "question": "Explain CUDA",
+                "candidate_idx": 1,
+                "messages": [{"role": "user", "content": "Explain CUDA"}],
+                "origin": "unknown",
+            })
+        self.assertEqual(result["origin"], "live_api")
 
 
 class ExportTests(unittest.TestCase):
@@ -432,7 +648,7 @@ class PromptLanguageTests(unittest.TestCase):
 class StoreKnowledgeTests(unittest.TestCase):
     def test_write_success_sets_task_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp))
+            store = Store(Path(tmp), allow_test_sources=True)
             state = {
                 "kind": "knowledge",
                 "question_id": 7,
@@ -447,10 +663,25 @@ class StoreKnowledgeTests(unittest.TestCase):
                 "candidate_idx": 1,
                 "repair_idx": 0,
                 "judge_score": 8.2,
+                "gate_ok": True,
+                "judge_pass": True,
+                "judge_unavailable": False,
+                "judge_skipped_llm": False,
                 "cuda_arch": "sm_86",
                 "gpu_name": "RTX",
                 "metadata": {
-                    "knowledge_judge": {"pass": True, "overall": 8.2},
+                    "knowledge_judge": {
+                        "pass": True,
+                        "overall": 8.2,
+                        "dimensions": {key: 8.2 for key in (
+                            "factual", "completeness", "derivation", "terminology", "structure", "grounding"
+                        )},
+                        "must_fix": [],
+                        "unavailable": False,
+                        "skipped_llm": False,
+                        "hard_gate_failed": False,
+                        "answer_sha256": hashlib.sha256(_long(STRUCTURED).encode("utf-8")).hexdigest(),
+                    },
                     "cot": {"source": "agent", "text": "1. 题意\nwarp。"},
                 },
             }

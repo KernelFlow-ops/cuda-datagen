@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from cuda_sft.refval.spec import (
+    COMPLEX_DTYPES,
     FLOAT_DTYPES,
     KernelABI,
     KernelParam,
@@ -73,7 +74,22 @@ FORBIDDEN_ATTR = re.compile(
     re.IGNORECASE,
 )
 
+
+def _safe_import(
+    name: str,
+    globals: dict[str, Any] | None = None,
+    locals: dict[str, Any] | None = None,
+    fromlist: tuple[str, ...] = (),
+    level: int = 0,
+) -> Any:
+    """Allow NumPy's internal imports without exposing system modules to references."""
+    if level or name.split(".", 1)[0] not in {"numpy", "math", "warnings"}:
+        raise ImportError(f"reference import is not allowed: {name}")
+    return __import__(name, globals, locals, fromlist, level)
+
+
 SAFE_BUILTINS = {
+    "__import__": _safe_import,
     "abs": abs,
     "all": all,
     "any": any,
@@ -103,12 +119,13 @@ SAFE_BUILTINS = {
     "None": None,
 }
 
+# Child startup and NumPy import can exceed five seconds on a loaded GPU host.
 REFERENCE_CALL_TIMEOUT_SEC = max(
-    0.1, float(os.environ.get("REFVAL_REFERENCE_TIMEOUT_SEC", "5") or "5")
+    0.1, float(os.environ.get("REFVAL_REFERENCE_TIMEOUT_SEC", "20") or "20")
 )
 REFERENCE_VALIDATION_TIMEOUT_SEC = max(
     REFERENCE_CALL_TIMEOUT_SEC,
-    float(os.environ.get("REFVAL_REFERENCE_VALIDATION_TIMEOUT_SEC", "10") or "10"),
+    float(os.environ.get("REFVAL_REFERENCE_VALIDATION_TIMEOUT_SEC", "30") or "30"),
 )
 
 
@@ -211,7 +228,7 @@ def load_reference_fn(
 def _load_reference_fn_inline(source: str, fn_name: str) -> Callable[..., Any]:
     """Load a reference inside an already-isolated worker process."""
     text = strip_reference_fence(source)
-    # Imports are rejected by the sandbox builtins; drop allowed import lines.
+    # Prevalidated import lines are dropped; safe modules are bound below.
     cleaned_lines = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -228,12 +245,13 @@ def _load_reference_fn_inline(source: str, fn_name: str) -> Callable[..., Any]:
         "np": np,
         "numpy": np,
     }
-    try:
-        import torch  # type: ignore
+    if any(isinstance(node, ast.Name) and node.id == "torch" for node in ast.walk(ast.parse(text))):
+        try:
+            import torch  # type: ignore
 
-        ns["torch"] = torch
-    except ImportError:
-        pass
+            ns["torch"] = torch
+        except ImportError:
+            pass
     try:
         exec(compile(text, "<reference>", "exec"), ns, ns)  # noqa: S102 — sandboxed
     except Exception as exc:
@@ -263,7 +281,13 @@ def _call_program_worker(
 def _isolated_entry(conn: Any, target: Callable[..., Any], args: tuple[Any, ...]) -> None:
     """Child entrypoint that serializes either a value or a bounded error."""
     try:
-        conn.send(("ok", target(*args)))
+        np = _try_numpy()
+        if np is None:
+            result = target(*args)
+        else:
+            with np.errstate(all="ignore"):
+                result = target(*args)
+        conn.send(("ok", result))
     except BaseException as exc:  # child must report model-code failures
         conn.send(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -528,18 +552,28 @@ def _zero_like_param(param: KernelParam, n: int):
     return np.zeros(shape, dtype=dt)
 
 
-def _random_like_param(param: KernelParam, n: int, rng: random.Random):
+def _random_like_param(
+    param: KernelParam, n: int, rng: random.Random, *, compute_dtype: str = ""
+):
     np = _try_numpy()
     shape = (n,) if param.rank <= 1 else tuple([max(1, n)] * max(1, param.rank))
     dt = numpy_dtype_name(param.dtype)
     if np is None:
         return [rng.random() for _ in range(_prod(shape))]
-    if param.dtype in FLOAT_DTYPES or True:
-        arr = np.empty(shape, dtype=dt)
-        flat = arr.reshape(-1)
-        for i in range(flat.size):
-            flat[i] = rng.random() * 2.0 - 1.0
-        return arr
+    if param.dtype == "u16" and compute_dtype == "f16":
+        values = [rng.random() * 4.0 - 2.0 for _ in range(_prod(shape))]
+        return np.asarray(values, dtype=np.float16).reshape(shape).view(np.uint16)
+    if param.dtype in COMPLEX_DTYPES:
+        values = [complex(rng.random() * 2.0 - 1.0, rng.random() * 2.0 - 1.0) for _ in range(_prod(shape))]
+    elif param.dtype in FLOAT_DTYPES:
+        values = [rng.random() * 2.0 - 1.0 for _ in range(_prod(shape))]
+    elif param.dtype == "bool":
+        values = [bool(rng.getrandbits(1)) for _ in range(_prod(shape))]
+    elif param.dtype.startswith("u"):
+        values = [rng.randrange(0, 11) for _ in range(_prod(shape))]
+    else:
+        values = [rng.randrange(-10, 11) for _ in range(_prod(shape))]
+    return np.asarray(values, dtype=dt).reshape(shape)
 
 
 def _prod(shape: tuple[int, ...]) -> int:
@@ -570,7 +604,9 @@ def validate_reference_fn(
         sizes = {"n": n}
     scalars: dict[str, Any] = dict(sizes)
     for param in abi.scalar_params():
-        if param.dtype in FLOAT_DTYPES:
+        if param.dtype in {"cublas_handle", "cufft_handle"}:
+            scalars[param.name] = None
+        elif param.dtype in FLOAT_DTYPES:
             scalars[param.name] = 1.25
         elif param.dtype == "bool":
             scalars[param.name] = True
@@ -581,7 +617,7 @@ def validate_reference_fn(
         rng = random.Random(int(seed) + tag)
         tensors: dict[str, Any] = {}
         for param in abi.input_params():
-            tensors[param.name] = _random_like_param(param, n, rng)
+            tensors[param.name] = _random_like_param(param, n, rng, compute_dtype=abi.dtype)
         return tensors
 
     validation_deadline = time.monotonic() + REFERENCE_VALIDATION_TIMEOUT_SEC
@@ -618,16 +654,16 @@ def validate_reference_fn(
         if np.asarray(arr).shape != np.asarray(other).shape:
             return f"reference shape changed across calls for {name}"
         if not np.allclose(
-            np.asarray(arr, dtype=np.float64),
-            np.asarray(other, dtype=np.float64),
+            np.asarray(arr),
+            np.asarray(other),
             equal_nan=True,
             atol=0.0,
             rtol=0.0,
         ):
             # Integer exact; floats must still be bit-stable for a CPU ref.
             if not np.allclose(
-                np.asarray(arr, dtype=np.float64),
-                np.asarray(other, dtype=np.float64),
+                np.asarray(arr),
+                np.asarray(other),
                 equal_nan=True,
                 atol=1e-12,
                 rtol=1e-12,
@@ -648,8 +684,15 @@ def validate_reference_fn(
     for name in out1:
         if name not in out2:
             continue
-        x = np.asarray(out1[name], dtype=np.float64).reshape(-1)
-        y = np.asarray(out2[name], dtype=np.float64).reshape(-1)
+        param = next((p for p in abi.params if p.name == name), None)
+        first = np.asarray(out1[name])
+        second = np.asarray(out2[name])
+        half_bits = param is not None and param.dtype == "u16" and abi.dtype == "f16"
+        if half_bits and first.dtype == np.uint16 and second.dtype == np.uint16:
+            first = first.view(np.float16)
+            second = second.view(np.float16)
+        x = np.asarray(first).reshape(-1)
+        y = np.asarray(second).reshape(-1)
         ncmp = min(x.size, y.size)
         if ncmp == 0:
             continue
@@ -658,8 +701,7 @@ def validate_reference_fn(
         if ncmp < 4:
             continue
         compared = True
-        param = next((p for p in abi.params if p.name == name), None)
-        dtype = param.dtype if param is not None else abi.dtype
+        dtype = "f16" if half_bits else (param.dtype if param is not None else abi.dtype)
         tol = tolerances_for(dtype)
         sigma = float(tol["atol"]) + float(tol["rtol"]) * max(
             float(np.nanmax(np.abs(x[:ncmp]))) if ncmp else 0.0,

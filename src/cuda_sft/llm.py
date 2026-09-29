@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import re
 import sys
-from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+import threading
+import time
+from collections.abc import Iterable
+from concurrent.futures import CancelledError as FutureCancelledError
+from dataclasses import dataclass, replace
+from typing import Any, Protocol
 
 try:
     import anthropic
@@ -17,6 +23,8 @@ except ImportError:  # OpenAI/NVIDIA-only installs must still import this module
 
 from cuda_sft.config import Settings, get_settings
 from cuda_sft.parse import extract_thinking, strip_thinking
+from cuda_sft.runtime import deps, trace
+from cuda_sft.runtime.meta import CallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,8 @@ _AFFORD_TOKENS_RE = re.compile(r"can only afford (\d+)", re.IGNORECASE)
 # OpenRouter reserves max_tokens against remaining credits; 100k often 402s.
 OPENROUTER_MAX_TOKENS_CAP = 32768
 OPENROUTER_MIN_TOKENS = 256
+_nvidia_stream_usage_supported = True
+_nvidia_stream_usage_lock = threading.Lock()
 
 
 class LLMError(Exception):
@@ -53,11 +63,15 @@ class LLMCompletion:
         text: Visible assistant text (think tags stripped when they were extracted).
         reasoning: Concatenated chain-of-thought / thinking.
         reasoning_source: How reasoning was obtained.
+        origin: Whether the response came from a live provider SDK call.
     """
 
     text: str
     reasoning: str = ""
     reasoning_source: str = "empty"
+    usage: dict[str, int] | None = None
+    tokens_estimated: bool = False
+    origin: str = "unknown"
 
 
 class LLMClient(Protocol):
@@ -70,6 +84,7 @@ class LLMClient(Protocol):
         system: str,
         temperature: float,
         print_stream: bool = True,
+        meta: CallMeta | None = None,
     ) -> LLMCompletion:
         """Stream a completion and return visible text plus reasoning."""
         ...
@@ -81,6 +96,7 @@ class LLMClient(Protocol):
         system: str,
         temperature: float,
         print_stream: bool = True,
+        meta: CallMeta | None = None,
     ) -> str:
         """Stream a completion and return visible assistant text (no thinking).
 
@@ -174,6 +190,11 @@ def is_retryable_llm_error(exc: BaseException) -> bool:
     Used by LangGraph ``RetryPolicy`` on the generate node.
     """
     if isinstance(exc, LLMError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in {401, 403}:
+        return False
+    if status in RETRYABLE_STATUS:
         return True
     if _anthropic_error_types(
         "APIConnectionError", "APITimeoutError", "RateLimitError", "InternalServerError"
@@ -330,6 +351,15 @@ def assemble_completion(
     )
 
 
+def _partial_completion(text: list[str], reasoning: list[str], source: str) -> LLMCompletion | None:
+    if not text and not reasoning:
+        return None
+    return assemble_completion(
+        visible_text="".join(text),
+        reasoning_candidates=[("".join(reasoning), source)],
+    )
+
+
 def _stream_event_delta(event: Any) -> Any:
     """Return the delta payload of an Anthropic stream event, if any."""
     if event is None:
@@ -360,17 +390,83 @@ def approx_tokens(text: str) -> int:
     return (ascii_n + 3) // 4 + other
 
 
+def _usage_value(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _read_usage(usage: Any) -> dict[str, int] | None:
+    if usage is None:
+        return None
+    input_tokens = _usage_value(usage, "input_tokens")
+    output_tokens = _usage_value(usage, "output_tokens")
+    if input_tokens is None:
+        input_tokens = _usage_value(usage, "prompt_tokens")
+    if output_tokens is None:
+        output_tokens = _usage_value(usage, "completion_tokens")
+    if input_tokens is None or output_tokens is None:
+        return None
+    details = _usage_value(usage, "completion_tokens_details")
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "reasoning_tokens": int(_usage_value(details, "reasoning_tokens") or 0),
+    }
+
+
+def _trace_key_label(provider: str) -> str:
+    label = os.environ.get("CUDA_SFT_WORKER_KEY_LABEL", "").strip()
+    if label == provider:
+        return f"{provider}#1"
+    if re.fullmatch(rf"{re.escape(provider)}#[1-9][0-9]*", label):
+        return label
+    return f"{provider}#1"
+
+
+def _emit_usage(
+    *, meta: CallMeta | None, provider: str, model: str, started: float,
+    first_token: float | None, system: str, messages: list[dict[str, str]],
+    completion: LLMCompletion | None, attempt: int = 1, error: BaseException | None = None,
+) -> LLMCompletion | None:
+    """Record one explicit client request; S0 cannot observe SDK-internal retries."""
+    usage = completion.usage if completion is not None else None
+    estimated = usage is None
+    if estimated:
+        usage = {
+            "input_tokens": approx_tokens(system) + _message_tokens(messages),
+            "output_tokens": approx_tokens((completion.text + completion.reasoning) if completion else ""),
+            "reasoning_tokens": approx_tokens(completion.reasoning) if completion else 0,
+        }
+    cancelled = isinstance(error, (asyncio.CancelledError, FutureCancelledError, KeyboardInterrupt, GeneratorExit))
+    trace.emit(
+        "llm.call", job_key=meta.job_key if meta else "", candidate=meta.candidate if meta else 0,
+        repair=meta.repair if meta else 0, role=meta.role if meta else "generator",
+        purpose=meta.purpose if meta else "", provider=provider, model=model,
+        key_label=_trace_key_label(provider), attempt=attempt,
+        caller_attempt=meta.attempt if meta else 1, n_messages=len(messages),
+        elapsed_s=round(time.monotonic() - started, 4),
+        ttft_s=round(first_token - started, 4) if first_token is not None else None,
+        input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
+        reasoning_tokens=usage["reasoning_tokens"], tokens_estimated=estimated,
+        ok=error is None, error_type=type(error).__name__ if error else "",
+        retryable=is_retryable_llm_error(error) if error else False,
+        cancelled=cancelled, cost_usd=None,
+    )
+    return replace(completion, usage=usage, tokens_estimated=estimated) if completion is not None else None
+
+
 def _message_tokens(messages: list[dict[str, str]]) -> int:
     return sum(approx_tokens(m.get("content") or "") + 4 for m in messages)
 
 
 def _clip_text_tail(text: str, max_tokens: int) -> str:
     """Keep the tail of ``text`` so estimated tokens stay within ``max_tokens``."""
-    if max_tokens <= 0 or approx_tokens(text) <= max_tokens:
+    if max_tokens <= 0:
+        return ""
+    if approx_tokens(text) <= max_tokens:
         return text
     # Binary-search a suffix; CUDA repair prompts keep latest code/errors at the end.
     lo, hi = 0, len(text)
-    best = text[- min(len(text), max(1, max_tokens)) :]
+    best = ""
     while lo <= hi:
         mid = (lo + hi) // 2
         suffix = text[len(text) - mid :] if mid else ""
@@ -379,8 +475,31 @@ def _clip_text_tail(text: str, max_tokens: int) -> str:
             lo = mid + 1
         else:
             hi = mid - 1
-    if best and not text.endswith(best):
-        return "\n...[truncated input]...\n" + best
+    return best
+
+
+def _clip_text_middle(text: str, max_tokens: int) -> str:
+    """Fit the latest user turn, retaining roughly 30% head and 70% tail."""
+    if max_tokens <= 0:
+        return ""
+    if approx_tokens(text) <= max_tokens:
+        return text
+    marker = "\n...[truncated]...\n"
+    if approx_tokens(marker) > max_tokens:
+        return _clip_text_tail(text, max_tokens)
+
+    best = marker
+    lo, hi = 0, len(text) - 1
+    while lo <= hi:
+        retained = (lo + hi) // 2
+        head_len = min(retained - 1, max(1, round(retained * 0.3))) if retained >= 2 else 0
+        tail_len = retained - head_len
+        candidate = text[:head_len] + marker + text[-tail_len:] if tail_len else text[:head_len] + marker
+        if approx_tokens(candidate) <= max_tokens:
+            best = candidate
+            lo = retained + 1
+        else:
+            hi = retained - 1
     return best
 
 
@@ -389,7 +508,7 @@ def fit_to_input_budget(
     messages: list[dict[str, str]],
     max_input_tokens: int,
 ) -> tuple[str, list[dict[str, str]]]:
-    """Drop oldest turns, then trim system / last message to fit ``max_input_tokens``.
+    """Keep the first and latest user turns while fitting the input budget.
 
     Args:
         system: System prompt.
@@ -399,41 +518,44 @@ def fit_to_input_budget(
     Returns:
         Possibly truncated ``(system, messages)``.
     """
+    msgs = [{"role": m.get("role"), "content": m.get("content") or ""} for m in messages]
+
+    def validate_turns() -> None:
+        if not msgs or any(
+            message["role"] != ("user" if index % 2 == 0 else "assistant")
+            for index, message in enumerate(msgs)
+        ) or msgs[-1]["role"] != "user":
+            raise ValueError("messages must alternate user/assistant and end with user")
+
+    validate_turns()
     if max_input_tokens <= 0:
         return system, messages
-    msgs = [{"role": m.get("role", "user"), "content": m.get("content") or ""} for m in messages]
     sys_text = system or ""
 
     def total() -> int:
         return approx_tokens(sys_text) + 4 + _message_tokens(msgs)
 
-    if total() <= max_input_tokens:
-        return sys_text, msgs
+    if total() > max_input_tokens:
+        logger.warning(
+            "input ~%s tokens exceeds MAX_INPUT_TOKENS=%s; clipping",
+            total(),
+            max_input_tokens,
+        )
+        while len(msgs) > 3 and total() > max_input_tokens:
+            del msgs[1:3]
 
-    logger.warning(
-        "input ~%s tokens exceeds MAX_INPUT_TOKENS=%s; clipping",
-        total(),
-        max_input_tokens,
-    )
-    while len(msgs) > 1 and total() > max_input_tokens:
-        msgs.pop(0)
+        if total() > max_input_tokens:
+            sys_budget = max(0, max_input_tokens - 4 - _message_tokens(msgs))
+            sys_text = _clip_text_tail(sys_text, sys_budget)
 
-    if total() <= max_input_tokens:
-        return sys_text, msgs
+        if total() > max_input_tokens:
+            room = max(
+                0,
+                max_input_tokens - 4 - approx_tokens(sys_text) - _message_tokens(msgs[:-1]) - 4,
+            )
+            msgs[-1]["content"] = _clip_text_middle(msgs[-1]["content"], room)
 
-    last_min = min(256, max_input_tokens // 4)
-    sys_budget = max(0, max_input_tokens - _message_tokens(msgs) - 8)
-    if approx_tokens(sys_text) > sys_budget:
-        sys_text = _clip_text_tail(sys_text, sys_budget)
-
-    if total() <= max_input_tokens:
-        return sys_text, msgs
-
-    if msgs:
-        last = dict(msgs[-1])
-        room = max(last_min, max_input_tokens - approx_tokens(sys_text) - 8)
-        last["content"] = _clip_text_tail(last.get("content") or "", room)
-        msgs[-1] = last
+    validate_turns()
     return sys_text, msgs
 
 
@@ -463,11 +585,11 @@ class AnthropicOpenRouterClient:
         if Anthropic is None:
             raise LLMError(
                 "anthropic package is required for LLM_PROVIDER=openrouter; "
-                "install requirements.txt or use LLM_PROVIDER=nvidia"
+                "run pip install -e . or use LLM_PROVIDER=nvidia"
             )
         self._client = Anthropic(
             api_key=self.settings.openrouter_api_key,
-            base_url=self.settings.openrouter_base_url,
+            base_url=self.settings.resolved_base_url,
             timeout=self.settings.llm_timeout_sec,
             default_headers={
                 "HTTP-Referer": self.settings.http_referer,
@@ -482,6 +604,7 @@ class AnthropicOpenRouterClient:
         system: str,
         temperature: float,
         print_stream: bool = True,
+        meta: CallMeta | None = None,
     ) -> str:
         """Stream an Anthropic Messages completion; return visible text."""
         return self.stream_completion(
@@ -489,6 +612,7 @@ class AnthropicOpenRouterClient:
             system=system,
             temperature=temperature,
             print_stream=print_stream,
+            meta=meta,
         ).text
 
     def stream_completion(
@@ -501,6 +625,7 @@ class AnthropicOpenRouterClient:
         thinking_level: str | None = None,
         max_output_tokens: int | None = None,
         reasoning_max_tokens: int | None = None,
+        meta: CallMeta | None = None,
     ) -> LLMCompletion:
         """Stream an Anthropic Messages completion with reasoning captured.
 
@@ -510,7 +635,7 @@ class AnthropicOpenRouterClient:
             temperature: Sampling temperature.
             print_stream: Echo content tokens to stdout.
             thinking_level: Override ``THINKING_LEVEL`` for this call.
-            max_output_tokens: Override completion ``max_tokens``.
+            max_output_tokens: Override completion token limit.
             reasoning_max_tokens: OpenRouter ``reasoning.max_tokens`` budget.
 
         Returns:
@@ -519,7 +644,7 @@ class AnthropicOpenRouterClient:
         Raises:
             LLMError: Retryable HTTP/transport failures.
         """
-        extra_body: dict[str, Any] = {}
+        extra_body: dict[str, Any] = {"temperature": temperature}
         thinking = (thinking_level or self.settings.thinking_level).strip()
         if _thinking_enabled(self.settings, thinking):
             reasoning: dict[str, Any] = {"effort": thinking, "exclude": False}
@@ -533,17 +658,23 @@ class AnthropicOpenRouterClient:
         )
         requested = int(max_output_tokens or self.settings.resolved_max_output_tokens)
         max_tokens = min(requested, OPENROUTER_MAX_TOKENS_CAP)
+        logger.debug("LLM call provider=openrouter role=%s", meta.role if meta else "generator")
         last_exc: BaseException | None = None
         for _attempt in range(4):
+            started = time.monotonic()
+            first_token: float | None = None
+            attempt_meta = (
+                replace(meta, purpose=f"{meta.purpose}:afford")
+                if meta is not None and _attempt > 0
+                else meta
+            )
             request: dict[str, Any] = {
                 "model": self.settings.resolved_model,
                 "max_tokens": max_tokens,
-                "temperature": temperature,
                 "system": system,
                 "messages": messages,
+                "extra_body": extra_body,
             }
-            if extra_body:
-                request["extra_body"] = extra_body
 
             streamed_text: list[str] = []
             streamed_reasoning: list[str] = []
@@ -559,11 +690,13 @@ class AnthropicOpenRouterClient:
                         if delta_type == "thinking_delta":
                             chunk = _attr_text(delta, "thinking", "text")
                             if chunk:
+                                first_token = first_token or time.monotonic()
                                 streamed_reasoning.append(chunk)
                         elif delta_type == "text_delta":
                             chunk = _attr_text(delta, "text")
                             if not chunk:
                                 continue
+                            first_token = first_token or time.monotonic()
                             streamed_text.append(chunk)
                             if print_stream:
                                 print(chunk, end="", file=sys.stdout, flush=True)
@@ -572,6 +705,15 @@ class AnthropicOpenRouterClient:
                 "APIStatusError", "APIConnectionError", "APITimeoutError"
             ) as exc:
                 last_exc = exc
+                _emit_usage(
+                    meta=attempt_meta, provider="openrouter", model=self.settings.resolved_model,
+                    started=started, first_token=first_token, system=system,
+                    messages=messages,
+                    completion=_partial_completion(
+                        streamed_text, streamed_reasoning, "anthropic_thinking"
+                    ),
+                    attempt=_attempt + 1, error=exc,
+                )
                 nxt = affordable_max_tokens(exc, max_tokens)
                 if nxt is not None:
                     logger.warning(
@@ -590,6 +732,17 @@ class AnthropicOpenRouterClient:
                 if is_retryable_llm_error(exc):
                     raise LLMError(message) from exc
                 raise
+            except BaseException as exc:
+                _emit_usage(
+                    meta=attempt_meta, provider="openrouter", model=self.settings.resolved_model,
+                    started=started, first_token=first_token, system=system,
+                    messages=messages,
+                    completion=_partial_completion(
+                        streamed_text, streamed_reasoning, "anthropic_thinking"
+                    ),
+                    attempt=_attempt + 1, error=exc,
+                )
+                raise
 
             if print_stream and streamed_text:
                 print(file=sys.stdout, flush=True)
@@ -607,6 +760,17 @@ class AnthropicOpenRouterClient:
                     ("".join(streamed_reasoning), "anthropic_thinking"),
                 ],
             )
+            completion = replace(
+                completion,
+                usage=_read_usage(getattr(final, "usage", None)),
+                origin="live_api",
+            )
+            completion = _emit_usage(
+                meta=attempt_meta, provider="openrouter", model=self.settings.resolved_model,
+                started=started, first_token=first_token, system=system,
+                messages=messages, completion=completion, attempt=_attempt + 1,
+            )
+            assert completion is not None
             if not completion.text.strip():
                 logger.warning("LLM returned empty text content (thinking-only or blank).")
             return completion
@@ -615,33 +779,35 @@ class AnthropicOpenRouterClient:
         raise last_exc
 
 
-class NvidiaOpenAIClient:
-    """NVIDIA NIM via OpenAI-compatible Chat Completions."""
+class OpenAIChatClient:
+    """OpenAI-compatible streaming Chat Completions client."""
+
+    provider = "openai"
 
     def __init__(self, settings: Settings | None = None) -> None:
-        """Create the OpenAI-compatible NVIDIA NIM client.
+        """Create an OpenAI-compatible client for the selected provider.
 
         Args:
             settings: App settings; defaults to :func:`get_settings`.
 
         Raises:
-            LLMError: Missing ``NVIDIA_API_KEY`` or missing ``openai`` package.
+            LLMError: Missing provider key or missing ``openai`` package.
         """
         self.settings = settings or get_settings()
         api_key = self.settings.resolved_api_key
         if not api_key:
-            raise LLMError(
-                "NVIDIA_API_KEY is empty. Put the nvapi- key in .env before generating."
-            )
+            key_name = "NVIDIA_API_KEY" if self.provider == "nvidia" else "OPENAI_API_KEY"
+            raise LLMError(f"{key_name} is empty. Set it in .env before generating.")
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise LLMError("openai package is required for LLM_PROVIDER=nvidia") from exc
+            raise LLMError(f"openai package is required for LLM_PROVIDER={self.provider}") from exc
         self._client = OpenAI(
-            base_url=self.settings.nvidia_base_url,
+            base_url=self.settings.resolved_base_url,
             api_key=api_key,
             timeout=self.settings.llm_timeout_sec,
         )
+        self._stream_usage_supported = True
 
     def stream_text(
         self,
@@ -650,6 +816,7 @@ class NvidiaOpenAIClient:
         system: str,
         temperature: float,
         print_stream: bool = True,
+        meta: CallMeta | None = None,
     ) -> str:
         """Stream Chat Completions; return visible text (not reasoning)."""
         return self.stream_completion(
@@ -657,6 +824,7 @@ class NvidiaOpenAIClient:
             system=system,
             temperature=temperature,
             print_stream=print_stream,
+            meta=meta,
         ).text
 
     def stream_completion(
@@ -669,6 +837,8 @@ class NvidiaOpenAIClient:
         thinking_level: str | None = None,
         max_output_tokens: int | None = None,
         reasoning_max_tokens: int | None = None,
+        meta: CallMeta | None = None,
+        _attempt: int = 1,
     ) -> LLMCompletion:
         """Stream Chat Completions; collect content and reasoning deltas.
 
@@ -679,7 +849,7 @@ class NvidiaOpenAIClient:
             print_stream: Echo content tokens to stdout.
             thinking_level: Override ``THINKING_LEVEL`` for this call.
             max_output_tokens: Override completion ``max_tokens``.
-            reasoning_max_tokens: Optional NVIDIA ``max_thinking_tokens``.
+            reasoning_max_tokens: Optional provider reasoning token cap.
 
         Returns:
             Visible text plus ``reasoning_content`` / think-tag fallback.
@@ -687,6 +857,7 @@ class NvidiaOpenAIClient:
         Raises:
             LLMError: Retryable HTTP/transport failures.
         """
+        global _nvidia_stream_usage_supported
         import openai
 
         system, messages = fit_to_input_budget(
@@ -698,36 +869,57 @@ class NvidiaOpenAIClient:
         oa_messages.extend(messages)
 
         thinking = (thinking_level or self.settings.thinking_level).strip().lower()
-        extra_body: dict[str, Any] = {
-            "chat_template_kwargs": {
-                "enable_thinking": _thinking_enabled(self.settings, thinking),
-            }
-        }
-        if _thinking_enabled(self.settings, thinking) and thinking in {"low", "medium", "high"}:
-            extra_body["chat_template_kwargs"]["reasoning_effort"] = thinking
-
+        logger.debug("LLM call provider=%s role=%s", self.provider, meta.role if meta else "generator")
         out_tokens = int(max_output_tokens or self.settings.resolved_max_output_tokens)
         streamed_text: list[str] = []
         streamed_reasoning: list[str] = []
+        started = time.monotonic()
+        first_token: float | None = None
+        usage: dict[str, int] | None = None
         try:
-            completion = self._client.chat.completions.create(
-                model=self.settings.resolved_model,
-                messages=oa_messages,
-                temperature=temperature,
-                top_p=self.settings.top_p,
-                max_tokens=out_tokens,
-                extra_body=extra_body,
-                stream=True,
-            )
+            request: dict[str, Any] = {
+                "model": self.settings.resolved_model,
+                "messages": oa_messages,
+                "stream": True,
+            }
+            if self.provider == "nvidia":
+                extra_body: dict[str, Any] = {
+                    "chat_template_kwargs": {
+                        "enable_thinking": _thinking_enabled(self.settings, thinking),
+                    }
+                }
+                if _thinking_enabled(self.settings, thinking) and thinking in {"low", "medium", "high"}:
+                    extra_body["chat_template_kwargs"]["reasoning_effort"] = thinking
+                request.update(
+                    temperature=temperature,
+                    top_p=self.settings.top_p,
+                    max_tokens=out_tokens,
+                    extra_body=extra_body,
+                )
+            else:
+                request["max_completion_tokens"] = out_tokens
+                if thinking in {"low", "medium", "high"}:
+                    request["reasoning_effort"] = thinking
+            if self.provider == "nvidia":
+                with _nvidia_stream_usage_lock:
+                    include_usage = _nvidia_stream_usage_supported
+            else:
+                include_usage = self._stream_usage_supported
+            if include_usage:
+                request["stream_options"] = {"include_usage": True}
+            completion = self._client.chat.completions.create(**request)
             for chunk in completion:
+                usage = _read_usage(getattr(chunk, "usage", None)) or usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
                 reason = _attr_text(delta, "reasoning_content", "reasoning")
                 if reason:
+                    first_token = first_token or time.monotonic()
                     streamed_reasoning.append(reason)
                 content = _attr_text(delta, "content")
                 if content:
+                    first_token = first_token or time.monotonic()
                     streamed_text.append(content)
                     if print_stream:
                         print(content, end="", file=sys.stdout, flush=True)
@@ -738,10 +930,50 @@ class NvidiaOpenAIClient:
             openai.RateLimitError,
             openai.APIError,
         ) as exc:
+            _emit_usage(
+                meta=meta, provider=self.provider, model=self.settings.resolved_model,
+                started=started, first_token=first_token, system=system,
+                messages=messages,
+                completion=_partial_completion(
+                    streamed_text, streamed_reasoning, f"{self.provider}_delta"
+                ),
+                attempt=_attempt, error=exc,
+            )
+            if getattr(exc, "status_code", None) == 400 and "stream_options" in str(exc).lower() and include_usage:
+                if self.provider == "nvidia":
+                    with _nvidia_stream_usage_lock:
+                        warn = _nvidia_stream_usage_supported
+                        _nvidia_stream_usage_supported = False
+                else:
+                    warn = self._stream_usage_supported
+                    self._stream_usage_supported = False
+                if warn:
+                    logger.warning(
+                        "%s endpoint rejected stream_options; falling back to estimated usage",
+                        self.provider,
+                    )
+                return self.stream_completion(
+                    messages=messages, system=system, temperature=temperature,
+                    print_stream=print_stream, thinking_level=thinking_level,
+                    max_output_tokens=max_output_tokens,
+                    reasoning_max_tokens=reasoning_max_tokens, meta=meta,
+                    _attempt=_attempt + 1,
+                )
             status = getattr(exc, "status_code", None)
-            message = f"NVIDIA NIM HTTP {status}: {exc}"
+            message = f"{self.provider} HTTP {status}: {exc}"
             if is_retryable_llm_error(exc):
                 raise LLMError(message) from exc
+            raise
+        except BaseException as exc:
+            _emit_usage(
+                meta=meta, provider=self.provider, model=self.settings.resolved_model,
+                started=started, first_token=first_token, system=system,
+                messages=messages,
+                completion=_partial_completion(
+                    streamed_text, streamed_reasoning, f"{self.provider}_delta"
+                ),
+                attempt=_attempt, error=exc,
+            )
             raise
 
         if print_stream and streamed_text:
@@ -751,34 +983,62 @@ class NvidiaOpenAIClient:
         result = assemble_completion(
             visible_text=text,
             reasoning_candidates=[
-                ("".join(streamed_reasoning), "nvidia_delta"),
+                ("".join(streamed_reasoning), f"{self.provider}_delta"),
             ],
         )
+        result = replace(result, usage=usage, origin="live_api")
+        emitted = _emit_usage(
+            meta=meta, provider=self.provider, model=self.settings.resolved_model,
+            started=started, first_token=first_token, system=system,
+            messages=messages, completion=result, attempt=_attempt,
+        )
+        assert emitted is not None
+        result = emitted
         if not result.text.strip():
             logger.warning("LLM returned empty text content (thinking-only or blank).")
         return result
 
 
-_client: LLMClient | None = None
+class NvidiaOpenAIClient(OpenAIChatClient):
+    """NVIDIA NIM variant with its provider-specific request options."""
+
+    provider = "nvidia"
 
 
-def get_llm_client(settings: Settings | None = None) -> LLMClient:
-    """Return a process-wide client for ``LLM_PROVIDER`` (created on first use).
+_clients: dict[tuple[Any, ...], LLMClient] = {}
+_clients_lock = threading.Lock()
 
-    Args:
-        settings: Used only when constructing the first client.
-    """
-    global _client
-    if _client is None:
-        cfg = settings or get_settings()
-        if cfg.llm_provider == "nvidia":
-            _client = NvidiaOpenAIClient(cfg)
-        else:
-            _client = AnthropicOpenRouterClient(cfg)
-    return _client
+
+def get_llm_client(settings: Settings | None = None, *, role: str = "generator") -> LLMClient:
+    """Return a cached client for the role's effective provider and endpoint."""
+    cfg = (settings or get_settings()).for_role(role)
+    factory = deps.current().llm_factory
+    if factory is not None:
+        from cuda_sft.runtime.limits import limited_client
+
+        return limited_client(factory(role), settings=cfg)
+    key = (
+        role, cfg.llm_provider, cfg.resolved_api_key, cfg.resolved_base_url,
+        cfg.resolved_model, cfg.llm_timeout_sec, cfg.thinking_level,
+        cfg.max_input_tokens, cfg.resolved_max_output_tokens, cfg.top_p,
+        cfg.http_referer, cfg.x_title,
+    )
+    with _clients_lock:
+        client = _clients.get(key)
+        if client is None:
+            if cfg.llm_provider == "openrouter":
+                client = AnthropicOpenRouterClient(cfg)
+            elif cfg.llm_provider == "nvidia":
+                client = NvidiaOpenAIClient(cfg)
+            else:
+                client = OpenAIChatClient(cfg)
+            _clients[key] = client
+    from cuda_sft.runtime.limits import limited_client
+
+    return limited_client(client, settings=cfg)
 
 
 def reset_llm_client() -> None:
-    """Drop the cached client (tests / provider switch in-process)."""
-    global _client
-    _client = None
+    """Drop cached role clients (tests / provider switch in-process)."""
+    with _clients_lock:
+        _clients.clear()

@@ -7,24 +7,56 @@ import fcntl
 import logging
 import multiprocessing as mp
 import os
+import re
+import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
+from cuda_sft.agents.difficulty import plan_topology
 from cuda_sft.config import PROJECT_ROOT, WorkerSlot, get_settings
 from cuda_sft.dialects.agent import get_dialect_agent
+from cuda_sft.formats import export_training_files
 from cuda_sft.graph import build_graph, recursion_limit
 from cuda_sft.llm import is_retryable_llm_error
-from cuda_sft.formats import export_training_files
 from cuda_sft.pipeline.common import set_print_stream
-from cuda_sft.store import init_store, iter_question_rows, load_done_keys
-from cuda_sft.tasks.kinds import Job, QuestionRow, coerce_job, progress_key
+from cuda_sft.runtime import deps, trace
+from cuda_sft.store import get_store, init_store, iter_question_rows, load_done_keys
+from cuda_sft.tasks.kinds import Job, QuestionRow, coerce_job, progress_key, question_hash
 from cuda_sft.tasks.router import expand_pipeline_jobs
 
 logger = logging.getLogger("cuda_sft")
+
+
+class KernelDeadlineExceeded(BaseException):
+    """Stop a kernel job when its shared wall-clock budget is exhausted."""
+
+
+@contextmanager
+def _kernel_deadline(seconds: float):
+    if seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def _expired(_signum: int, _frame: Any) -> None:
+        raise KernelDeadlineExceeded()
+
+    signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
 
 def _parse_ids(raw: str | None) -> set[int] | None:
@@ -109,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--providers",
         type=str,
         default=None,
-        help="comma-separated providers, e.g. nvidia,openrouter",
+        help="comma-separated providers, e.g. openai,nvidia,openrouter",
     )
     parser.add_argument(
         "--workers-per-provider",
@@ -140,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="kernel (default, compile gate), knowledge (rubric gate), or auto",
+    )
+    parser.add_argument(
+        "--kernel-fast",
+        action="store_true",
+        help="use one kernel candidate, reduced repairs, and skip the semantic critic",
     )
     parser.add_argument(
         "--no-refval",
@@ -298,8 +335,11 @@ def _select_question_rows(
 
 
 def _apply_kernel_cli(args: argparse.Namespace) -> None:
-    """Copy ``--dialects`` / ``--kernel-mode`` / ``--task`` into env and drop cache."""
+    """Apply explicit CLI overrides to environment-backed settings."""
     changed = False
+    if getattr(args, "kernel_fast", False):
+        os.environ["KERNEL_FAST_MODE"] = "true"
+        changed = True
     if args.dialects:
         os.environ["KERNEL_DIALECTS"] = args.dialects
         changed = True
@@ -428,7 +468,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.providers:
         object.__setattr__(settings, "llm_providers", args.providers)
     providers = settings.provider_pool()
-    missing = settings.missing_provider_secrets(providers)
+    if os.environ.get("CUDA_SFT_LLM_REPLAY"):
+        print("CUDA_SFT_LLM_REPLAY is not allowed for formal generation.", file=sys.stderr)
+        return 2
+    if deps.current().llm_factory is not None:
+        print("Injected LLM clients are not allowed for formal generation.", file=sys.stderr)
+        return 2
+    missing = settings.missing_provider_secrets(
+        providers, roles=settings.active_llm_roles()
+    )
     if missing:
         joined = " / ".join(missing)
         print(f"{joined} is empty. Put the key(s) in .env and retry.", file=sys.stderr)
@@ -473,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         providers=providers,
     )
     workers = max(1, len(assignments))
+    object.__setattr__(settings, "workers", workers)  # TODO(T4.2): replace with RunContext
     if workers > 1:
         _set_all_print_stream(False)
 
@@ -489,36 +538,33 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"providers={','.join(providers)} nvidia_keys={nvidia_n} "
         f"assignments={labels} "
-        f"thinking={settings.thinking_level} "
-        f"cot={settings.cot_enabled}/{settings.cot_agent_enabled} "
+        f"thinking={'low' if settings.kernel_fast_mode else settings.thinking_level} "
+        f"cot={settings.cot_enabled}/{settings.cot_agent_enabled and not settings.kernel_fast_mode} "
         f"task_mode={settings.task_mode} "
         f"dialects={dialect_label} "
         f"kernel_mode={settings.kernel_mode} "
         f"refval={settings.refval_enabled}/{settings.refval_cases} "
-        f"max_in={settings.max_input_tokens} max_out={settings.resolved_max_output_tokens} "
+        f"max_in={settings.max_input_tokens} "
+        f"max_out={min(settings.resolved_max_output_tokens, 8192) if settings.kernel_fast_mode else settings.resolved_max_output_tokens} "
         f"arch={settings.resolved_cuda_arch} gpu={settings.resolved_gpu_name}"
     )
     print(
-        f"candidates={settings.max_candidates} repairs={settings.max_repairs} "
-        f"workers={workers} queued={len(jobs)} skipped_done={skipped_done}"
+        f"candidates={1 if settings.kernel_fast_mode else settings.max_candidates} "
+        f"repairs={min(settings.max_repairs, 1) if settings.kernel_fast_mode else settings.max_repairs} "
+        f"kernel_deadline={settings.kernel_deadline_sec if settings.kernel_fast_mode else 'off'}s "
+        f"workers={workers} in_flight_cap={workers * settings.max_inflight_jobs} "
+        f"llm_per_key={settings.llm_concurrency} compile_global={settings.compile_concurrency} "
+        f"queued={len(jobs)} skipped_done={skipped_done}"
     )
     if not jobs:
         print("nothing to do")
         return 0
 
-    if workers == 1:
-        _apply_worker_slot(assignments[0] if assignments else None)
-        success, abandoned, failed = run_job_list(
-            jobs, data_dir=data_dir, worker_id=0, show_progress=True
-        )
-    else:
-        success, abandoned, failed = run_multiprocess(
-            jobs,
-            data_dir=data_dir,
-            workers=workers,
-            log_level=args.log_level,
-            assignments=assignments,
-        )
+    from cuda_sft.runtime.scheduler import run_supervised
+
+    success, abandoned, failed = run_supervised(
+        jobs, data_dir=data_dir, assignments=assignments, log_level=args.log_level
+    )
 
     print(
         f"\ndone success={success} abandoned={abandoned} crashed={failed} "
@@ -546,6 +592,14 @@ def run_job_list(
         ``(success, abandoned, crashed)`` counts.
     """
     init_store(data_dir)
+    trace_settings = get_settings()
+    if trace_settings.trace_enabled:
+        trace_dir = Path(trace_settings.trace_dir or "trace")
+        if not trace_dir.is_absolute():
+            trace_dir = data_dir / trace_dir
+        trace.ensure_file_sink(trace_dir)
+    else:
+        trace.disable_file_sink()
     kernel_app = None
     knowledge_app = None
     kernel_limit = recursion_limit()
@@ -554,6 +608,16 @@ def run_job_list(
     abandoned = 0
     failed = 0
     prefix = f"w{worker_id}"
+    settings_for_group = get_settings()
+    requested_dialects = get_dialect_agent().requested_names(settings_for_group)
+    available_dialects: list[str] = []
+    for requested in requested_dialects:
+        try:
+            ok, _reason = get_dialect_agent().spec(requested).available(settings_for_group)
+        except Exception:
+            ok = False
+        if ok:
+            available_dialects.append(requested)
     iterable: Any = jobs
     if show_progress:
         iterable = tqdm(jobs, desc=f"questions[{prefix}]", file=sys.stderr, unit="q")
@@ -561,24 +625,35 @@ def run_job_list(
     for index, raw_job in enumerate(iterable, start=1):
         job = coerce_job(raw_job)
         qid = job.question_id
+        try:
+            source_line = int(job.extras.get("source_line", qid))
+        except (TypeError, ValueError):
+            source_line = qid
+        started = time.monotonic()
+        topology = plan_topology(
+            question=job.question,
+            kind=job.kind,
+            topic=job.topic,
+            settings=settings_for_group,
+        )
+        trace.push_context(job_key=f"q{qid}:{job.track}")
+        trace.emit(
+            "job.start",
+            question_hash=question_hash(job.question),
+            source_line=source_line,
+            track=job.track,
+            difficulty=topology.difficulty,
+            candidate_cap=topology.max_candidates,
+            repair_cap=topology.max_repairs,
+        )
         # Preserve the dialect group context even though LangGraph executes
         # one backend job at a time.  The cross-dialect oracle and downstream
         # reports use these fields to distinguish an unavailable backend from
         # a backend that was never requested.
-        settings_for_group = get_settings()
-        requested_dialects = get_dialect_agent().requested_names(settings_for_group)
-        available_dialects: list[str] = []
-        for requested in requested_dialects:
-            try:
-                ok, _reason = get_dialect_agent().spec(requested).available(settings_for_group)
-            except Exception:
-                ok = False
-            if ok:
-                available_dialects.append(requested)
         group_metadata = {
             "requested_dialects": requested_dialects,
             "available_dialects": available_dialects,
-            "group_id": f"q{qid}:{job.question_id}",
+            "group_id": f"q{qid}:{question_hash(job.question)[:12]}",
         }
         if job.kind == "knowledge":
             if knowledge_app is None:
@@ -624,10 +699,27 @@ def run_job_list(
         final = None
         for attempt in range(1, 4):
             try:
-                final = app.invoke(init_state, {"recursion_limit": limit})
+                budget = (
+                    settings_for_group.kernel_deadline_sec
+                    if job.kind == "kernel" and settings_for_group.kernel_fast_mode
+                    else 0
+                )
+                with _kernel_deadline(budget):
+                    final = app.invoke(init_state, {"recursion_limit": limit})
+                break
+            except KernelDeadlineExceeded:
+                final = {
+                    **init_state,
+                    "status": "abandoned",
+                    "abandon_reason": "kernel_deadline_exceeded",
+                    "abandon_error": f"kernel job exceeded {budget}s",
+                }
+                get_store().write_abandoned(final)
+                logger.warning("[%s] question %s %s exceeded %ss", prefix, qid, label, budget)
                 break
             except KeyboardInterrupt:
                 print("\ninterrupted", file=sys.stderr)
+                trace.pop_context()
                 raise
             except Exception as exc:
                 retryable = is_retryable_llm_error(exc)
@@ -655,8 +747,14 @@ def run_job_list(
                     exc,
                     wait,
                 )
-                time.sleep(wait)
+                deps.sleep(wait)
         if final is None:
+            trace.emit(
+                "job.end", status="crashed", abandon_reason="pipeline_exception",
+                selected_candidate=0, release_tier="quarantine",
+                elapsed_s=time.monotonic() - started,
+            )
+            trace.pop_context()
             continue
 
         status = (final or {}).get("status")
@@ -669,6 +767,15 @@ def run_job_list(
             logger.error(
                 "[%s] question %s ended with unexpected status %s", prefix, qid, status
             )
+        trace.emit(
+            "job.end",
+            status=status or "crashed",
+            abandon_reason=str(final.get("abandon_reason") or ""),
+            selected_candidate=int(final.get("winner_candidate") or 0),
+            release_tier=str((final.get("quality_status") or {}).get("release_tier") or "quarantine"),
+            elapsed_s=time.monotonic() - started,
+        )
+        trace.pop_context()
     return success, abandoned, failed
 
 
@@ -681,19 +788,52 @@ def _apply_worker_slot(slot: WorkerSlot | None) -> None:
         slot: Worker assignment; ignored if None or missing a provider name.
     """
     if slot is None or not slot.provider:
+        os.environ.pop("CUDA_SFT_WORKER_KEY_LABEL", None)
         return
+    os.environ["CUDA_SFT_WORKER_KEY_LABEL"] = slot.label
     os.environ["LLM_PROVIDER"] = slot.provider
     if slot.provider == "nvidia" and slot.api_key:
         os.environ["NVIDIA_API_KEY"] = slot.api_key
-        os.environ["NVIDIA_API_KEY_2"] = ""
-        os.environ["NVIDIA_API_KEY_3"] = ""
+        for key in list(os.environ):
+            if re.fullmatch(r"NVIDIA_API_KEY_\d+", key):
+                os.environ.pop(key)
     elif slot.provider == "openrouter" and slot.api_key:
         os.environ["OPENROUTER_API_KEY"] = slot.api_key
+    elif slot.provider == "openai" and slot.api_key:
+        os.environ["OPENAI_API_KEY"] = slot.api_key
     from cuda_sft.config import get_settings as _gs
     from cuda_sft.llm import reset_llm_client
 
     _gs.cache_clear()
     reset_llm_client()
+
+
+def _install_cassette(settings: Any) -> None:
+    """Record real API requests when configured; never install replay here."""
+    record = os.environ.get("CUDA_SFT_LLM_RECORD", "")
+    replay = os.environ.get("CUDA_SFT_LLM_REPLAY", "")
+    if replay:
+        raise ValueError("CUDA_SFT_LLM_REPLAY is not allowed for formal generation")
+    if not record:
+        return
+    from cuda_sft.llm import AnthropicOpenRouterClient, NvidiaOpenAIClient, OpenAIChatClient
+    from cuda_sft.testing.cassette import RecordingClient
+
+    clients: dict[str, Any] = {}
+
+    def factory(role: str) -> Any:
+        if role not in clients:
+            route = settings.for_role(role)
+            if route.llm_provider == "nvidia":
+                underlying = NvidiaOpenAIClient(route)
+            elif route.llm_provider == "openai":
+                underlying = OpenAIChatClient(route)
+            else:
+                underlying = AnthropicOpenRouterClient(route)
+            clients[role] = RecordingClient(underlying, Path(record))
+        return clients[role]
+
+    deps.install(deps.Deps(llm_factory=factory))
 
 
 def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
@@ -715,7 +855,10 @@ def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
         label=label,
     )
     _apply_worker_slot(slot if provider else None)
-    time.sleep(0.6 * worker_id)
+    settings = get_settings()
+    _install_cassette(settings)
+    object.__setattr__(settings, "workers", int(payload.get("workers_total") or 1))  # TODO(T4.2): replace with RunContext
+    deps.sleep(0.6 * worker_id)
     _configure_logging(log_level, data_dir / "run.log", worker_id=worker_id)
     _set_all_print_stream(False)
     if provider:
@@ -728,12 +871,16 @@ def _mp_entry(payload: dict[str, Any]) -> dict[str, Any]:
             label,
             cfg.resolved_model,
         )
-    success, abandoned, failed = run_job_list(
-        jobs, data_dir=data_dir, worker_id=worker_id, show_progress=True
-    )
+    try:
+        success, abandoned, failed = run_job_list(
+            jobs, data_dir=data_dir, worker_id=worker_id, show_progress=True
+        )
+    finally:
+        trace.get_sink().flush()
     return {
         "worker_id": worker_id,
         "provider": label,
+        "workers_total": settings.workers,
         "success": success,
         "abandoned": abandoned,
         "failed": failed,
@@ -769,30 +916,39 @@ def run_multiprocess(
     if src not in pythonpath.split(os.pathsep):
         os.environ["PYTHONPATH"] = src + (os.pathsep + pythonpath if pythonpath else "")
 
+    payloads = []
+    for i, shard in enumerate(shards):
+        if not shard:
+            continue
+        slot = assignments[i] if assignments and i < len(assignments) else None
+        payloads.append(
+            {
+                "worker_id": i,
+                "data_dir": str(data_dir),
+                "jobs": shard,
+                "log_level": log_level,
+                "provider": slot.provider if slot else "",
+                "api_key": slot.api_key if slot else "",
+                "label": slot.label if slot else "",
+                "workers_total": workers,
+            }
+        )
     ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=workers) as pool:
-        payloads = []
-        for i, shard in enumerate(shards):
-            if not shard:
-                continue
-            slot = assignments[i] if assignments and i < len(assignments) else None
-            payloads.append(
-                {
-                    "worker_id": i,
-                    "data_dir": str(data_dir),
-                    "jobs": shard,
-                    "log_level": log_level,
-                    "provider": slot.provider if slot else "",
-                    "api_key": slot.api_key if slot else "",
-                    "label": slot.label if slot else "",
-                }
-            )
-        try:
-            results = pool.map(_mp_entry, payloads)
-        except KeyboardInterrupt:
-            pool.terminate()
-            print("\ninterrupted", file=sys.stderr)
-            raise
+    pool = ctx.Pool(processes=workers)
+    try:
+        results = pool.map(_mp_entry, payloads)
+    except KeyboardInterrupt:
+        pool.terminate()
+        pool.join()
+        print("\ninterrupted", file=sys.stderr)
+        raise
+    except BaseException:
+        pool.terminate()
+        pool.join()
+        raise
+    else:
+        pool.close()
+        pool.join()
     success = sum(r["success"] for r in results)
     abandoned = sum(r["abandoned"] for r in results)
     failed = sum(r["failed"] for r in results)

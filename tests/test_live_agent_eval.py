@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cuda_sft.config import Settings
 from scripts import live_agent_eval as live
 
 
@@ -45,7 +47,10 @@ def test_budget_journal_records_before_after_and_exhaustion(tmp_path: Path) -> N
     journal_path = tmp_path / "journal.jsonl"
     budget = live.BudgetClient(_Client(), 1, live.Journal(journal_path))
     with budget.context(component="generate", task_id="q1"):
-        assert budget.stream_completion(messages=[], system="", temperature=0, print_stream=False).text == "ok"
+        assert (
+            budget.stream_completion(messages=[], system="", temperature=0, print_stream=False).text
+            == "ok"
+        )
         with pytest.raises(live._BudgetExceeded):
             budget.stream_completion(messages=[], system="", temperature=0, print_stream=False)
     events = _events(journal_path)
@@ -112,3 +117,27 @@ def test_strict_rejects_not_evaluated_components() -> None:
     assert live._strict_ok([record], {"generate", "compile"}) is False
     record["components"]["compile"] = {"status": "not_applicable"}
     assert live._strict_ok([record], {"generate", "compile"}) is True
+
+
+def test_thinking_only_response_is_not_an_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class ThinkingOnly:
+        def stream_completion(self, **_kwargs: object) -> object:
+            return SimpleNamespace(text="", reasoning="internal thinking")
+
+    monkeypatch.setattr(
+        live, "get_settings", lambda: Settings(llm_provider="openai", openai_api_key="test")
+    )
+    monkeypatch.setattr(live, "get_llm_client", lambda _settings: ThinkingOnly())
+    report = tmp_path / "report.json"
+    args = live.build_parser().parse_args(
+        [
+            "--smoke", "--max-calls", "1", "--candidate-pool", "1",
+            "--skip-compile", "--agent-components", "generate", "--strict",
+            "--journal", str(tmp_path / "journal.jsonl"), "--report", str(report),
+        ]
+    )
+    assert live.run(args) == 1
+    result = json.loads(report.read_text(encoding="utf-8"))
+    assert result["records"][0]["components"]["generate"] == {
+        "status": "fail", "reason": "empty_visible_answer"
+    }

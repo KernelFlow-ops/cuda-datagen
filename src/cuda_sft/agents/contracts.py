@@ -20,39 +20,14 @@ class GenerateResult:
         reasoning: Captured chain-of-thought / thinking, possibly empty.
         reasoning_source: How reasoning was obtained (``empty`` if none).
         used_speculative: True when the text came from the async repair pool.
+        origin: Source of the completion (``live_api`` for provider SDK calls).
     """
 
     text: str
     reasoning: str = ""
     reasoning_source: str = "empty"
     used_speculative: bool = False
-
-
-@dataclass
-class RepairRequest:
-    """Inputs the Repairer needs; always includes the original question.
-
-    Attributes:
-        question: Raw problem text (not the generation suffix).
-        previous_code: Last extracted source or knowledge answer.
-        compile_error: Compiler / gate message, already trimmed.
-        cuda_arch: Target SM string for kernel repairs.
-        question_id: 1-based jsonl id (variant selection).
-        candidate_idx: 1-based candidate.
-        repair_idx: 1-based repair round about to run.
-        dialect: Kernel dialect or ``knowledge``.
-        error_class: Optional classifier label (filled in M2).
-    """
-
-    question: str
-    previous_code: str
-    compile_error: str
-    cuda_arch: str = ""
-    question_id: int = 1
-    candidate_idx: int = 1
-    repair_idx: int = 1
-    dialect: str = "cuda"
-    error_class: str = ""
+    origin: str = "unknown"
 
 
 @dataclass

@@ -26,7 +26,11 @@ class GraphState(TypedDict, total=False):
     user_prompt: str
     messages: list[dict[str, str]]
     candidate_idx: int
+    candidate_ctx: dict[str, Any]
+    selected: dict[str, Any]
     repair_idx: int
+    oracle_retry_idx: int
+    oracle_blocked: bool
     repair_cap: int
     temperature: float
     raw_response: str
@@ -35,6 +39,8 @@ class GraphState(TypedDict, total=False):
     compile_error: str
     used_rdc: bool
     status: Literal["running", "success", "abandoned"]
+    abandon_reason: str
+    last_gate: dict[str, Any]
     attempts: list[dict[str, Any]]
     gpu_name: str
     cuda_arch: str
@@ -52,6 +58,7 @@ class GraphState(TypedDict, total=False):
     cot: str
     cot_source: str
     cot_error: str
+    cot_mode: str
     difficulty: str
     candidate_cap: int
     use_critic: bool
@@ -72,3 +79,4 @@ class GraphState(TypedDict, total=False):
     refval_status: str
     refval_error: str
     refval_error_class: str
+    refval_owner: str

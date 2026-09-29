@@ -9,8 +9,9 @@ from cuda_sft.prompts.selection import (
     CANDIDATE_TEMPERATURES,
     candidate_temperature,
     language_matched_index,
-    stable_index as _stable_index,
+    looks_chinese,
 )
+from cuda_sft.prompts.selection import stable_index as _stable_index
 
 # Generator system pool: compile-first role, mixed EN/ZH. Selection matches
 # question CJK-ness via language_matched_index (not random).
@@ -61,6 +62,13 @@ SYSTEM_PROMPTS: tuple[str, ...] = (
 )
 
 SYSTEM_PROMPT = SYSTEM_PROMPTS[0]
+
+TRAINING_SYSTEM_PROMPT_ZH = (
+    "你是一名资深 GPU 内核工程师。请先分析题目要求、数据规模与硬件特性，再给出完整、正确、高效且可直接编译的实现。"
+)
+TRAINING_SYSTEM_PROMPT_EN = (
+    "You are a senior GPU kernel engineer. First analyze the problem requirements, data sizes and hardware characteristics, then provide a complete, correct, efficient implementation that compiles as-is."
+)
 
 USER_SUFFIXES: tuple[str, ...] = (
     """## 生成要求（高质量）
@@ -184,12 +192,13 @@ REPAIR_PROMPTS: tuple[str, ...] = (
     """上一版 CUDA 代码未能通过 nvcc 编译。请输出**完整修正后**的 `solution.cu`（不要只给 diff）。
 目标架构：{cuda_arch}。保持题面要求的算法与函数职责，只修编译问题。
 
+## Evidence
 nvcc 输出（过长则已去重摘要）：
 ```
 {error}
 ```
 
-上一版代码：
+## Previous solution.cu
 ```cuda
 {code}
 ```
@@ -198,12 +207,13 @@ nvcc 输出（过长则已去重摘要）：
     """nvcc failed on the previous kernel (arch {cuda_arch}). Return a full corrected `solution.cu`, not a patch.
 Keep the same algorithm and host responsibilities; fix compile errors only.
 
+## Evidence
 nvcc output (deduplicated summary if over the size limit):
 ```
 {error}
 ```
 
-Previous source:
+## Previous solution.cu
 ```cuda
 {code}
 ```
@@ -212,12 +222,13 @@ Reply with exactly one ```cuda fence.""",
     """请根据 nvcc 报错修复上一版实现，目标 `{cuda_arch}`。
 给出整份可编译源码，不要解释，不要省略未改动的函数。
 
+## Evidence
 nvcc 输出（过长则已去重摘要）：
 ```
 {error}
 ```
 
-原代码：
+## Previous solution.cu
 ```cuda
 {code}
 ```
@@ -240,7 +251,11 @@ void launch_scale(float* x, float s, int n) {
 ```
 Invalid: `#include "include/helpers.h"` (that file is absent). Invalid: a `main()` test harness."""
 
-COT_SYSTEM_PROMPT = """你是 CUDA SFT 思维链编辑器，不是写代码的人。最终 solution.cu 已经通过编译；你只整理可学习的推理。
+COT_NO_REPAIR_RULES_ZH = "严格要求：以第一次独立解题的视角叙述推理过程。不得提及任何编译错误、报错信息、调试、修复、上一版本、之前的尝试或评测框架。推理中出现的函数名、常量值、线程块尺寸、共享内存数组名必须与最终代码完全一致。"
+COT_NO_REPAIR_RULES_EN = "Strict rules: narrate the reasoning as a first, independent attempt at the problem. Never mention compile errors, error messages, debugging, fixes, previous versions, earlier attempts, or any grading harness. Every function name, constant value, block size and shared-memory array name mentioned must match the final code exactly."
+
+_COT_SYSTEM_BASE_CUDA = (
+    """你是 CUDA SFT 思维链编辑器，不是写代码的人。最终 solution.cu 已经通过编译；你只整理可学习的推理。
 You are the CUDA SFT Chain-of-Thought editor.
 
 Your job is NOT to write a new kernel. A compilable solution.cu already exists.
@@ -253,8 +268,8 @@ Role constraints:
   the code does not implement.
 - Teaching voice: concise, ordered, technical. Prefer "what we chose and why"
   over inner monologue, self-doubt, or abandoned drafts.
-- If raw thinking contradicts the final code, trust the code and briefly note
-  the correction (e.g. indexing, bounds, sync) without replaying the wrong path.
+- If raw thinking contradicts the final code, silently follow the code; never
+  narrate the correction or replay the wrong path.
 - If raw thinking is missing or noisy, reconstruct CoT from the problem and the
   final code only.
 - Do not emit CUDA source, markdown fences, diffs, or a second solution.
@@ -263,22 +278,29 @@ Role constraints:
 - Target length: 400–1200 Chinese characters or 250–800 English words; never
   exceed the stated character budget.
 
-Required CoT skeleton (use these headings, keep them short):
-1. Problem restatement — tensors/shapes, host entry, success criteria.
-2. Algorithm — formula, reduction/scan/gemm pattern, numerical notes.
-3. Thread/block mapping — index math, grid/block, why this layout.
-4. Memory and sync — global/shared/registers, coalescing, __syncthreads__.
-5. Bounds and edge cases — empty n, misaligned tails, overflow.
-6. Implementation checklist — 4–8 bullets that map onto the actual code
-   (includes, kernel name, host launcher, key locals).
+Structure: use exactly the six numbered headings given in the user message,
+in its language, and keep each heading short. What each section covers:
+- the problem: tensors/shapes, host entry, success criteria;
+- the algorithm: formula, reduction/scan/gemm pattern, numerical notes;
+- the mapping: index math, grid/block, why this layout;
+- memory and sync: only the memory and synchronization choices present in
+  the final source; if no explicit synchronization is used, say so;
+- bounds and edge cases: empty n, misaligned tails, overflow;
+- the checklist: 4–8 bullets that map onto the actual code (includes,
+  kernel name, host launcher, key locals).
 """
+)
 
-COT_SYSTEM_PYTHON = """You are the SFT Chain-of-Thought editor for Triton/TileLang kernels.
+_COT_SYSTEM_BASE_PYTHON = """You are the SFT Chain-of-Thought editor for Triton/TileLang kernels.
 A compilable solution.py already exists. Rewrite teacher thinking into a
 pedagogical CoT. Faithful to the FINAL Python source only. Do not emit
 source, fences, or mention this editor. Match the problem language.
 Headings come from the user message (program_id / T.Kernel, not CUDA C++).
+If raw thinking contradicts the final source, silently follow the source.
 """
+
+COT_SYSTEM_PROMPT = _COT_SYSTEM_BASE_CUDA + "\n" + COT_NO_REPAIR_RULES_ZH
+COT_SYSTEM_PYTHON = _COT_SYSTEM_BASE_PYTHON + "\n" + COT_NO_REPAIR_RULES_EN
 
 COT_SKELETON_ZH = (
     "1. 题意与张量/入口\n"
@@ -298,17 +320,22 @@ COT_SKELETON_PY_ZH = (
 )
 
 
-def cot_system_for(*, dialect: str) -> str:
+def cot_system_for(*, dialect: str, question: str = "") -> str:
     """CoT-editor system prompt for a kernel dialect.
 
     Args:
         dialect: ``cuda`` / ``cutlass`` use the CUDA-C++ editor; Python
             dialects use :data:`COT_SYSTEM_PYTHON`.
+        question: Raw problem; when given, the no-repair rules follow its
+            language instead of the dialect default.
     """
     name = (dialect or "cuda").strip().lower()
-    if name in {"triton", "tilelang"}:
-        return COT_SYSTEM_PYTHON
-    return COT_SYSTEM_PROMPT
+    python = name in {"triton", "tilelang"}
+    if not (question or "").strip():
+        return COT_SYSTEM_PYTHON if python else COT_SYSTEM_PROMPT
+    base = _COT_SYSTEM_BASE_PYTHON if python else _COT_SYSTEM_BASE_CUDA
+    rules = COT_NO_REPAIR_RULES_ZH if looks_chinese(question) else COT_NO_REPAIR_RULES_EN
+    return base + "\n" + rules
 
 
 COT_USER_TEMPLATE = """## Problem
@@ -328,11 +355,6 @@ Required headings:
 ## Raw teacher thinking (may be empty, noisy, or contradictory)
 {raw_reasoning}
 
-## Optional compile/repair notes (context only; do not copy logs into CoT)
-repairs={repair_idx}; last_error_summary={error_summary}
-judge_issues={judge_issues}
-judge_suggestions={judge_suggestions}
-
 ## Output
 Return ONLY the polished CoT using the six headings. No code fences. Character budget: {max_chars}.
 """
@@ -343,8 +365,6 @@ def build_cot_user_prompt(
     question: str,
     code: str,
     raw_reasoning: str,
-    repair_idx: int = 0,
-    error_summary: str = "",
     judge_issues: list[str] | None = None,
     judge_suggestions: list[str] | None = None,
     max_chars: int = 8000,
@@ -359,18 +379,16 @@ def build_cot_user_prompt(
         question: Original problem text (not the generation suffix).
         code: Compile-passed source.
         raw_reasoning: Teacher thinking, already truncated/cleaned.
-        repair_idx: How many compile-fix rounds the winner used.
-        error_summary: Last compiler summary (optional context).
-        judge_issues: Judge issues, if any.
-        judge_suggestions: Judge suggestions, if any.
+        judge_issues: Ignored. Heuristic nits about the final code pull the
+            editor away from a faithful first-attempt narrative.
+        judge_suggestions: Ignored, see ``judge_issues``.
         max_chars: Character budget told to the editor.
         dialect: Kernel dialect id.
         language: ``cuda-cpp`` or ``python``.
         skeleton: Six-heading outline for this dialect.
         fence: Markdown fence language for the frozen source.
     """
-    issues = judge_issues or []
-    suggestions = judge_suggestions or []
+    del judge_issues, judge_suggestions
     default_skel = (
         "1. Problem restatement\n2. Algorithm\n3. Thread/block mapping\n"
         "4. Memory and sync\n5. Bounds and edge cases\n6. Implementation checklist"
@@ -382,11 +400,8 @@ def build_cot_user_prompt(
         skeleton=(skeleton or default_skel).strip(),
         fence=(fence or "cuda"),
         code=(code or "").strip() or "(no source)",
-        raw_reasoning=(raw_reasoning or "").strip() or "(none)",
-        repair_idx=int(repair_idx or 0),
-        error_summary=(error_summary or "").strip() or "(none)",
-        judge_issues="; ".join(issues) if issues else "(none)",
-        judge_suggestions="; ".join(suggestions) if suggestions else "(none)",
+        raw_reasoning=(raw_reasoning or "").strip()
+        or "(none — derive the reasoning from the problem and the final code)",
         max_chars=int(max_chars),
     ).strip()
 
@@ -525,8 +540,8 @@ __all__ = [
     "REPAIR_PROMPTS",
     "SYSTEM_PROMPT",
     "SYSTEM_PROMPTS",
-    "SelectedPrompts",
     "USER_SUFFIXES",
+    "SelectedPrompts",
     "build_cot_user_prompt",
     "build_repair_prompt",
     "build_user_prompt",
